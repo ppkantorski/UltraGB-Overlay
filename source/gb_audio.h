@@ -1,0 +1,731 @@
+/********************************************************************************
+ * File: gb_audio.h
+ * Description:
+ *   GB APU → Switch audout bridge — dedicated audio thread design.
+ *
+ *   Architecture:
+ *
+ *   RENDER THREAD (draw())
+ *   ┌─────────────────────────────────────────────┐
+ *   │ gb_run_frame()                              │
+ *   │   └─ peanut_gb calls audio_write(addr,val) │  ← SPSC enqueue only (~5 ns)
+ *   │ gb_audio_submit()  [no-op]                  │
+ *   │ render pixels                               │
+ *   └─────────────────────────────────────────────┘
+ *           (fully decoupled — no signals)
+ *   AUDIO THREAD (dedicated, priority 0x2C = same as render thread)
+ *   ┌─────────────────────────────────────────────┐
+ *   │ drain SPSC queue → local GBAPU state        │
+ *   │ generate_samples()  — 802 stereo @ 48 kHz   │
+ *   │ audoutGetReleasedAudioOutBuffer() [non-blk] │  under m_audioMutex
+ *   │ audoutPlayBuffer()                          │  under m_audioMutex
+ *   │ svcSleepThread(remaining_frame_ns)          │  drift-corrected 59.73 fps
+ *   └─────────────────────────────────────────────┘
+ *
+ *   Audio quality:
+ *   - Proper DAC model: each channel maps its digital [0..15] output to float
+ *     [-1..+1] (0.0 when the DAC is powered off). This naturally eliminates
+ *     the abrupt DC step when channels are gated on/off, removing the "buzz"
+ *     artefact. The real GB has an analog output capacitor for the same reason.
+ *   - NO low-pass filter: LP rounds square-wave transitions and makes high-
+ *     frequency tones sound muddy. GB audio requires sharp edges.
+ *   - DC blocker (high-pass ~8 Hz): removes residual DC via the same one-pole
+ *     IIR used by most accurate GB emulators.  HP_R is derived from the Pan
+ *     Docs capacitor spec: 0.999958^(4194304/48000/4) ≈ 0.99908 per sample.
+ *
+ *   Pause / resume (overlay hide / show):
+ *   - gb_audio_pause()  — sets paused flag; audio thread discards queued events
+ *     and submits silence.  GBAPU state is PRESERVED (not cleared).
+ *   - gb_audio_resume() — sets restore flag + clears paused flag.  On the
+ *     audio thread's next active frame, restore_regs_to_apu() replays
+ *     s_ctrl.regs into the local GBAPU before generating samples.
+ *
+ *   Why the GBAPU must NOT be cleared on pause:
+ *     apply_reg() silently drops all writes when local.power == false.  If
+ *     the GBAPU were zeroed, the APU would stay permanently silent because the
+ *     game never re-writes NR52 after boot — it was already set.
+ *     restore_regs_to_apu() replays NR52 first, which re-enables power and
+ *     allows the rest of the register replay to take effect.
+ *
+ *   Why audoutAppendAudioOutBuffer + svcSleepThread (not audoutPlayBuffer):
+ *     audoutPlayBuffer = audoutAppendAudioOutBuffer + audoutWaitPlayFinish.
+ *     The blocking wait means only 1 buffer is ever in the hardware queue.
+ *     During the ~1ms gap between buffer completion and the next submission
+ *     (generate + mutex overhead) the hardware has nothing to play — this
+ *     occurs 60×/sec producing 60Hz amplitude modulation on every tone,
+ *     audible as a reverb-like chorus haze on sustained notes.
+ *     audoutAppendAudioOutBuffer is non-blocking (μs inside mutex); the
+ *     pre-queued silence frames keep the hardware queue 2-3 deep at all
+ *     times.  svcSleepThread(GB_FRAME_NS) is the submission clock.
+ ********************************************************************************/
+
+#pragma once
+
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <atomic>
+#include <mutex>
+#include <switch.h>
+#include "audio.hpp"   // ult::Audio::m_audioMutex, m_initialized
+
+extern "C" {
+#include "peanut_gb.h"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Output constants
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr uint32_t GB_CPU_HZ    = 4194304u;
+static constexpr uint32_t GB_OUT_RATE  = 48000u;
+static constexpr uint32_t GB_FRAME_CYC = 70224u;
+
+// Samples per frame — exact value is 48000×70224/4194304 = 803.6499…
+// A fixed ceiling of 804 advances 70254 T-cycles per frame instead of 70224,
+// making every note play +0.754 cents sharp — audible on music you know well.
+// The audio thread uses a Bresenham accumulator to alternate 803 / 804 samples
+// so the long-run average is exactly 48000 Hz (zero pitch error).
+// GB_SPF is the maximum size (804) used for DMA buffer sizing only.
+static constexpr uint32_t GB_SPF =
+    (static_cast<uint64_t>(GB_OUT_RATE) * GB_FRAME_CYC + GB_CPU_HZ - 1u) / GB_CPU_HZ;
+static constexpr uint32_t GB_SPF_BASE =
+    static_cast<uint32_t>(static_cast<uint64_t>(GB_OUT_RATE) * GB_FRAME_CYC / GB_CPU_HZ); // 803
+static constexpr uint32_t GB_SPF_FRAC_INC =
+    static_cast<uint32_t>((static_cast<uint64_t>(GB_OUT_RATE) * GB_FRAME_CYC) % GB_CPU_HZ);
+
+static constexpr uint32_t GB_DMA_DATA  = GB_SPF * 2u * sizeof(int16_t);
+static constexpr uint32_t GB_DMA_ALIGN = 0x1000u;
+static constexpr uint32_t GB_DMA_CAP   =
+    (GB_DMA_DATA + GB_DMA_ALIGN - 1u) & ~(GB_DMA_ALIGN - 1u);
+
+static constexpr int GB_SEQ_CYC = 8192;  // frame sequencer: 512 Hz
+
+static constexpr uint8_t GB_DUTY[4][8] = {
+    {0,0,0,0,0,0,0,1},{1,0,0,0,0,0,0,1},{1,0,0,0,1,1,1,1},{0,1,1,1,1,1,1,0}
+};
+static constexpr uint16_t GB_NDIV[8] = {8,16,32,48,64,80,96,112};
+
+// DC-blocker decay coefficient from Pan Docs capacitor spec:
+//   charge factor = 0.999958 per T-cycle (the 4.194 MHz GB clock)
+//   per output sample @ 48 kHz: 0.999958 ^ (4194304/48000) = 0.99634
+//
+// IMPORTANT: the exponent must NOT be divided by 4.  Pan Docs defines the
+// factor per T-cycle (one 4 MHz clock tick), not per machine cycle (4 T).
+// The old value (0.99908) used /4, giving a 22ms time constant.  The
+// correct 5.7ms constant settles between volume envelope steps (~7ms min),
+// eliminating the periodic dip/hum on sustained notes caused by the DC
+// tracker permanently lagging behind the changing envelope DC level.
+static constexpr float HP_R = 0.99634f;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GBAPU — full APU state, owned exclusively by the audio thread.
+// ─────────────────────────────────────────────────────────────────────────────
+struct GBAPU {
+    struct Ch1 {
+        int timer=0,duty_pos=0; uint8_t duty=0;
+        int vol=0; uint8_t vol_init=0; bool vol_add=false;
+        int vol_timer=0,vol_period=0; uint16_t period=0;
+        int len_timer=0; bool len_en=false,enabled=false,dac_on=false;
+        int sw_timer=0,sw_period=0,sw_shift=0; bool sw_negate=false; uint16_t sw_shadow=0;
+    } ch1;
+    struct Ch2 {
+        int timer=0,duty_pos=0; uint8_t duty=0;
+        int vol=0; uint8_t vol_init=0; bool vol_add=false;
+        int vol_timer=0,vol_period=0; uint16_t period=0;
+        int len_timer=0; bool len_en=false,enabled=false,dac_on=false;
+    } ch2;
+    struct Ch3 {
+        int timer=0,pos=0; uint8_t vol_shift=0; uint16_t period=0;
+        int len_timer=0; bool len_en=false,enabled=false,dac_on=false;
+        uint8_t ram[16]={};
+    } ch3;
+    struct Ch4 {
+        int timer=0,vol=0; uint8_t vol_init=0; bool vol_add=false;
+        int vol_timer=0,vol_period=0;
+        uint8_t clock_shift=0,div_code=0; bool width7=false; uint16_t lfsr=0x7FFF;
+        int len_timer=0; bool len_en=false,enabled=false,dac_on=false;
+    } ch4;
+    uint8_t nr50=0x77,nr51=0xFF; bool power=false;
+    int seq_cycles=0,seq_step=0; uint32_t cycle_frac=0;
+
+    // Per-channel DC-blocker (applied to each channel before NR51 mix).
+    // Keeping HP per-channel means a DC step on one channel (e.g. an arpeggio
+    // channel triggering a new note) cannot bleed into the other channels'
+    // waveforms — the combined-mix HP caused audible amplitude distortion.
+    // Preserved across pause/resume to avoid clicks.
+    float hp_ch[4]={};
+};
+
+static inline int ch1_p(const GBAPU& a){return (2048-a.ch1.period)*4;}
+static inline int ch2_p(const GBAPU& a){return (2048-a.ch2.period)*4;}
+static inline int ch3_p(const GBAPU& a){return (2048-a.ch3.period)*2;}
+static inline int ch4_p(const GBAPU& a){return GB_NDIV[a.ch4.div_code]<<a.ch4.clock_shift;}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// apply_reg — replay one register write into a GBAPU instance.
+// ─────────────────────────────────────────────────────────────────────────────
+static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
+    if (addr>=0x30&&addr<=0x3F){a.ch3.ram[addr-0x30]=val;return;}
+    if (!a.power&&addr!=0x26) return;
+    switch(addr){
+    case 0x10: a.ch1.sw_period=(val>>4)&7;a.ch1.sw_negate=(val>>3)&1;a.ch1.sw_shift=val&7;break;
+    case 0x11: a.ch1.duty=(val>>6)&3;a.ch1.len_timer=64-(val&0x3F);break;
+    case 0x12: a.ch1.vol_init=(val>>4)&0xF;a.ch1.vol_add=(val>>3)&1;a.ch1.vol_period=val&7;
+               a.ch1.dac_on=(val&0xF8)!=0;if(!a.ch1.dac_on)a.ch1.enabled=false;break;
+    case 0x13: a.ch1.period=(a.ch1.period&0x700u)|val;break;
+    case 0x14: a.ch1.period=(a.ch1.period&0xFFu)|(static_cast<uint16_t>(val&7)<<8);
+               a.ch1.len_en=(val>>6)&1;
+               if(val&0x80){a.ch1.enabled=a.ch1.dac_on;a.ch1.vol=a.ch1.vol_init;
+                   a.ch1.vol_timer=a.ch1.vol_period;
+                   a.ch1.timer=ch1_p(a)>0?ch1_p(a):1;a.ch1.duty_pos=0;
+                   if(a.ch1.len_timer==0)a.ch1.len_timer=64;
+                   a.ch1.sw_shadow=a.ch1.period;
+                   a.ch1.sw_timer=a.ch1.sw_period?a.ch1.sw_period:8;}break;
+    case 0x16: a.ch2.duty=(val>>6)&3;a.ch2.len_timer=64-(val&0x3F);break;
+    case 0x17: a.ch2.vol_init=(val>>4)&0xF;a.ch2.vol_add=(val>>3)&1;a.ch2.vol_period=val&7;
+               a.ch2.dac_on=(val&0xF8)!=0;if(!a.ch2.dac_on)a.ch2.enabled=false;break;
+    case 0x18: a.ch2.period=(a.ch2.period&0x700u)|val;break;
+    case 0x19: a.ch2.period=(a.ch2.period&0xFFu)|(static_cast<uint16_t>(val&7)<<8);
+               a.ch2.len_en=(val>>6)&1;
+               if(val&0x80){a.ch2.enabled=a.ch2.dac_on;a.ch2.vol=a.ch2.vol_init;
+                   a.ch2.vol_timer=a.ch2.vol_period;
+                   a.ch2.timer=ch2_p(a)>0?ch2_p(a):1;a.ch2.duty_pos=0;
+                   if(a.ch2.len_timer==0)a.ch2.len_timer=64;}break;
+    case 0x1A: a.ch3.dac_on=(val&0x80)!=0;if(!a.ch3.dac_on)a.ch3.enabled=false;break;
+    case 0x1B: a.ch3.len_timer=256-val;break;
+    case 0x1C: a.ch3.vol_shift=(val>>5)&3;break;
+    case 0x1D: a.ch3.period=(a.ch3.period&0x700u)|val;break;
+    case 0x1E: a.ch3.period=(a.ch3.period&0xFFu)|(static_cast<uint16_t>(val&7)<<8);
+               a.ch3.len_en=(val>>6)&1;
+               if(val&0x80){a.ch3.enabled=a.ch3.dac_on;
+                   a.ch3.timer=ch3_p(a)>0?ch3_p(a):1;a.ch3.pos=0;
+                   if(a.ch3.len_timer==0)a.ch3.len_timer=256;}break;
+    case 0x20: a.ch4.len_timer=64-(val&0x3F);break;
+    case 0x21: a.ch4.vol_init=(val>>4)&0xF;a.ch4.vol_add=(val>>3)&1;a.ch4.vol_period=val&7;
+               a.ch4.dac_on=(val&0xF8)!=0;if(!a.ch4.dac_on)a.ch4.enabled=false;break;
+    case 0x22: a.ch4.clock_shift=val>>4;a.ch4.width7=(val>>3)&1;a.ch4.div_code=val&7;break;
+    case 0x23: a.ch4.len_en=(val>>6)&1;
+               if(val&0x80){a.ch4.enabled=a.ch4.dac_on;a.ch4.vol=a.ch4.vol_init;
+                   a.ch4.vol_timer=a.ch4.vol_period;
+                   a.ch4.timer=ch4_p(a)>0?ch4_p(a):1;a.ch4.lfsr=0x7FFF;
+                   if(a.ch4.len_timer==0)a.ch4.len_timer=64;}break;
+    case 0x24: a.nr50=val;break;
+    case 0x25: a.nr51=val;break;
+    case 0x26:
+        a.power=(val&0x80)!=0;
+        if(!a.power){
+            const auto ram=a.ch3.ram;
+            const int sc=a.seq_cycles,ss=a.seq_step;const uint32_t cf=a.cycle_frac;
+            float hc[4]; memcpy(hc,a.hp_ch,sizeof(hc));
+            a.ch1={};a.ch2={};a.ch4={};a.ch3={};memcpy(a.ch3.ram,ram,16);
+            a.nr50=0;a.nr51=0;a.seq_cycles=sc;a.seq_step=ss;a.cycle_frac=cf;
+            memcpy(a.hp_ch,hc,sizeof(hc));}
+        break;
+    default:break;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generate_samples — writes GB_SPF stereo int16 samples into dst.
+//
+// Output pipeline per sample:
+//   1. Frame sequencer tick (length / sweep / volume envelope, integer)
+//   2. Per-channel time-integration over the output sample period:
+//        For CH1/CH2 (square): count how many of the `cyc` CPU cycles the
+//        duty output was HIGH.  Output = (high_cycles / cyc) × vol.
+//        For CH3 (wave):       accumulate (sample_nibble × cycles_held) / cyc.
+//        For CH4 (noise LFSR): count high cycles for current LFSR state.
+//      This is a box-filter / integrate-and-dump approach.  It completely
+//      eliminates aliasing from high-frequency oscillators — without it,
+//      a channel cycling 20× per output sample produces a scratchy alias
+//      tone instead of the correct (near-silence) high-frequency note.
+//   3. DAC model: averaged digital value [0..15] → float [-1..+1].
+//      DAC-off channels contribute 0.0.  This removes gate-on/off DC steps.
+//   4. NR51 panning + NR50 master volume mix (float).
+//   5. DC blocker (HP_R capacitor), no low-pass filter.
+// ─────────────────────────────────────────────────────────────────────────────
+static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp) {
+    static constexpr uint32_t STEP =
+        static_cast<uint32_t>((static_cast<uint64_t>(GB_CPU_HZ)<<16)/GB_OUT_RATE);
+
+    static constexpr float DAC_SCALE = 1.0f / 7.5f;  // [0..15] → [-1..+1]
+    static constexpr float MIX_SCALE = 900.0f;        // ~88% of int16 range
+
+    const float lv = static_cast<float>(((a.nr50>>4)&7)+1);
+    const float rv = static_cast<float>((a.nr50&7)+1);
+
+    for (uint32_t i=0; i<n_samp; ++i) {
+        a.cycle_frac+=STEP;
+        const int cyc=static_cast<int>(a.cycle_frac>>16);
+        a.cycle_frac&=0xFFFFu;
+        const float rcyc = 1.0f / static_cast<float>(cyc);
+
+        // ── Frame sequencer ───────────────────────────────────────────────────
+        a.seq_cycles+=cyc;
+        while(a.seq_cycles>=GB_SEQ_CYC){
+            a.seq_cycles-=GB_SEQ_CYC;
+            const int s=a.seq_step;
+            if((s&1)==0){
+                auto tl=[](bool&en,bool le,int&lt){if(le&&lt>0&&--lt==0)en=false;};
+                tl(a.ch1.enabled,a.ch1.len_en,a.ch1.len_timer);
+                tl(a.ch2.enabled,a.ch2.len_en,a.ch2.len_timer);
+                tl(a.ch3.enabled,a.ch3.len_en,a.ch3.len_timer);
+                tl(a.ch4.enabled,a.ch4.len_en,a.ch4.len_timer);
+            }
+            if(s==2||s==6){
+                if(a.ch1.sw_period>0&&--a.ch1.sw_timer<=0){
+                    a.ch1.sw_timer=a.ch1.sw_period;
+                    if(a.ch1.sw_shift>0){
+                        const int d=a.ch1.sw_shadow>>a.ch1.sw_shift;
+                        const int np=a.ch1.sw_negate?a.ch1.sw_shadow-d:a.ch1.sw_shadow+d;
+                        if(np>2047)a.ch1.enabled=false;
+                        else a.ch1.sw_shadow=a.ch1.period=static_cast<uint16_t>(np);
+                    }
+                }
+            }
+            if(s==7){
+                auto te=[](int&v,bool add,int&vt,int vp){
+                    if(vp>0&&--vt<=0){vt=vp;if(add&&v<15)++v;else if(!add&&v>0)--v;}};
+                te(a.ch1.vol,a.ch1.vol_add,a.ch1.vol_timer,a.ch1.vol_period);
+                te(a.ch2.vol,a.ch2.vol_add,a.ch2.vol_timer,a.ch2.vol_period);
+                te(a.ch4.vol,a.ch4.vol_add,a.ch4.vol_timer,a.ch4.vol_period);
+            }
+            a.seq_step=(a.seq_step+1)&7;
+        }
+
+        // ── CH1 — integrate square wave over cyc cycles ───────────────────────
+        // Walk the duty/timer forward cycle-by-cycle, accumulating the number
+        // of cycles the output was HIGH.  avg = hi_cycles / cyc × vol.
+        float d1;
+        {
+            int rem=cyc, t=a.ch1.timer, dp=a.ch1.duty_pos, hi=0;
+            while(rem>0){
+                if(t<=0){dp=(dp+1)&7;const int p=ch1_p(a);t+=p>0?p:1;}
+                const int step=rem<t?rem:t;
+                if(a.ch1.enabled&&GB_DUTY[a.ch1.duty][dp]) hi+=step;
+                rem-=step; t-=step;
+            }
+            a.ch1.timer=t; a.ch1.duty_pos=dp;
+            const float avg=a.ch1.enabled
+                ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch1.vol):0.0f;
+            d1=a.ch1.dac_on?avg*DAC_SCALE-1.0f:0.0f;
+        }
+        { const float _h=HP_R*a.hp_ch[0]+(1.0f-HP_R)*d1; d1-=_h; a.hp_ch[0]=_h; }
+
+        // ── CH2 — integrate square wave ───────────────────────────────────────
+        float d2;
+        {
+            int rem=cyc, t=a.ch2.timer, dp=a.ch2.duty_pos, hi=0;
+            while(rem>0){
+                if(t<=0){dp=(dp+1)&7;const int p=ch2_p(a);t+=p>0?p:1;}
+                const int step=rem<t?rem:t;
+                if(a.ch2.enabled&&GB_DUTY[a.ch2.duty][dp]) hi+=step;
+                rem-=step; t-=step;
+            }
+            a.ch2.timer=t; a.ch2.duty_pos=dp;
+            const float avg=a.ch2.enabled
+                ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch2.vol):0.0f;
+            d2=a.ch2.dac_on?avg*DAC_SCALE-1.0f:0.0f;
+        }
+        { const float _h=HP_R*a.hp_ch[1]+(1.0f-HP_R)*d2; d2-=_h; a.hp_ch[1]=_h; }
+
+        // ── CH3 — integrate wave table ────────────────────────────────────────
+        // Accumulate (nibble_value × cycles_at_that_position) / cyc.
+        float d3;
+        {
+            int rem=cyc, t=a.ch3.timer, pos=a.ch3.pos;
+            float acc=0.0f;
+            while(rem>0){
+                if(t<=0){pos=(pos+1)&31;const int p=ch3_p(a);t+=p>0?p:1;}
+                const int step=rem<t?rem:t;
+                if(a.ch3.enabled&&a.ch3.vol_shift>0){
+                    const uint8_t b=a.ch3.ram[pos>>1];
+                    const int nib=((pos&1)?(b&0xFu):(b>>4))>>(a.ch3.vol_shift-1);
+                    acc+=static_cast<float>(nib)*static_cast<float>(step);
+                }
+                rem-=step; t-=step;
+            }
+            a.ch3.timer=t; a.ch3.pos=pos;
+            d3=a.ch3.dac_on?acc*rcyc*DAC_SCALE-1.0f:0.0f;
+        }
+        { const float _h=HP_R*a.hp_ch[2]+(1.0f-HP_R)*d3; d3-=_h; a.hp_ch[2]=_h; }
+
+        // ── CH4 — integrate LFSR noise ────────────────────────────────────────
+        // The LFSR state is valid for `t` cycles; when t expires the LFSR shifts.
+        // Accumulate high cycles for the current LFSR bit between each shift.
+        float d4;
+        {
+            int rem=cyc, t=a.ch4.timer, hi=0;
+            uint16_t lfsr=a.ch4.lfsr;
+            while(rem>0){
+                if(t<=0){
+                    const int p=ch4_p(a);t+=p>0?p:1;
+                    const uint16_t xb=(lfsr^(lfsr>>1))&1u;
+                    lfsr=(lfsr>>1)|(xb<<14);
+                    if(a.ch4.width7)lfsr=(lfsr&~(1u<<6))|(xb<<6);
+                }
+                const int step=rem<t?rem:t;
+                if(a.ch4.enabled&&(~lfsr&1u)) hi+=step;
+                rem-=step; t-=step;
+            }
+            a.ch4.timer=t; a.ch4.lfsr=lfsr;
+            const float avg=a.ch4.enabled
+                ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch4.vol):0.0f;
+            d4=a.ch4.dac_on?avg*DAC_SCALE-1.0f:0.0f;
+        }
+        { const float _h=HP_R*a.hp_ch[3]+(1.0f-HP_R)*d4; d4-=_h; a.hp_ch[3]=_h; }
+
+        // ── NR51 panning + NR50 volume ────────────────────────────────────────
+        float ls=0.0f,rs=0.0f;
+        if(a.nr51&0x10u){ls+=d1;} if(a.nr51&0x01u){rs+=d1;}
+        if(a.nr51&0x20u){ls+=d2;} if(a.nr51&0x02u){rs+=d2;}
+        if(a.nr51&0x40u){ls+=d3;} if(a.nr51&0x04u){rs+=d3;}
+        if(a.nr51&0x80u){ls+=d4;} if(a.nr51&0x08u){rs+=d4;}
+        ls*=lv; rs*=rv;
+
+        // ── Scale, clamp, write ──────────────────────────────────────────────
+        // DC removed per-channel above; no combined-mix HP needed.
+        const float sl=ls*MIX_SCALE, sr=rs*MIX_SCALE;
+        *dst++=sl> 32767.f? 32767:sl<-32767.f?-32767:static_cast<int16_t>(sl);
+        *dst++=sr> 32767.f? 32767:sr<-32767.f?-32767:static_cast<int16_t>(sr);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPSC event queue
+// ─────────────────────────────────────────────────────────────────────────────
+struct RegEvent { uint8_t addr, val; };
+static constexpr uint32_t EVT_CAP  = 512u;
+static constexpr uint32_t EVT_MASK = EVT_CAP - 1u;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared control block
+// ─────────────────────────────────────────────────────────────────────────────
+static struct GACtrl {
+    RegEvent              events[EVT_CAP]{};
+    std::atomic<uint32_t> evt_w{0};
+    std::atomic<uint32_t> evt_r{0};
+
+    // Live register mirror: index = addr - 0x10, covers NR10–NR52 + wave RAM.
+    // Used by audio_read() and by restore_regs_to_apu() on resume.
+    uint8_t regs[64]{};
+
+    int16_t*       dma[4]  = {};
+    AudioOutBuffer ab[4]   = {};
+    uint8_t        cur     = 0;
+
+    std::atomic<bool> thread_run{false};
+    Thread            thread_handle{};
+    bool              own_session = false;
+    bool              ready       = false;
+
+    // paused  — submit silence, discard SPSC events.
+    // restore — on next active frame, replay regs[] into local GBAPU.
+    std::atomic<bool> paused {false};
+    std::atomic<bool> restore{false};
+} s_ctrl;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// restore_regs_to_apu
+//
+// Replays the live register mirror into a GBAPU to recover from a pause.
+//
+// Ordering is critical:
+//   1. NR52 first  — sets a.power=true so apply_reg accepts subsequent writes.
+//   2. NR50/51     — master vol + routing.
+//   3. Channel regs NRx0–NRx3 before NRx4, so trigger (bit7 of NRx4) fires
+//      with the correct period, volume, and duty already loaded.
+//      Trigger bit is MASKED OFF — we don't want to restart notes on resume,
+//      only restore the register state so fresh events work correctly.
+//   4. Wave RAM.
+//   HP capacitor state is preserved to avoid a click.
+// ─────────────────────────────────────────────────────────────────────────────
+static void restore_regs_to_apu(GBAPU& a) {
+    float hc[4]; memcpy(hc,a.hp_ch,sizeof(hc));
+
+    // 1. Power (NR52 = addr 0x26, mirror index 0x26-0x10 = 0x16)
+    apply_reg(a, 0x26, s_ctrl.regs[0x16]);
+
+    // 2. Master vol / panning
+    apply_reg(a, 0x24, s_ctrl.regs[0x14]);
+    apply_reg(a, 0x25, s_ctrl.regs[0x15]);
+
+    // 3. Channel registers — trigger byte last, bit7 masked off
+    // CH1 (NR10–NR14)
+    apply_reg(a, 0x10, s_ctrl.regs[0x00]);
+    apply_reg(a, 0x11, s_ctrl.regs[0x01]);
+    apply_reg(a, 0x12, s_ctrl.regs[0x02]);
+    apply_reg(a, 0x13, s_ctrl.regs[0x03]);
+    apply_reg(a, 0x14, s_ctrl.regs[0x04] & 0x7F);  // no retrigger
+
+    // CH2 (NR21–NR24; NR20 doesn't exist)
+    apply_reg(a, 0x16, s_ctrl.regs[0x06]);
+    apply_reg(a, 0x17, s_ctrl.regs[0x07]);
+    apply_reg(a, 0x18, s_ctrl.regs[0x08]);
+    apply_reg(a, 0x19, s_ctrl.regs[0x09] & 0x7F);  // no retrigger
+
+    // CH3 (NR30–NR34)
+    apply_reg(a, 0x1A, s_ctrl.regs[0x0A]);
+    apply_reg(a, 0x1B, s_ctrl.regs[0x0B]);
+    apply_reg(a, 0x1C, s_ctrl.regs[0x0C]);
+    apply_reg(a, 0x1D, s_ctrl.regs[0x0D]);
+    apply_reg(a, 0x1E, s_ctrl.regs[0x0E] & 0x7F);  // no retrigger
+
+    // CH4 (NR41–NR44)
+    apply_reg(a, 0x20, s_ctrl.regs[0x10]);
+    apply_reg(a, 0x21, s_ctrl.regs[0x11]);
+    apply_reg(a, 0x22, s_ctrl.regs[0x12]);
+    apply_reg(a, 0x23, s_ctrl.regs[0x13] & 0x7F);  // no retrigger
+
+    // 4. Wave RAM (0x30–0x3F → mirror index 0x20–0x2F)
+    for (uint8_t r=0x30; r<=0x3F; ++r)
+        apply_reg(a, r, s_ctrl.regs[r-0x10]);
+
+    memcpy(a.hp_ch,hc,sizeof(hc));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// audio_write / audio_read — called by peanut_gb on the render thread.
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" {
+
+void audio_write(const uint8_t addr, const uint8_t val) {
+    if (addr>=0x10&&addr<=0x4F)
+        s_ctrl.regs[addr-0x10]=val;
+
+    const uint32_t w    = s_ctrl.evt_w.load(std::memory_order_relaxed);
+    const uint32_t next = (w+1u)&EVT_MASK;
+    if (next!=s_ctrl.evt_r.load(std::memory_order_acquire)){
+        s_ctrl.events[w]={addr,val};
+        s_ctrl.evt_w.store(next,std::memory_order_release);
+    }
+}
+
+uint8_t audio_read(const uint8_t addr) {
+    if (addr>=0x30&&addr<=0x3F) return s_ctrl.regs[addr-0x10];
+    if (addr<0x10||addr>0x4F)   return 0xFFu;
+    static constexpr uint8_t MASK[0x17]={
+        0x80,0x3F,0x00,0xFF,0xBF,
+        0xFF,0x3F,0x00,0xFF,0xBF,
+        0x7F,0xFF,0x9F,0xFF,0xBF,
+        0xFF,0xFF,0x00,0x00,0xBF,
+        0x00,0x00,0x70,
+    };
+    const uint8_t off=addr-0x10u;
+    return s_ctrl.regs[off]|(off<sizeof(MASK)?MASK[off]:0u);
+}
+
+}  // extern "C"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio thread
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int64_t GB_FRAME_NS =
+    (int64_t)GB_FRAME_CYC*1'000'000'000LL/(int64_t)GB_CPU_HZ;
+
+static void gb_audio_thread_fn(void*) {
+    GBAPU local{};
+    local.ch4.lfsr=0x7FFF;
+
+    // Bresenham: accumulates GB_SPF_FRAC_INC each frame; flips 803→804 when
+    // it overflows GB_CPU_HZ, giving exactly 48000 samples/sec on average.
+    uint32_t spf_acc = 0;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    int64_t next_ns=(int64_t)ts.tv_sec*1'000'000'000LL+ts.tv_nsec+GB_FRAME_NS;
+
+    while(s_ctrl.thread_run.load(std::memory_order_relaxed)){
+
+        // ── Bresenham sample count for this frame ─────────────────────────────
+        spf_acc += GB_SPF_FRAC_INC;
+        const uint32_t n_samp = GB_SPF_BASE + (spf_acc >= GB_CPU_HZ ? 1u : 0u);
+        if (spf_acc >= GB_CPU_HZ) spf_acc -= GB_CPU_HZ;
+        const uint32_t n_data = n_samp * 2u * static_cast<uint32_t>(sizeof(int16_t));
+
+        if(s_ctrl.paused.load(std::memory_order_acquire)){
+            // ── Paused path ───────────────────────────────────────────────────
+            s_ctrl.evt_r.store(
+                s_ctrl.evt_w.load(std::memory_order_acquire),
+                std::memory_order_release);
+            memset(s_ctrl.dma[s_ctrl.cur],0,n_data);
+
+        } else {
+            // ── Active path ───────────────────────────────────────────────────
+            if(s_ctrl.restore.load(std::memory_order_acquire)){
+                restore_regs_to_apu(local);
+                s_ctrl.restore.store(false,std::memory_order_release);
+            }
+
+            // Drain SPSC event queue up to frame-end sentinel (addr=0xFF).
+            {
+                uint32_t r=s_ctrl.evt_r.load(std::memory_order_relaxed);
+                const uint32_t w=s_ctrl.evt_w.load(std::memory_order_acquire);
+                while(r!=w){
+                    const RegEvent ev=s_ctrl.events[r];
+                    r=(r+1u)&EVT_MASK;
+                    if(ev.addr==0xFF) break;
+                    apply_reg(local,ev.addr,ev.val);
+                }
+                s_ctrl.evt_r.store(r,std::memory_order_release);
+            }
+
+            generate_samples(local,s_ctrl.dma[s_ctrl.cur],n_samp);
+        }
+
+        // ── Submit ────────────────────────────────────────────────────────────
+        // Use audoutAppendAudioOutBuffer (non-blocking) so the mutex is held for
+        // microseconds, not 16.7ms.  The hardware queue stays 2-3 deep; combined
+        // with the two pre-queued silence frames there is always a buffer ready
+        // for the hardware to play — no gaps, no 60Hz amplitude modulation.
+        {
+            std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
+            AudioOutBuffer* rel=nullptr; u32 cnt=0;
+            audoutGetReleasedAudioOutBuffer(&rel,&cnt);  // clean up finished bufs
+
+            AudioOutBuffer& ab=s_ctrl.ab[s_ctrl.cur];
+            ab.buffer     =s_ctrl.dma[s_ctrl.cur];
+            ab.buffer_size=GB_DMA_CAP;
+            ab.data_size  =n_data;  // 803 or 804 samples — exact 48 kHz on average
+            ab.data_offset=0;
+            ab.next       =nullptr;
+            audoutAppendAudioOutBuffer(&ab);  // non-blocking append
+        }
+        s_ctrl.cur=(s_ctrl.cur+1u)&3u;  // 4-buffer ring: 0→1→2→3→0
+
+        // ── Sleep for remainder of frame period ───────────────────────────────
+        clock_gettime(CLOCK_MONOTONIC,&ts);
+        const int64_t now_ns=(int64_t)ts.tv_sec*1'000'000'000LL+ts.tv_nsec;
+        const int64_t sleep_ns=next_ns-now_ns;
+        if(sleep_ns>0) svcSleepThread(sleep_ns);
+        next_ns+=GB_FRAME_NS;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_init — call after gb_init_lcd(), before gb_reset().
+// ─────────────────────────────────────────────────────────────────────────────
+static bool gb_audio_init(gb_s*) {
+    if(s_ctrl.ready) return true;
+
+    s_ctrl.evt_w.store(0,std::memory_order_relaxed);
+    s_ctrl.evt_r.store(0,std::memory_order_relaxed);
+    memset(s_ctrl.regs,0,sizeof(s_ctrl.regs));
+    s_ctrl.cur=0;
+    s_ctrl.paused.store(false, std::memory_order_relaxed);
+    s_ctrl.restore.store(false,std::memory_order_relaxed);
+
+    for(int i=0;i<4;++i){
+        free(s_ctrl.dma[i]);
+        s_ctrl.dma[i]=static_cast<int16_t*>(aligned_alloc(GB_DMA_ALIGN,GB_DMA_CAP));
+        if(!s_ctrl.dma[i]){
+            for(int j=0;j<i;++j){free(s_ctrl.dma[j]);s_ctrl.dma[j]=nullptr;}
+            return false;
+        }
+        memset(s_ctrl.dma[i],0,GB_DMA_CAP);
+    }
+
+    if(!ult::Audio::m_initialized){
+        if(R_FAILED(audoutInitialize())||R_FAILED(audoutStartAudioOut())){
+            audoutExit();
+            free(s_ctrl.dma[0]);free(s_ctrl.dma[1]);
+            s_ctrl.dma[0]=s_ctrl.dma[1]=nullptr;return false;
+        }
+        s_ctrl.own_session=true;
+    }
+
+    // Pre-queue two silence frames so the hardware DMA queue has ~33 ms of
+    // headroom before the audio thread generates its first frame.
+    // MUST use audoutAppendAudioOutBuffer (non-blocking), NOT audoutPlayBuffer.
+    // audoutPlayBuffer blocks until the submitted buffer finishes playing, so
+    // calling it here would drain both silence frames before threadStart(),
+    // leaving the queue empty and causing the 60Hz gap artifact described above.
+    s_ctrl.cur=2;
+    {
+        std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
+        for(int i=0;i<2;++i){
+            s_ctrl.ab[i]={};
+            s_ctrl.ab[i].buffer     =s_ctrl.dma[i];
+            s_ctrl.ab[i].buffer_size=GB_DMA_CAP;
+            s_ctrl.ab[i].data_size  =GB_DMA_DATA;
+            audoutAppendAudioOutBuffer(&s_ctrl.ab[i]);  // non-blocking: stays in queue
+        }
+    }
+    s_ctrl.thread_run.store(true,std::memory_order_relaxed);
+    // Priority 0x2B (one notch above render thread 0x2C) — audio must never
+    // be starved by the 23K drawRect calls in the render path.
+    if(R_FAILED(threadCreate(&s_ctrl.thread_handle,
+                              gb_audio_thread_fn,nullptr,
+                              nullptr,0x4000,0x2B,-2)))
+    {
+        s_ctrl.thread_run.store(false);
+        if(s_ctrl.own_session){audoutStopAudioOut();audoutExit();s_ctrl.own_session=false;}
+        for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;}
+        return false;
+    }
+    threadStart(&s_ctrl.thread_handle);
+    s_ctrl.ready=true;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_pause — call from Overlay::onHide().
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_pause() {
+    s_ctrl.paused.store(true,std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_resume — call before re-entering the emulator.
+//
+// Clears the paused flag only.  The audio thread's local GBAPU is never
+// touched while paused — it carries through exactly as-is.  No register
+// restore is needed or performed.
+//
+// restore_regs_to_apu() is intentionally NOT called: it masks off trigger
+// bits (bit 7 of NRx4) so ch.enabled is never set back to true.  Channels
+// on sustained notes the game isn't actively retriggering stay permanently
+// silent after resume.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_resume() {
+    s_ctrl.paused.store(false, std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_shutdown() {
+    if(!s_ctrl.ready) return;
+    s_ctrl.ready=false;
+
+    s_ctrl.thread_run.store(false,std::memory_order_release);
+    threadWaitForExit(&s_ctrl.thread_handle);
+    threadClose(&s_ctrl.thread_handle);
+
+    {
+        std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
+        AudioOutBuffer* rel=nullptr; u32 cnt=0;
+        for(int i=0;i<16;++i) audoutGetReleasedAudioOutBuffer(&rel,&cnt);
+    }
+    if(s_ctrl.own_session){audoutStopAudioOut();audoutExit();s_ctrl.own_session=false;}
+    for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;s_ctrl.ab[i]={};}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_submit — enqueue a frame-end sentinel after each gb_run_frame().
+//
+// addr=0xFF is never a real APU register offset (APU only uses 0x10–0x3F).
+// The drain loop stops at this marker, so the audio thread consumes exactly
+// one render frame's events per audio frame — preventing multi-frame batching
+// when the render thread (vsync ≈ 60fps) briefly runs ahead of the audio
+// thread (≈59.73fps).
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_submit() {
+    if (!s_ctrl.ready) return;
+    const uint32_t w    = s_ctrl.evt_w.load(std::memory_order_relaxed);
+    const uint32_t next = (w + 1u) & EVT_MASK;
+    if (next != s_ctrl.evt_r.load(std::memory_order_acquire)) {
+        s_ctrl.events[w] = {0xFF, 0};
+        s_ctrl.evt_w.store(next, std::memory_order_release);
+    }
+}
