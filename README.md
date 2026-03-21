@@ -1,2 +1,2 @@
 # UltraGB
-An embedded GameBoy made utilizing the Ultrahand Overlay framework.
+An embedded Game Boy Overlay for the Nintendo Switch made utilizing the libultrahand framework.
