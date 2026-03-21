@@ -26,19 +26,17 @@
 #include <cstdio>
 
 // ── Peanut-GB compile-time options ───────────────────────────────────────────
-// These MUST be defined here, before peanut_gb.h is included, because the
-// header uses #if (not #ifdef) to gate entire struct members such as gb_s::cgb.
-// Relying solely on -D flags in the Makefile is not sufficient when the header
-// is pulled in through an extern "C" block in a precompiled-header context.
-// All are guarded with #ifndef so Makefile -D flags are respected without warning.
 #ifndef ENABLE_LCD
 #  define ENABLE_LCD                  1
 #endif
 #ifndef ENABLE_SOUND
-#  define ENABLE_SOUND                1  // enables audio_write()/audio_read() hooks
+#  define ENABLE_SOUND                1
 #endif
 #ifndef ENABLE_GBC_SUPPORT
 #  define ENABLE_GBC_SUPPORT          1
+#endif
+#ifndef WALNUT_FULL_GBC_SUPPORT
+#  define WALNUT_FULL_GBC_SUPPORT     1  // enables gb_s::cgb — full GBC colour
 #endif
 #ifndef PEANUT_GB_HIGH_LCD_ACCURACY
 #  define PEANUT_GB_HIGH_LCD_ACCURACY 0
@@ -46,19 +44,17 @@
 #ifndef GB_INTERNAL
 #  define GB_INTERNAL
 #endif
+// Safe dual-fetch flags (MBC/DMA/opcodes) are set to 1 directly in
+// walnut_cgb.h — they are unconditional #defines so #ifndef guards here
+// have no effect.  Edit walnut_cgb.h lines 62-64 to change them.
 
-// Forward-declare the APU hooks that peanut_gb.h calls when ENABLE_SOUND=1.
-// These must be visible as C symbols before peanut_gb.h is parsed, because
-// peanut_gb.h calls them directly inside __gb_read/__gb_write with no prior
-// declaration of its own.  The definitions live in gb_audio.h.
 extern "C" {
     uint8_t audio_read(uint8_t addr);
     void    audio_write(uint8_t addr, uint8_t val);
 }
 
-// Include Peanut-GB as C inside C++ — required to avoid name-mangling issues.
 extern "C" {
-#include "peanut_gb.h"
+#include "walnut_cgb.h"
 }
 
 // ── Screen and viewport dimensions ───────────────────────────────────────────
@@ -66,49 +62,13 @@ static constexpr int GB_W          = LCD_WIDTH;    // 160
 static constexpr int GB_H          = LCD_HEIGHT;   // 144
 
 static constexpr int VP_X          = 24;
-static constexpr int VP_Y          = (720 - 360) / 2;  // 180
+static constexpr int VP_Y          = (720 - 360) / 2 - 60-10;  // 120 — shifted up 60 px total to make room for virtual controls
 static constexpr int VP_W          = 400;
 static constexpr int VP_H          = 360;
 
 // Overlay framebuffer dimensions (448 × 720, RGBA4444)
 static constexpr int FB_W          = 448;
 static constexpr int FB_H          = 720;
-
-// ── TO ENABLE FULL GBC COLOUR ────────────────────────────────────────────────
-// GBC support requires knowing two things that differ between Peanut-GB forks:
-//   1. The macro that enables the `cgb` member inside `struct gb_s`
-//   2. The exact field names for the BG and sprite palette arrays
-//
-// Run this from your project root to find them:
-//   grep -n "GBC\|cgb\|palette" lib/Peanut-GB/peanut_gb.h | head -80
-//
-// Once you have them, define ULTRABOY_GBC and fill in the three items below,
-// then add -DULTRABOY_GBC to CFLAGS in the Makefile.
-//
-// Example (deltabeard mainline, ~2024):
-//   In gb_core.h, add before #include "peanut_gb.h":
-//     #define ENABLE_GBC_SUPPORT 1   (or whatever your peanut_gb.h checks)
-//   Then set:
-//     #define ULTRABOY_GBC
-//     #define PGB_CGB_BG_PAL(gb)  (gb)->cgb.cgbp    // uint8_t[64]
-//     #define PGB_CGB_SP_PAL(gb)  (gb)->cgb.cgbsp   // uint8_t[64]
-//     #define PGB_CGB_MODE(gb)    (gb)->cgb.mode     // nonzero = GBC ROM
-//
-#if defined(ULTRABOY_GBC)
-#  ifndef PGB_CGB_BG_PAL
-#    error "Define PGB_CGB_BG_PAL, PGB_CGB_SP_PAL, PGB_CGB_MODE — see gb_core.h"
-#  endif
-#  define CGB_BG_PAL_BYTE(gb, pal, col, byte) \
-       (PGB_CGB_BG_PAL(gb)[((pal)*4+(col))*2+(byte)])
-#  define CGB_SP_PAL_BYTE(gb, pal, col, byte) \
-       (PGB_CGB_SP_PAL(gb)[((pal)*4+(col))*2+(byte)])
-#  define CGB_BG_COLOR(gb, pal, col) \
-       ((uint16_t)CGB_BG_PAL_BYTE(gb,pal,col,0) | \
-        ((uint16_t)CGB_BG_PAL_BYTE(gb,pal,col,1)<<8))
-#  define CGB_SP_COLOR(gb, pal, col) \
-       ((uint16_t)CGB_SP_PAL_BYTE(gb,pal,col,0) | \
-        ((uint16_t)CGB_SP_PAL_BYTE(gb,pal,col,1)<<8))
-#endif  // ULTRABOY_GBC
 
 // ── DMG greyscale palette (RGB555) ───────────────────────────────────────────
 static constexpr uint16_t DMG_GREY[4] = {
@@ -117,6 +77,19 @@ static constexpr uint16_t DMG_GREY[4] = {
     0x294A,  // 2 – dark grey
     0x0000,  // 3 – black
 };
+
+// ── GBC green palette (RGB555) ────────────────────────────────────────────────
+static constexpr uint16_t GBC_GREEN[4] = {
+    0x06F3,  // 0 – lightest green
+    0x06B1,  // 1 – light green
+    0x1986,  // 2 – dark green
+    0x04E1,  // 3 – darkest green
+};
+
+// Palette selection — defined in main.cpp, read from config.ini [config].
+// true  = classic DMG greyscale
+// false = GBC-style green tint (for DMG games running without CGB hardware)
+extern bool g_original_palette;
 
 // ── Global emulator state ─────────────────────────────────────────────────────
 struct GBState {
@@ -145,6 +118,22 @@ static uint8_t gb_rom_read(struct gb_s*, const uint_fast32_t addr) {
     return g_gb.rom[addr];
 }
 
+// Walnut-CGB requires 16-bit and 32-bit ROM read functions for its dual-fetch
+// CPU execution model.  These are simple unaligned little-endian reads —
+// safe because g_gb.rom is a heap buffer with no alignment restrictions.
+static uint16_t gb_rom_read16(struct gb_s*, const uint_fast32_t addr) {
+    if (addr + 1 >= g_gb.romSize) return 0xFFFF;
+    return (uint16_t)g_gb.rom[addr] | ((uint16_t)g_gb.rom[addr + 1] << 8);
+}
+
+static uint32_t gb_rom_read32(struct gb_s*, const uint_fast32_t addr) {
+    if (addr + 3 >= g_gb.romSize) return 0xFFFFFFFF;
+    return (uint32_t)g_gb.rom[addr]
+         | ((uint32_t)g_gb.rom[addr + 1] << 8)
+         | ((uint32_t)g_gb.rom[addr + 2] << 16)
+         | ((uint32_t)g_gb.rom[addr + 3] << 24);
+}
+
 static uint8_t gb_cart_ram_read(struct gb_s*, const uint_fast32_t addr) {
     if (!g_gb.cartRam || addr >= g_gb.cartRamSz) return 0xFF;
     return g_gb.cartRam[addr];
@@ -160,39 +149,38 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
 }
 
 // ── LCD draw-line callback ────────────────────────────────────────────────────
-// Called 144 times per gb_run_frame(), once per horizontal scanline.
-// Writes one row into g_gb_fb in RGB555 format.
+// Walnut-CGB pixel byte encoding:
+//
+//   CGB mode (gb->cgb.cgbMode != 0):
+//     Pixel byte is a direct index into gb->cgb.fixPalette[]:
+//       [0x00..0x1F] = BG palettes  (8 palettes × 4 colours, RGB565 LE)
+//       [0x20..0x3F] = OBJ palettes (8 palettes × 4 colours, RGB565 LE)
+//     Just use fixPalette[pixel] directly — Walnut pre-converts BGR555→RGB565.
+//
+//   DMG mode (non-CGB ROM):
+//     WALNUT_GB_12_COLOUR=1: bits[1:0]=colour index, bits[5:4]=source
+//       (LCD_PALETTE_BG=0x20=BG, else sprite).  We only need bits[1:0].
+//     We apply g_original_palette ? DMG_GREY : GBC_GREEN per-pixel.
 static void gb_lcd_draw_line(struct gb_s* gb,
                               const uint8_t* pixels,
                               const uint_fast8_t line)
 {
-    (void)gb;  // unused until ULTRABOY_GBC is enabled
     if ((int)line >= GB_H) return;
     uint16_t* row = g_gb_fb + (int)line * GB_W;
 
-#if defined(ULTRABOY_GBC)
-    // Full GBC colour path — only active when ULTRABOY_GBC is defined in the
-    // Makefile AND PGB_CGB_* macros are set correctly for your peanut_gb.h.
-    if (PGB_CGB_MODE(gb)) {
-        // Peanut-GB pixel byte:
-        //   bits [1:0] = colour index within palette (0–3)
-        //   bits [4:2] = palette number (0–7)
-        //   bit  [6]   = sprite pixel (use sprite palette bank)
-        for (int x = 0; x < GB_W; x++) {
-            const uint8_t pix      = pixels[x];
-            const uint8_t col      = pix & 0x03;
-            const uint8_t pal      = (pix >> 2) & 0x07;
-            const bool    isSprite = (pix >> 6) & 0x01;
-            row[x] = isSprite ? CGB_SP_COLOR(gb, pal, col)
-                               : CGB_BG_COLOR(gb, pal, col);
-        }
+#if WALNUT_FULL_GBC_SUPPORT
+    if (gb->cgb.cgbMode) {
+        // CGB path: fixPalette is pre-built RGB565 — one lookup per pixel.
+        for (int x = 0; x < GB_W; x++)
+            row[x] = gb->cgb.fixPalette[pixels[x]];
         return;
     }
 #endif
 
-    // DMG greyscale: map 2-bit palette indices → RGB555
+    // DMG path: map 2-bit colour index through selected palette (RGB555).
+    const uint16_t* pal = g_original_palette ? DMG_GREY : GBC_GREEN;
     for (int x = 0; x < GB_W; x++)
-        row[x] = DMG_GREY[pixels[x] & 3];
+        row[x] = pal[pixels[x] & 3];
 }
 
 // ── Public interface (implemented in main.cpp) ────────────────────────────────
@@ -204,11 +192,17 @@ bool gb_load_rom(const char* romPath);
 // Save cart RAM to file and free all emulator resources.
 void gb_unload_rom();
 
-// Run exactly one Game Boy frame (calls Peanut-GB's gb_run_frame()).
+// Run exactly one Game Boy frame.
+// Uses gb_run_frame() (the __gb_step_cpu_x path — original Peanut-GB execution
+// core) rather than gb_run_frame_dualfetch() (__gb_step_cpu dual-fetch model).
+// The dual-fetch model has compatibility gaps with some MBC3 games like Oracle
+// of Seasons that cause freezes even with all SAFE_DUALFETCH flags enabled.
+// gb_run_frame() still benefits from Walnut's DMA and CGB hardware emulation;
+// it just skips the dual-fetch opcode dispatch optimisation.
 // Must only be called when g_gb.running == true.
 inline void gb_run_one_frame() {
     if (g_gb.running)
-        gb_run_frame(&g_gb.gb);
+        gb_run_frame_dualfetch(&g_gb.gb);  // ← switch back to this
 }
 
 // Update the joypad from the overlay's keysHeld bitmask.

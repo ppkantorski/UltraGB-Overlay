@@ -33,19 +33,18 @@
  *     IIR used by most accurate GB emulators.  HP_R is derived from the Pan
  *     Docs capacitor spec: 0.999958^(4194304/48000/4) ≈ 0.99908 per sample.
  *
- *   Pause / resume (overlay hide / show):
- *   - gb_audio_pause()  — sets paused flag; audio thread discards queued events
- *     and submits silence.  GBAPU state is PRESERVED (not cleared).
- *   - gb_audio_resume() — sets restore flag + clears paused flag.  On the
- *     audio thread's next active frame, restore_regs_to_apu() replays
- *     s_ctrl.regs into the local GBAPU before generating samples.
+ *   Pause / resume (system-combo overlay hide / show):
+ *   - gb_audio_pause()  — sets paused flag; audio thread discards SPSC events
+ *     and submits silence.  GBAPU state (including hp_ch[]) is preserved.
+ *   - gb_audio_resume() — clears paused flag.  Thread transitions naturally to
+ *     real audio on the next iteration.  At most one silence frame (16.7 ms)
+ *     precedes the first real-audio frame — imperceptible.
  *
- *   Why the GBAPU must NOT be cleared on pause:
- *     apply_reg() silently drops all writes when local.power == false.  If
- *     the GBAPU were zeroed, the APU would stay permanently silent because the
- *     game never re-writes NR52 after boot — it was already set.
- *     restore_regs_to_apu() replays NR52 first, which re-enables power and
- *     allows the rest of the register replay to take effect.
+ *   X → ROM menu → re-enter game (gb_audio_shutdown + gb_audio_init):
+ *     hp_ch[] is saved to s_ctrl.hp_ch when the thread exits (shutdown) and
+ *     restored into local.hp_ch at thread startup (init).  This prevents the
+ *     ~5 ms HP-filter undershoot transient that caused crackling on re-entry.
+ *     regs[] is similarly preserved so the APU restores to its exact last state.
  *
  *   Why audoutAppendAudioOutBuffer + svcSleepThread (not audoutPlayBuffer):
  *     audoutPlayBuffer = audoutAppendAudioOutBuffer + audoutWaitPlayFinish.
@@ -70,7 +69,7 @@
 #include "audio.hpp"   // ult::Audio::m_audioMutex, m_initialized
 
 extern "C" {
-#include "peanut_gb.h"
+#include "walnut_cgb.h"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,8 +406,14 @@ static struct GACtrl {
     std::atomic<uint32_t> evt_r{0};
 
     // Live register mirror: index = addr - 0x10, covers NR10–NR52 + wave RAM.
-    // Used by audio_read() and by restore_regs_to_apu() on resume.
+    // Used by audio_read() to return correct values to peanut_gb.
     uint8_t regs[64]{};
+
+    // HP capacitor state, one value per channel.  Persisted across
+    // shutdown/init so the filter resumes at its settled value rather than
+    // starting from 0.0 (which produces a ~5 ms undershoot transient heard
+    // as a click or crackle on every re-entry into a game).
+    float hp_ch[4]{};
 
     int16_t*       dma[4]  = {};
     AudioOutBuffer ab[4]   = {};
@@ -419,70 +424,10 @@ static struct GACtrl {
     bool              own_session = false;
     bool              ready       = false;
 
-    // paused  — submit silence, discard SPSC events.
-    // restore — on next active frame, replay regs[] into local GBAPU.
-    std::atomic<bool> paused {false};
-    std::atomic<bool> restore{false};
+    // paused — thread submits silence; GBAPU state is fully preserved.
+    std::atomic<bool> paused{false};
 } s_ctrl;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// restore_regs_to_apu
-//
-// Replays the live register mirror into a GBAPU to recover from a pause.
-//
-// Ordering is critical:
-//   1. NR52 first  — sets a.power=true so apply_reg accepts subsequent writes.
-//   2. NR50/51     — master vol + routing.
-//   3. Channel regs NRx0–NRx3 before NRx4, so trigger (bit7 of NRx4) fires
-//      with the correct period, volume, and duty already loaded.
-//      Trigger bit is MASKED OFF — we don't want to restart notes on resume,
-//      only restore the register state so fresh events work correctly.
-//   4. Wave RAM.
-//   HP capacitor state is preserved to avoid a click.
-// ─────────────────────────────────────────────────────────────────────────────
-static void restore_regs_to_apu(GBAPU& a) {
-    float hc[4]; memcpy(hc,a.hp_ch,sizeof(hc));
-
-    // 1. Power (NR52 = addr 0x26, mirror index 0x26-0x10 = 0x16)
-    apply_reg(a, 0x26, s_ctrl.regs[0x16]);
-
-    // 2. Master vol / panning
-    apply_reg(a, 0x24, s_ctrl.regs[0x14]);
-    apply_reg(a, 0x25, s_ctrl.regs[0x15]);
-
-    // 3. Channel registers — trigger byte last, bit7 masked off
-    // CH1 (NR10–NR14)
-    apply_reg(a, 0x10, s_ctrl.regs[0x00]);
-    apply_reg(a, 0x11, s_ctrl.regs[0x01]);
-    apply_reg(a, 0x12, s_ctrl.regs[0x02]);
-    apply_reg(a, 0x13, s_ctrl.regs[0x03]);
-    apply_reg(a, 0x14, s_ctrl.regs[0x04] & 0x7F);  // no retrigger
-
-    // CH2 (NR21–NR24; NR20 doesn't exist)
-    apply_reg(a, 0x16, s_ctrl.regs[0x06]);
-    apply_reg(a, 0x17, s_ctrl.regs[0x07]);
-    apply_reg(a, 0x18, s_ctrl.regs[0x08]);
-    apply_reg(a, 0x19, s_ctrl.regs[0x09] & 0x7F);  // no retrigger
-
-    // CH3 (NR30–NR34)
-    apply_reg(a, 0x1A, s_ctrl.regs[0x0A]);
-    apply_reg(a, 0x1B, s_ctrl.regs[0x0B]);
-    apply_reg(a, 0x1C, s_ctrl.regs[0x0C]);
-    apply_reg(a, 0x1D, s_ctrl.regs[0x0D]);
-    apply_reg(a, 0x1E, s_ctrl.regs[0x0E] & 0x7F);  // no retrigger
-
-    // CH4 (NR41–NR44)
-    apply_reg(a, 0x20, s_ctrl.regs[0x10]);
-    apply_reg(a, 0x21, s_ctrl.regs[0x11]);
-    apply_reg(a, 0x22, s_ctrl.regs[0x12]);
-    apply_reg(a, 0x23, s_ctrl.regs[0x13] & 0x7F);  // no retrigger
-
-    // 4. Wave RAM (0x30–0x3F → mirror index 0x20–0x2F)
-    for (uint8_t r=0x30; r<=0x3F; ++r)
-        apply_reg(a, r, s_ctrl.regs[r-0x10]);
-
-    memcpy(a.hp_ch,hc,sizeof(hc));
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // audio_write / audio_read — called by peanut_gb on the render thread.
@@ -527,6 +472,40 @@ static void gb_audio_thread_fn(void*) {
     GBAPU local{};
     local.ch4.lfsr=0x7FFF;
 
+    // Restore HP capacitor state saved from the previous session.
+    // Without this, hp_ch[] starts at 0.0 while the APU is mid-audio
+    // (sustained notes), producing a ~5 ms undershoot transient heard as a
+    // click or crackle on the very first generated audio frame.
+    // On a fresh ROM load s_ctrl.hp_ch is all zeros — correct starting state.
+    memcpy(local.hp_ch, s_ctrl.hp_ch, sizeof(local.hp_ch));
+
+    // Replay saved register state so the local GBAPU is in the right state
+    // before the main loop starts.  NR52 first to enable power so subsequent
+    // channel writes are accepted by apply_reg().
+    apply_reg(local,0x26,s_ctrl.regs[0x16]);          // NR52 — power on first
+    apply_reg(local,0x24,s_ctrl.regs[0x14]);          // NR50 master vol
+    apply_reg(local,0x25,s_ctrl.regs[0x15]);          // NR51 panning
+    apply_reg(local,0x10,s_ctrl.regs[0x00]);          // CH1
+    apply_reg(local,0x11,s_ctrl.regs[0x01]);
+    apply_reg(local,0x12,s_ctrl.regs[0x02]);
+    apply_reg(local,0x13,s_ctrl.regs[0x03]);
+    apply_reg(local,0x14,s_ctrl.regs[0x04]&0x7F);    // no retrigger
+    apply_reg(local,0x16,s_ctrl.regs[0x06]);          // CH2
+    apply_reg(local,0x17,s_ctrl.regs[0x07]);
+    apply_reg(local,0x18,s_ctrl.regs[0x08]);
+    apply_reg(local,0x19,s_ctrl.regs[0x09]&0x7F);
+    apply_reg(local,0x1A,s_ctrl.regs[0x0A]);          // CH3
+    apply_reg(local,0x1B,s_ctrl.regs[0x0B]);
+    apply_reg(local,0x1C,s_ctrl.regs[0x0C]);
+    apply_reg(local,0x1D,s_ctrl.regs[0x0D]);
+    apply_reg(local,0x1E,s_ctrl.regs[0x0E]&0x7F);
+    apply_reg(local,0x20,s_ctrl.regs[0x10]);          // CH4
+    apply_reg(local,0x21,s_ctrl.regs[0x11]);
+    apply_reg(local,0x22,s_ctrl.regs[0x12]);
+    apply_reg(local,0x23,s_ctrl.regs[0x13]&0x7F);
+    for(uint8_t r=0x30;r<=0x3F;++r)                  // wave RAM
+        apply_reg(local,r,s_ctrl.regs[r-0x10]);
+
     // Bresenham: accumulates GB_SPF_FRAC_INC each frame; flips 803→804 when
     // it overflows GB_CPU_HZ, giving exactly 48000 samples/sec on average.
     uint32_t spf_acc = 0;
@@ -545,6 +524,8 @@ static void gb_audio_thread_fn(void*) {
 
         if(s_ctrl.paused.load(std::memory_order_acquire)){
             // ── Paused path ───────────────────────────────────────────────────
+            // Drain SPSC so stale events don't pile up.  Submit silence.
+            // GBAPU state (including hp_ch) is preserved in local — no reset.
             s_ctrl.evt_r.store(
                 s_ctrl.evt_w.load(std::memory_order_acquire),
                 std::memory_order_release);
@@ -552,11 +533,6 @@ static void gb_audio_thread_fn(void*) {
 
         } else {
             // ── Active path ───────────────────────────────────────────────────
-            if(s_ctrl.restore.load(std::memory_order_acquire)){
-                restore_regs_to_apu(local);
-                s_ctrl.restore.store(false,std::memory_order_release);
-            }
-
             // Drain SPSC event queue up to frame-end sentinel (addr=0xFF).
             {
                 uint32_t r=s_ctrl.evt_r.load(std::memory_order_relaxed);
@@ -574,10 +550,6 @@ static void gb_audio_thread_fn(void*) {
         }
 
         // ── Submit ────────────────────────────────────────────────────────────
-        // Use audoutAppendAudioOutBuffer (non-blocking) so the mutex is held for
-        // microseconds, not 16.7ms.  The hardware queue stays 2-3 deep; combined
-        // with the two pre-queued silence frames there is always a buffer ready
-        // for the hardware to play — no gaps, no 60Hz amplitude modulation.
         {
             std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
             AudioOutBuffer* rel=nullptr; u32 cnt=0;
@@ -586,20 +558,35 @@ static void gb_audio_thread_fn(void*) {
             AudioOutBuffer& ab=s_ctrl.ab[s_ctrl.cur];
             ab.buffer     =s_ctrl.dma[s_ctrl.cur];
             ab.buffer_size=GB_DMA_CAP;
-            ab.data_size  =n_data;  // 803 or 804 samples — exact 48 kHz on average
+            ab.data_size  =n_data;
             ab.data_offset=0;
             ab.next       =nullptr;
-            audoutAppendAudioOutBuffer(&ab);  // non-blocking append
+            audoutAppendAudioOutBuffer(&ab);
         }
-        s_ctrl.cur=(s_ctrl.cur+1u)&3u;  // 4-buffer ring: 0→1→2→3→0
+        s_ctrl.cur=(s_ctrl.cur+1u)&3u;
 
         // ── Sleep for remainder of frame period ───────────────────────────────
+        // Skip sleep when thread_run is false so the thread exits immediately
+        // rather than waiting up to 16 ms.  threadWaitForExit then returns in
+        // < 1 ms, keeping gb_audio_shutdown() safe to call from handleInput.
         clock_gettime(CLOCK_MONOTONIC,&ts);
         const int64_t now_ns=(int64_t)ts.tv_sec*1'000'000'000LL+ts.tv_nsec;
         const int64_t sleep_ns=next_ns-now_ns;
-        if(sleep_ns>0) svcSleepThread(sleep_ns);
+        if(sleep_ns>0 && s_ctrl.thread_run.load(std::memory_order_relaxed))
+            svcSleepThread(sleep_ns);
         next_ns+=GB_FRAME_NS;
+        // If we've fallen behind real time by more than one frame (scheduler
+        // jitter, mutex contention, generate_samples overrun), snap next_ns
+        // forward to now+1 frame.  Without this clamp the thread spins through
+        // back-to-back iterations with sleep_ns<=0, submitting frames faster
+        // than the hardware plays them and building up unbounded queue latency.
+        if(next_ns < now_ns)
+            next_ns = now_ns + GB_FRAME_NS;
     }
+
+    // Save HP capacitor state so the next thread startup (after shutdown/init)
+    // can restore it, avoiding the undershoot transient described above.
+    memcpy(s_ctrl.hp_ch, local.hp_ch, sizeof(local.hp_ch));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -610,10 +597,10 @@ static bool gb_audio_init(gb_s*) {
 
     s_ctrl.evt_w.store(0,std::memory_order_relaxed);
     s_ctrl.evt_r.store(0,std::memory_order_relaxed);
-    memset(s_ctrl.regs,0,sizeof(s_ctrl.regs));
+    // Do NOT zero s_ctrl.regs or s_ctrl.hp_ch — they hold state from the
+    // previous session and are restored by the thread on startup.
     s_ctrl.cur=0;
-    s_ctrl.paused.store(false, std::memory_order_relaxed);
-    s_ctrl.restore.store(false,std::memory_order_relaxed);
+    s_ctrl.paused.store(false,std::memory_order_relaxed);
 
     for(int i=0;i<4;++i){
         free(s_ctrl.dma[i]);
@@ -626,20 +613,27 @@ static bool gb_audio_init(gb_s*) {
     }
 
     if(!ult::Audio::m_initialized){
-        if(R_FAILED(audoutInitialize())||R_FAILED(audoutStartAudioOut())){
-            audoutExit();
-            free(s_ctrl.dma[0]);free(s_ctrl.dma[1]);
-            s_ctrl.dma[0]=s_ctrl.dma[1]=nullptr;return false;
+        if(R_FAILED(audoutInitialize())){
+            for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;}
+            return false;
         }
         s_ctrl.own_session=true;
     }
 
-    // Pre-queue two silence frames so the hardware DMA queue has ~33 ms of
-    // headroom before the audio thread generates its first frame.
-    // MUST use audoutAppendAudioOutBuffer (non-blocking), NOT audoutPlayBuffer.
-    // audoutPlayBuffer blocks until the submitted buffer finishes playing, so
-    // calling it here would drain both silence frames before threadStart(),
-    // leaving the queue empty and causing the 60Hz gap artifact described above.
+    // Stop then restart audout for exclusive, clean stream ownership.
+    // When ultrahand owns the session its audio thread may still be active.
+    // Stop flushes all their queued buffers so our silence pre-roll is the
+    // first thing the hardware plays — no stale frames, no de-sync.
+    audoutStopAudioOut();
+    if(R_FAILED(audoutStartAudioOut())){
+        if(s_ctrl.own_session){audoutExit();s_ctrl.own_session=false;}
+        else{audoutStartAudioOut();}  // best-effort restore if Start failed
+        for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;}
+        return false;
+    }
+
+    // Pre-queue two silence frames for ~33 ms of headroom before the audio
+    // thread generates its first real frame.
     s_ctrl.cur=2;
     {
         std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
@@ -648,18 +642,18 @@ static bool gb_audio_init(gb_s*) {
             s_ctrl.ab[i].buffer     =s_ctrl.dma[i];
             s_ctrl.ab[i].buffer_size=GB_DMA_CAP;
             s_ctrl.ab[i].data_size  =GB_DMA_DATA;
-            audoutAppendAudioOutBuffer(&s_ctrl.ab[i]);  // non-blocking: stays in queue
+            audoutAppendAudioOutBuffer(&s_ctrl.ab[i]);
         }
     }
     s_ctrl.thread_run.store(true,std::memory_order_relaxed);
-    // Priority 0x2B (one notch above render thread 0x2C) — audio must never
-    // be starved by the 23K drawRect calls in the render path.
     if(R_FAILED(threadCreate(&s_ctrl.thread_handle,
                               gb_audio_thread_fn,nullptr,
                               nullptr,0x4000,0x2B,-2)))
     {
         s_ctrl.thread_run.store(false);
-        if(s_ctrl.own_session){audoutStopAudioOut();audoutExit();s_ctrl.own_session=false;}
+        audoutStopAudioOut();
+        if(s_ctrl.own_session){audoutExit();s_ctrl.own_session=false;}
+        else{audoutStartAudioOut();}  // restore ultrahand's stream on failure
         for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;}
         return false;
     }
@@ -676,16 +670,13 @@ static void gb_audio_pause() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// gb_audio_resume — call before re-entering the emulator.
+// gb_audio_resume — call from Overlay::onShow() after a system-combo hide.
 //
-// Clears the paused flag only.  The audio thread's local GBAPU is never
-// touched while paused — it carries through exactly as-is.  No register
-// restore is needed or performed.
-//
-// restore_regs_to_apu() is intentionally NOT called: it masks off trigger
-// bits (bit 7 of NRx4) so ch.enabled is never set back to true.  Channels
-// on sustained notes the game isn't actively retriggering stay permanently
-// silent after resume.
+// Simply clears the paused flag.  The thread transitions from submitting
+// silence to generating real audio on the very next iteration.  At most one
+// silence frame (16.7 ms) was submitted ahead of the first real-audio frame —
+// imperceptible.  hp_ch[] is preserved in the running thread, so there is no
+// transient.  No flush or re-queue is needed.
 // ─────────────────────────────────────────────────────────────────────────────
 static void gb_audio_resume() {
     s_ctrl.paused.store(false, std::memory_order_release);
@@ -698,17 +689,57 @@ static void gb_audio_shutdown() {
     if(!s_ctrl.ready) return;
     s_ctrl.ready=false;
 
+    // Signal the thread to stop.  The thread skips its sleep when thread_run
+    // is false, so threadWaitForExit returns in < 1 ms.  The thread writes
+    // local.hp_ch back to s_ctrl.hp_ch just before returning.
     s_ctrl.thread_run.store(false,std::memory_order_release);
     threadWaitForExit(&s_ctrl.thread_handle);
     threadClose(&s_ctrl.thread_handle);
 
+    // Under m_audioMutex so no concurrent playSound() can interfere.
+    //
+    // 1. audoutFlushAudioOutBuffers — releases all queued-but-not-yet-
+    //    playing buffers from the kernel queue.
+    // 2. audoutStopAudioOut — synchronous IPC call: hardware DMA is fully
+    //    stopped when it returns.  free() is safe immediately after.
+    //    DO NOT use audoutWaitPlayFinish: it only dequeues ONE buffer per
+    //    call; with 2-4 buffers in the ring it returns while the hardware
+    //    is still DMA-reading the next one — free() then crashes.
+    //    This Flush+Stop pattern matches ultrahand's own Audio::exit().
+    // 3. audoutStartAudioOut (non-own_session) — restores ultrahand's stream
+    //    inside the mutex so triggerExitFeedback → playSound() immediately
+    //    finds a live stream when it next acquires the mutex.
     {
         std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
-        AudioOutBuffer* rel=nullptr; u32 cnt=0;
-        for(int i=0;i<16;++i) audoutGetReleasedAudioOutBuffer(&rel,&cnt);
+        bool dummy=false;
+        audoutFlushAudioOutBuffers(&dummy);
+        audoutStopAudioOut();
+
+        if(s_ctrl.own_session){
+            audoutExit();
+            s_ctrl.own_session=false;
+        } else {
+            audoutStartAudioOut();
+        }
     }
-    if(s_ctrl.own_session){audoutStopAudioOut();audoutExit();s_ctrl.own_session=false;}
+
     for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;s_ctrl.ab[i]={};}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_reset_regs — clear APU register state for a fresh ROM load.
+//
+// Called by gb_load_rom() after gb_unload_rom() when switching to a different
+// game.  Zeroing regs[] prevents the audio thread from replaying the old game's
+// NR10–NR52 register state (via apply_reg() on startup) into the new game's APU.
+//
+// hp_ch[] is intentionally NOT touched here — it holds the DC-blocker filter
+// state.  Resetting it to 0.0 while the APU is mid-audio causes a ~5 ms
+// undershoot transient heard as a click on the first audio frame.  The new
+// game's audio settles the filter within a few frames naturally.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_reset_regs() {
+    memset(s_ctrl.regs, 0, sizeof(s_ctrl.regs));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -40,37 +40,36 @@ static constexpr const char* SAVE_DIR    = "sdmc:/config/gbemu/saves/";
 static char g_rom_dir[512] = "sdmc:/roms/gb/";
 
 static void load_config() {
-    FILE* f = fopen(CONFIG_FILE, "r");
-    if (!f) return;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-            line[--len] = '\0';
-        const size_t KLEN = 8; // "rom_dir="
-        if (strncmp(line, "rom_dir=", KLEN) == 0) {
-            const char* val = line + KLEN;
-            const size_t vlen = strlen(val);
-            if (vlen > 0 && vlen < sizeof(g_rom_dir) - 2) {
-                strncpy(g_rom_dir, val, sizeof(g_rom_dir) - 2);
-                g_rom_dir[vlen] = '\0';
-                if (g_rom_dir[vlen-1] != '/') {
-                    g_rom_dir[vlen]   = '/';
-                    g_rom_dir[vlen+1] = '\0';
-                }
-            }
+    const std::string path = CONFIG_FILE;
+
+    // rom_dir
+    const std::string rom_dir_val = ult::parseValueFromIniSection(path, "config", "rom_dir");
+    if (!rom_dir_val.empty() && rom_dir_val.size() < sizeof(g_rom_dir) - 2) {
+        strncpy(g_rom_dir, rom_dir_val.c_str(), sizeof(g_rom_dir) - 2);
+        const size_t vlen = strlen(g_rom_dir);
+        if (vlen > 0 && g_rom_dir[vlen - 1] != '/') {
+            g_rom_dir[vlen]     = '/';
+            g_rom_dir[vlen + 1] = '\0';
         }
     }
-    fclose(f);
+
+    // original_palette
+    const std::string pal_val = ult::parseValueFromIniSection(path, "config", "original_palette");
+    if (!pal_val.empty())
+        g_original_palette = (pal_val == "true" || pal_val == "1");
 }
 
 static void write_default_config_if_missing() {
-    FILE* t = fopen(CONFIG_FILE, "r");
-    if (t) { fclose(t); return; }
-    FILE* f = fopen(CONFIG_FILE, "w");
-    if (!f) return;
-    fprintf(f, "# Ultra-Boy config\n# Set rom_dir to your .gb/.gbc folder\nrom_dir=%s\n", g_rom_dir);
-    fclose(f);
+    const std::string path = CONFIG_FILE;
+    // Write keys only if they don't already exist
+    const std::string existing_dir = ult::parseValueFromIniSection(path, "config", "rom_dir");
+    if (existing_dir.empty())
+        ult::setIniFileValue(path, "config", "rom_dir", g_rom_dir,
+                             "Set rom_dir to your .gb/.gbc folder");
+    const std::string existing_pal = ult::parseValueFromIniSection(path, "config", "original_palette");
+    if (existing_pal.empty())
+        ult::setIniFileValue(path, "config", "original_palette", "true",
+                             "true = classic DMG greyscale, false = GBC color");
 }
 
 // =============================================================================
@@ -79,6 +78,77 @@ static void write_default_config_if_missing() {
 GBState  g_gb;
 uint16_t g_gb_fb[GB_W * GB_H] = {};
 static bool g_emu_active = false;
+bool g_original_palette = true;   // true = DMG greyscale, false = GBC green tint
+bool g_fb_is_rgb565     = false;  // true when CGB mode; set in gb_load_rom
+
+// =============================================================================
+// Virtual on-screen button layout (Game Boy skin)
+// All coordinates are in overlay pixels (448 × 720).
+// The screen bottom sits at VP_Y + VP_H = 140 + 360 = 500, leaving 220 px of
+// controller area below it.  Layout mirrors a real DMG Game Boy:
+//   D-pad   — lower-left
+//   B / A   — lower-right, staggered (B lower-left of A, matching real GB)
+//   Start   — centre, near bottom
+//
+// Draw positions (top-left x, baseline y) are compile-time constants.
+// Hit-test centres are derived at runtime from getTextDimensions() so they
+// track the glyph's actual visual centre regardless of font metrics.
+// =============================================================================
+
+// D-pad — \uE110
+static constexpr int DPAD_DRAW_X = 29;    // left edge  = DPAD_CX - DPAD_SIZE/2
+static constexpr int DPAD_DRAW_Y = 634+4;   // baseline   = DPAD_CY + DPAD_SIZE/2
+static constexpr int DPAD_SIZE   = 112;
+static constexpr int DPAD_R      = 54;    // hit radius for each directional arm
+
+// A button — \uE0E0
+static constexpr int ABTN_DRAW_X = 344;   // left edge
+static constexpr int ABTN_DRAW_Y = 594;   // baseline
+static constexpr int ABTN_SIZE   = 72;
+static constexpr int ABTN_R      = 38;
+
+// B button — \uE0E1
+static constexpr int BBTN_DRAW_X = 289;   // left edge
+static constexpr int BBTN_DRAW_Y = 633;   // baseline
+static constexpr int BBTN_SIZE   = 58;
+static constexpr int BBTN_R      = 30;
+
+// Start — \uE0F1
+// IMPORTANT: must stay above FOOTER_Y (FB_H - 73 = 647).  Any touch whose
+// *initial* y is >= FOOTER_Y is treated by the framework as a footer button
+// press (back / select), firing rumble and injecting KEY_B / KEY_A even when
+// the bottom bar is not rendered.
+static constexpr int FOOTER_Y    = FB_H;   // 647
+static constexpr int START_DRAW_X = 209;
+static constexpr int START_DRAW_Y = 626 + 44;         // baseline — keep below FOOTER_Y
+static constexpr int START_SIZE   = 30;
+static constexpr int START_R      = 24;
+
+// Solid grey — fully opaque so glyphs read clearly against the wallpaper
+static constexpr tsl::Color VBTN_COLOR{0xB, 0xB, 0xB, 0xF};
+
+// Hit-test centres, populated on first draw from getTextDimensions().
+// Initialised to geometric centres so they work even before measurement.
+static int g_dpad_hx  = DPAD_DRAW_X  + DPAD_SIZE  / 2;
+static int g_dpad_hy  = DPAD_DRAW_Y  - DPAD_SIZE  / 2;
+static int g_abtn_hx  = ABTN_DRAW_X  + ABTN_SIZE  / 2;
+static int g_abtn_hy  = ABTN_DRAW_Y  - ABTN_SIZE  / 2;
+static int g_bbtn_hx  = BBTN_DRAW_X  + BBTN_SIZE  / 2;
+static int g_bbtn_hy  = BBTN_DRAW_Y  - BBTN_SIZE  / 2;
+static int g_start_hx = START_DRAW_X + START_SIZE  / 2;
+static int g_start_hy = START_DRAW_Y - START_SIZE  / 2;
+static bool g_btns_measured = false;
+
+// Virtual key bitmask accumulated each frame from touch input.
+static u64 g_touch_keys = 0;
+
+// True GB frame period: 70224 T-cycles / 4194304 Hz ≈ 16.743 ms (59.73 fps).
+// Used to rate-limit gb_run_one_frame() independently of the 60 fps display vsync.
+static constexpr int64_t GB_RENDER_FRAME_NS =
+    (int64_t)70224 * 1'000'000'000LL / (int64_t)4194304;  // 16742706 ns
+
+// GB frame clock: 0 = unanchored, set to real time on first draw after load/resume.
+static int64_t g_gb_frame_next_ns = 0;
 
 // =============================================================================
 // Save helpers
@@ -113,6 +183,7 @@ static void write_save(GBState& s) {
 // =============================================================================
 bool gb_load_rom(const char* path) {
     if (g_gb.rom && strncmp(g_gb.romPath, path, sizeof(g_gb.romPath)) == 0) {
+        g_gb_frame_next_ns = 0;  // re-anchor clock on resume
         g_gb.running = true;
         return true;
     }
@@ -137,11 +208,29 @@ bool gb_load_rom(const char* path) {
     build_save_path(path, g_gb.savePath, sizeof(g_gb.savePath));
 
     const enum gb_init_error_e err =
-        gb_init(&g_gb.gb, gb_rom_read, gb_cart_ram_read, gb_cart_ram_write, gb_error, nullptr);
+        gb_init(&g_gb.gb,
+                gb_rom_read, gb_rom_read16, gb_rom_read32,
+                gb_cart_ram_read, gb_cart_ram_write,
+                gb_error, nullptr);
     if (err != GB_INIT_NO_ERROR) { free(g_gb.rom); g_gb.rom = nullptr; return false; }
+
+    // Detect whether this is a CGB ROM so the renderer uses the right converter.
+    // cgbMode is set by gb_init() when it reads byte 0x143 of the ROM header.
+#if WALNUT_FULL_GBC_SUPPORT
+    g_fb_is_rgb565 = (g_gb.gb.cgb.cgbMode != 0);
+#else
+    g_fb_is_rgb565 = false;
+#endif
 
     size_t ramSz = 0;
     gb_get_save_size_s(&g_gb.gb, &ramSz);
+    // MBC3 cartridges (especially Zelda Oracle / Pokémon Gold/Silver) can have
+    // bad ROM headers that declare only 8KB of SRAM when the game actually uses
+    // 4 banks × 8KB = 32KB.  If the game writes to banks 1–3 and gets 0xFF back
+    // it will enter a corrupted state during the intro save-RAM initialisation.
+    // Clamp MBC3 to a minimum of 32KB so all four banks are always available.
+    if (g_gb.gb.mbc == 3 && ramSz > 0 && ramSz < 0x8000)
+        ramSz = 0x8000;
     if (ramSz) {
         g_gb.cartRam   = static_cast<uint8_t*>(calloc(ramSz, 1));
         g_gb.cartRamSz = ramSz;
@@ -150,11 +239,16 @@ bool gb_load_rom(const char* path) {
 
     gb_init_lcd(&g_gb.gb, gb_lcd_draw_line);
 
+    // Clear the framebuffer BEFORE gb_reset() — peanut_gb fires gb_lcd_draw_line
+    // for line 0 during reset itself.  If memset runs after, that first draw is
+    // erased and row 0 stays black until the second frame completes.
+    memset(g_gb_fb, 0, sizeof(g_gb_fb));
+
     // ── Init audio BEFORE gb_reset() so the APU callback is live from frame 1 ──
     gb_audio_init(&g_gb.gb);
 
-    gb_reset(&g_gb.gb);
-    memset(g_gb_fb, 0, sizeof(g_gb_fb));
+    //gb_reset(&g_gb.gb);
+    g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     g_gb.running = true;
     return true;
 }
@@ -235,13 +329,25 @@ static std::vector<std::string> scan_roms(const char* dir) {
 class GBScreenElement : public tsl::elm::Element {
 public:
     virtual void draw(tsl::gfx::Renderer* renderer) override {
+        // Zero the footer-button width atomics every frame.
+        // The Overlay's touch handler computes backTouched / nextPageTouched as:
+        //   touchPos.x >= backLeftEdge && touchPos.x < (backLeftEdge + backWidth)
+        // With backWidth == 0 the right edge equals the left edge, so the
+        // condition is never satisfied — no rumble, no simulatedBack injection,
+        // regardless of where the user touches.  The ROM selector's OverlayFrame
+        // will recalculate correct values on its first draw after we swap back.
+        ult::backWidth.store(0.0f,     std::memory_order_release);
+        ult::selectWidth.store(0.0f,   std::memory_order_release);
+        ult::nextPageWidth.store(0.0f, std::memory_order_release);
+        ult::halfGap.store(0.0f,       std::memory_order_release);
+        ult::hasNextPageButton.store(false, std::memory_order_release);
         renderer->fillScreen(renderer->a(tsl::defaultBackgroundColor));
         renderer->drawWallpaper();
     
         //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
         
         // Use cached or current data for rendering
-        const std::string& renderTitle = "UltraGB";
+        const std::string& renderTitle = "UltraGBC";
         const std::string& renderSubtitle = APP_VERSION;
         
         y = 50;
@@ -256,26 +362,102 @@ public:
         //render_gb_background(renderer);
 
         if (!g_gb.running || !g_emu_active) {
-            renderer->drawString("Paused", false,
-                VP_X + VP_W/2 - 24, VP_Y + VP_H/2, 20,
-                tsl::defaultTextColor);
+            //renderer->drawString("Paused", false,
+            //    VP_X + VP_W/2 - 24, VP_Y + VP_H/2, 20,
+            //    tsl::defaultTextColor);
             return;
         }
 
-        // Run one emulated frame (also triggers APU callback → ring buffer)
-        gb_run_one_frame();
+        // Rate-limit the GB CPU to its true clock rate (59.73fps) regardless of
+        // display vsync (60fps).  At 60fps the render thread would drive game logic
+        // 0.45% faster than the audio thread plays it, accumulating ~1.35 seconds
+        // of A/V drift after 5 minutes.  Instead, only advance the GB when a full
+        // GB frame period (GB_FRAME_NS ≈ 16.743ms) has elapsed since the last one.
+        // When a display frame fires but no GB frame is due, we simply re-draw the
+        // previous framebuffer — one repeated frame every ~3.7 seconds, imperceptible.
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
 
-        // Submit any accumulated audio samples to audout
-        gb_audio_submit();
+            if (g_gb_frame_next_ns == 0)
+                g_gb_frame_next_ns = now_ns;  // anchor on first draw
+
+            if (now_ns >= g_gb_frame_next_ns) {
+                gb_run_one_frame();
+                gb_audio_submit();
+                g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
+                // If we fell behind by more than one frame, re-anchor rather than
+                // spinning to catch up (which would flood the audio queue).
+                if (g_gb_frame_next_ns < now_ns)
+                    g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
+            }
+        }
 
         render_gb_screen(renderer);
         render_gb_border(renderer);
 
-        const char* sl = strrchr(g_gb.romPath, '/');
-        renderer->drawString(sl ? sl+1 : g_gb.romPath, false,
-            VP_X+4, VP_Y-14, 12, tsl::defaultTextColor);
-        renderer->drawString("X: ROM list", false,
-            VP_X+4, VP_Y+VP_H+16, 12, tsl::defaultTextColor);
+        //const char* sl = strrchr(g_gb.romPath, '/');
+        //renderer->drawString(sl ? sl+1 : g_gb.romPath, false,
+        //    VP_X+4, VP_Y-14, 12, tsl::defaultTextColor);
+        renderer->drawString("\uE0E2 "+ult::DIVIDER_SYMBOL+" "+ult::BACK, false,
+            VP_X+4, VP_Y+VP_H+16, 14, tsl::defaultTextColor);
+
+        // ── Virtual Game Boy controls ─────────────────────────────────────────
+        // On first frame, measure each glyph's actual rendered dimensions and
+        // derive the true visual centre for hit testing.  This accounts for
+        // the font's internal bearing/ascender so the hit region tracks the
+        // glyph exactly rather than a hand-guessed geometric centre.
+        if (!g_btns_measured) {
+            auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
+            g_dpad_hx  = DPAD_DRAW_X  + dw / 2;
+            g_dpad_hy  = (DPAD_DRAW_Y - 10) - dh / 2 + 10;
+
+            auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
+            g_abtn_hx  = ABTN_DRAW_X  + aw / 2;
+            g_abtn_hy  = ABTN_DRAW_Y  - ah / 2;
+
+            auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
+            g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
+            g_bbtn_hy  = BBTN_DRAW_Y  - bh / 2;
+
+            auto [sw, sh] = renderer->getTextDimensions("\uE0F1", false, START_SIZE);
+            g_start_hx = START_DRAW_X + sw / 2;
+            g_start_hy = START_DRAW_Y - sh / 2;
+
+            g_btns_measured = true;
+        }
+
+        // ── D-pad composite — all four arrow directions ───────────────────────
+        // Think of each glyph as a 3×3 grid:
+        //   E115 (↑↓): arrows live in the center COLUMN (col 1 of 0-2)
+        //   E116 (←→): arrows live in the center ROW    (row 1 of 0-2)
+        // Scissor each to only its relevant strip; they share the center cell.
+        {
+            const s32 baseline  = DPAD_DRAW_Y - 10;
+            const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
+            const s32 left      = DPAD_DRAW_X;
+            const s32 top       = baseline - static_cast<s32>(dh);
+            const s32 thirdW    = static_cast<s32>(dw) / 3;
+            const s32 thirdH    = static_cast<s32>(dh) / 3;
+
+            // E115: center column — x constrained to middle third (+1px each side).
+            // Y is intentionally over-sized (DPAD_SIZE*2) so the scissor never
+            // clips the top or bottom of the ↑↓ arrows regardless of descenders.
+            renderer->enableScissoring(left + thirdW - 1, top - DPAD_SIZE / 2,
+                                       thirdW + 2, DPAD_SIZE * 2);
+            renderer->drawString("\uE115", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
+            renderer->disableScissoring();
+
+            // E116: center row — widened by 2px (1px each side), nudged down 10px total
+            renderer->enableScissoring(left, top + thirdH + 10,
+                                       static_cast<s32>(dw), thirdH + 2);
+            renderer->drawString("\uE116", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
+            renderer->disableScissoring();
+        }
+        renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y,  ABTN_SIZE,  VBTN_COLOR);
+        renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y,  BBTN_SIZE,  VBTN_COLOR);
+        renderer->drawString("\uE0F1", false, START_DRAW_X, START_DRAW_Y, START_SIZE, VBTN_COLOR);
 
         if (!ult::useRightAlignment)
             renderer->drawRect(447, 0, 448, 720, a(tsl::edgeSeparatorColor));
@@ -294,10 +476,15 @@ class RomSelectorGui; // forward declare
 // =============================================================================
 class GBEmulatorGui : public tsl::Gui {
     bool m_waitForRelease = true;  // ignore input until all buttons are released
+    u64 m_prevTouchKeys = 0;       // track previous touch state
 public:
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = true;
         m_waitForRelease = true;
+        // No bottom bar is drawn in-game. Tell the framework there are no
+        // clickable items so footer-zone touches don't highlight the select
+        // button or fire its rumble / simulation callbacks.
+        ult::noClickableItems.store(true, std::memory_order_release);
         return new GBScreenElement();
     }
 
@@ -307,28 +494,99 @@ public:
                              const HidTouchState& touchPos,
                              HidAnalogStickState leftJoy,
                              HidAnalogStickState rightJoy) override {
-        (void)touchPos; (void)leftJoy; (void)rightJoy;
+        (void)leftJoy; (void)rightJoy;
 
         // Block all input until the buttons that launched us are fully released.
         // keysHeld stays non-zero as long as any button remains physically held,
         // so we wait for a clean frame before passing anything to the GB core.
         if (m_waitForRelease) {
             if (keysHeld) return true;
+            g_touch_keys = 0;
+            m_prevTouchKeys = 0;
             m_waitForRelease = false;
         }
 
-        // X → pause + back to ROM picker, state preserved
+        // ── Touch → virtual button state ──────────────────────────────────────
+        // Sample the first active touch point each frame and map it to GB keys.
+        // D-pad touch area is split into 4 directional arms by comparing the
+        // absolute x and y deltas from the pad centre — whichever axis dominates
+        // determines the pressed direction.  A, B, and Start are circular zones.
+        // HidTouchState in this libtesla fork is a single resolved touch point
+        // with flat .x / .y fields — no .count or .touches[] array.
+        // (0, 0) is the sentinel meaning "no active touch".
+        //
+        // Any touch with an initial y >= FOOTER_Y is intercepted by the
+        // framework as a footer button press even when the bar isn't drawn.
+        // We simply ignore those touches so they never reach the GB core.
+        g_touch_keys = 0;
+        if ((touchPos.x != 0 || touchPos.y != 0) &&
+            static_cast<int>(touchPos.y) < FOOTER_Y) {
+            const int tx = static_cast<int>(touchPos.x);
+            const int ty = static_cast<int>(touchPos.y);
+
+            // D-pad — split into 4 arms from the measured glyph centre
+            {
+                const int dx = tx - g_dpad_hx;
+                const int dy = ty - g_dpad_hy;
+                if (dx*dx + dy*dy <= DPAD_R * DPAD_R) {
+                    if (std::abs(dx) >= std::abs(dy)) {
+                        g_touch_keys |= (dx >= 0) ? KEY_RIGHT : KEY_LEFT;
+                    }
+                    else {
+                        g_touch_keys |= (dy >= 0) ? KEY_DOWN : KEY_UP;
+                    }
+                }
+            }
+
+            // A button
+            {
+                const int dx = tx - g_abtn_hx, dy = ty - g_abtn_hy;
+                if (dx*dx + dy*dy <= ABTN_R * ABTN_R) {
+                    g_touch_keys |= KEY_A;
+                }
+            }
+
+            // B button
+            {
+                const int dx = tx - g_bbtn_hx, dy = ty - g_bbtn_hy;
+                if (dx*dx + dy*dy <= BBTN_R * BBTN_R) {
+                    g_touch_keys |= KEY_B;
+                }
+            }
+
+            // Start
+            {
+                const int dx = tx - g_start_hx, dy = ty - g_start_hy;
+                if (dx*dx + dy*dy <= START_R * START_R) {
+                    g_touch_keys |= KEY_PLUS;
+                }
+            }
+        }
+
+        // Trigger rumble ONLY on new touch presses (not holds)
+        u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
+        if (newTouchPresses) {
+            triggerRumbleClick.store(true, std::memory_order_release);
+        }
+        m_prevTouchKeys = g_touch_keys;
+
+        // X → back to ROM picker.  Shut audio down completely so the audout
+        // session is released and ultrahand / other overlays get clean access.
+        // gb_audio_init() will restart it fresh when a game is re-entered.
         if (keysDown & KEY_X) {
-            g_gb.running = false;
-            g_emu_active = false;
-            gb_audio_pause();
+            g_touch_keys  = 0;
+            g_gb.running  = false;
+            g_emu_active  = false;
+            // Restore normal clickable-item state for the ROM selector UI.
+            ult::noClickableItems.store(false, std::memory_order_release);
+            gb_audio_shutdown();
             triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>();
             return true;
         }
 
-        // Pass all held keys + fresh presses to the GB core
-        gb_set_input(keysHeld | keysDown);
+        // Pass physical held + fresh presses + virtual touch keys to the GB core
+        gb_set_input(keysHeld | keysDown | g_touch_keys);
 
         // Trigger rumble on ANY new button press
         if (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
@@ -348,6 +606,10 @@ public:
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = false;
 
+        // Initialize the audio service
+        if (ult::useSoundEffects && !ult::limitedMemory) {
+            ult::Audio::initialize();
+        }
         
         auto* list  = new tsl::elm::List();
 
@@ -379,9 +641,14 @@ public:
                                                     inProgress ? ult::INPROGRESS_SYMBOL : "");
                 item->setClickListener([path, inProgress](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
+
+                    if (ult::useSoundEffects && !ult::limitedMemory) {
+                        ult::Audio::exit();
+                    }
                     if (inProgress) {
+                        gb_audio_init(&g_gb.gb);
+                        g_gb_frame_next_ns = 0;
                         g_gb.running = true;
-                        gb_audio_resume();
                     } else {
                         if (!gb_load_rom(path.c_str())) return false;
                     }
@@ -392,7 +659,7 @@ public:
             }
         }
 
-        auto* frame = new tsl::elm::OverlayFrame("UltraGB", APP_VERSION);
+        auto* frame = new tsl::elm::OverlayFrame("UltraGBC", APP_VERSION);
         frame->m_showWidget = true;
         frame->setContent(list);
         return frame;
@@ -445,6 +712,7 @@ public:
     // from gb_run_frame() register events within one frame (~16.7 ms).
     virtual void onShow() override {
         if (g_gb.rom) {
+            g_gb_frame_next_ns = 0;
             g_gb.running = true;
             g_emu_active = true;
             gb_audio_resume();

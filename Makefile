@@ -15,25 +15,24 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-APP_TITLE   := UltraGB
+APP_TITLE   := UltraGBC
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.1.0
+APP_VERSION := 0.2.0
 TARGET      := gbemu
 BUILD       := build
 SOURCES     := source
-INCLUDES    := source include lib/Peanut-GB
+INCLUDES    := source include lib/Walnut-CGB
 NO_ICON     := 1
 
 # libultrahand — keep the same relative location as Tetris Overlay
 include ${TOPDIR}/lib/libultrahand/ultrahand.mk
 
 #---------------------------------------------------------------------------------
-# Peanut-GB compile-time options (passed to both C and C++ TUs)
+# Walnut-GB compile-time options (passed to both C and C++ TUs)
 #---------------------------------------------------------------------------------
 PEANUT_DEFINES := -DENABLE_LCD=1 \
-                  -DENABLE_GBC_SUPPORT=1 \
-                  -DPEANUT_GB_HIGH_LCD_ACCURACY=0 \
-                  -DGB_INTERNAL
+                  -DWALNUT_FULL_GBC_SUPPORT=1 \
+                  -DWALNUT_GB_HIGH_LCD_ACCURACY=0
 
 #---------------------------------------------------------------------------------
 ARCH := -march=armv8-a+simd+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -48,7 +47,7 @@ CFLAGS := -g -Wall -O3 \
 CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2
 
 # Overlay UI config path
-UI_OVERRIDE_PATH := /config/ultra_boy/
+UI_OVERRIDE_PATH := /config/gbemu/
 CFLAGS += -DUI_OVERRIDE_PATH="\"$(UI_OVERRIDE_PATH)\""
 
 # Enable Widget
