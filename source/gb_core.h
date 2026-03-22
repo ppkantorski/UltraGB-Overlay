@@ -192,17 +192,32 @@ bool gb_load_rom(const char* romPath);
 // Save cart RAM to file and free all emulator resources.
 void gb_unload_rom();
 
-// Run exactly one Game Boy frame.
-// Uses gb_run_frame() (the __gb_step_cpu_x path — original Peanut-GB execution
-// core) rather than gb_run_frame_dualfetch() (__gb_step_cpu dual-fetch model).
-// The dual-fetch model has compatibility gaps with some MBC3 games like Oracle
-// of Seasons that cause freezes even with all SAFE_DUALFETCH flags enabled.
-// gb_run_frame() still benefits from Walnut's DMA and CGB hardware emulation;
-// it just skips the dual-fetch opcode dispatch optimisation.
+// Run exactly one Game Boy frame using Walnut-CGB's dual-fetch execution path.
+// The three fixes applied to walnut_cgb.h that make Oracle of Seasons (and other
+// CGB games) work correctly:
+//
+//   1. LCD-off VBlank interrupt (the main freeze fix):
+//      Real hardware fires VBLANK_INTR even when the LCD is disabled. Walnut was
+//      not setting IO_IF |= VBLANK_INTR in the lcd_off_count path, so any game
+//      that turns off the LCD during a scene transition and then HALTs waiting
+//      for VBlank would spin in the do-while forever (IO_IF & IO_IE stayed 0).
+//
+//   2. HALT lcd_cycles double-speed scaling:
+//      The HALT handler computed lcd_cycles in display-clock ticks but used the
+//      value raw as inst_cycles, which is then halved by >>doubleSpeed. In
+//      double-speed mode this causes a Zeno-paradox convergence to lcd_count=455
+//      where 1>>1=0 stops all progress. Fix: scale lcd_cycles << doubleSpeed.
+//
+//   3. inst_cycles>1 guard removal:
+//      The lcd_count += path guarded the >>doubleSpeed shift with inst_cycles>1,
+//      skipping it for 1-cycle instructions and making lcd_count advance too fast.
+//
 // Must only be called when g_gb.running == true.
 inline void gb_run_one_frame() {
-    if (g_gb.running)
-        gb_run_frame_dualfetch(&g_gb.gb);  // ← switch back to this
+    if (g_gb.running) {
+        gb_run_frame_dualfetch(&g_gb.gb);
+        //gb_run_frame(&g_gb.gb);
+    }
 }
 
 // Update the joypad from the overlay's keysHeld bitmask.

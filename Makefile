@@ -31,8 +31,7 @@ include ${TOPDIR}/lib/libultrahand/ultrahand.mk
 # Walnut-GB compile-time options (passed to both C and C++ TUs)
 #---------------------------------------------------------------------------------
 PEANUT_DEFINES := -DENABLE_LCD=1 \
-                  -DWALNUT_FULL_GBC_SUPPORT=1 \
-                  -DWALNUT_GB_HIGH_LCD_ACCURACY=0
+                  -DWALNUT_FULL_GBC_SUPPORT=1
 
 #---------------------------------------------------------------------------------
 ARCH := -march=armv8-a+simd+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

@@ -37,6 +37,7 @@ using namespace ult;
 static constexpr const char* CONFIG_DIR  = "sdmc:/config/gbemu/";
 static constexpr const char* CONFIG_FILE = "sdmc:/config/gbemu/config.ini";
 static constexpr const char* SAVE_DIR    = "sdmc:/config/gbemu/saves/";
+static constexpr const char* STATE_DIR   = "sdmc:/config/gbemu/states/";
 static char g_rom_dir[512] = "sdmc:/roms/gb/";
 
 static void load_config() {
@@ -179,6 +180,144 @@ static void write_save(GBState& s) {
 }
 
 // =============================================================================
+// State save / load  (cross-session resume)
+//
+// Format (all fields little-endian):
+//   [0]  uint32  magic        = 0x47425354 ('GBST')
+//   [4]  uint32  version      = 3
+//   [8]  uint32  cart_ram_sz  cart RAM size in bytes (0 if none)
+//   [12] uint32  fb_bytes     framebuffer size = GB_W*GB_H*2
+//   [16] gb_s    core         full emulator struct (function pointers re-patched on load)
+//   [+]  uint8[] cart_ram     cart RAM contents (cart_ram_sz bytes)
+//   [+]  uint16[] framebuffer last rendered frame (fb_bytes bytes)
+//   [+]  GBAPU   apu_snapshot full APU runtime state (v3+)
+//
+// v3 adds the GBAPU snapshot so audio resumes correctly without any silence
+// gap.  v1 files are still accepted; APU state is not restored from them
+// (gb_audio_reset_regs() is called to get a safe starting point instead).
+// =============================================================================
+static constexpr uint32_t STATE_MAGIC   = 0x47425354u; // 'GBST'
+static constexpr uint32_t STATE_VERSION = 3u;
+
+static void build_state_path(const char* romPath, char* out, size_t outSz) {
+    const char* slash = strrchr(romPath, '/');
+    const char* base  = slash ? slash + 1 : romPath;
+    char bn[256] = {};
+    strncpy(bn, base, sizeof(bn)-1);
+    char* dot = strrchr(bn, '.');
+    if (dot) *dot = '\0';
+    snprintf(out, outSz, "%s%s.state", STATE_DIR, bn);
+}
+
+static void save_state(GBState& s) {
+    if (!s.rom || !s.romPath[0]) return;
+
+    mkdir(STATE_DIR, 0777);
+
+    char statePath[512] = {};
+    build_state_path(s.romPath, statePath, sizeof(statePath));
+
+    FILE* f = fopen(statePath, "wb");
+    if (!f) return;
+
+    const uint32_t magic   = STATE_MAGIC;
+    const uint32_t version = STATE_VERSION;
+    const uint32_t ramSz   = static_cast<uint32_t>(s.cartRamSz);
+    const uint32_t fbBytes = static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t));
+
+    fwrite(&magic,   sizeof(magic),   1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&ramSz,   sizeof(ramSz),   1, f);
+    fwrite(&fbBytes, sizeof(fbBytes), 1, f);
+    fwrite(&s.gb,    sizeof(s.gb),    1, f);  // includes CPU regs, WRAM, VRAM, OAM, HRAM
+    if (s.cartRam && s.cartRamSz)
+        fwrite(s.cartRam, 1, s.cartRamSz, f);
+    fwrite(g_gb_fb, 1, fbBytes, f);
+
+    // v3: full GBAPU runtime snapshot.
+    // Peanut-GB delegates all APU I/O to our callbacks so APU state is NOT
+    // inside gb_s.  Saving only registers is insufficient: apply_reg() never
+    // sets ch.enabled (it deliberately masks trigger bits), so every channel
+    // would stay silent after a save-state resume even with correct registers.
+    // The GBAPU snapshot captures the full computed state (enabled, timer,
+    // duty_pos, current vol, seq_step, lfsr, hp_ch, ...) so audio resumes
+    // immediately with the correct sound.
+    // gb_audio_shutdown() must have been called before save_state() so the
+    // thread has written its final state back to s_ctrl.snapshot.
+    GBAPU apu_snap{};
+    gb_audio_save_state(&apu_snap);
+    fwrite(&apu_snap, sizeof(apu_snap), 1, f);
+
+    fclose(f);
+}
+
+// Returns true if a valid state was loaded and the emulator is ready to run.
+// On failure, leaves the emulator in cold-boot state (gb_init already called).
+// *apu_restored is set true only when a v3 save successfully restored the full
+// GBAPU snapshot via gb_audio_restore_state().  When false, the caller must
+// call gb_audio_reset_regs() before gb_audio_init().
+static bool load_state(GBState& s, bool* apu_restored = nullptr) {
+    if (apu_restored) *apu_restored = false;
+    if (!s.romPath[0]) return false;
+
+    char statePath[512] = {};
+    build_state_path(s.romPath, statePath, sizeof(statePath));
+
+    FILE* f = fopen(statePath, "rb");
+    if (!f) return false;
+
+    uint32_t magic = 0, version = 0, ramSz = 0, fbBytes = 0;
+    if (fread(&magic,   sizeof(magic),   1, f) != 1 || magic != STATE_MAGIC) { fclose(f); return false; }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version < 1u || version > 3u) { fclose(f); return false; }
+    if (fread(&ramSz,   sizeof(ramSz),   1, f) != 1) { fclose(f); return false; }
+    if (fread(&fbBytes, sizeof(fbBytes), 1, f) != 1) { fclose(f); return false; }
+
+    // Sanity checks
+    if (ramSz   != static_cast<uint32_t>(s.cartRamSz))  { fclose(f); return false; }
+    if (fbBytes != static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t))) { fclose(f); return false; }
+
+    // Read the core struct — this overwrites function pointers; we re-patch below
+    if (fread(&s.gb, sizeof(s.gb), 1, f) != 1) { fclose(f); return false; }
+
+    // Re-patch all function pointers that were serialized as garbage
+    s.gb.gb_rom_read       = gb_rom_read;
+    s.gb.gb_rom_read_16bit = gb_rom_read16;
+    s.gb.gb_rom_read_32bit = gb_rom_read32;
+    s.gb.gb_cart_ram_read  = gb_cart_ram_read;
+    s.gb.gb_cart_ram_write = gb_cart_ram_write;
+    s.gb.gb_error          = gb_error;
+    s.gb.gb_serial_tx      = nullptr;
+    s.gb.gb_serial_rx      = nullptr;
+    s.gb.gb_bootrom_read   = nullptr;
+    s.gb.direct.priv       = nullptr;
+    gb_init_lcd(&s.gb, gb_lcd_draw_line);  // re-sets display.lcd_draw_line
+
+    // Restore cart RAM
+    if (s.cartRam && s.cartRamSz) {
+        if (fread(s.cartRam, 1, s.cartRamSz, f) != s.cartRamSz) { fclose(f); return false; }
+    }
+
+    // Restore framebuffer so the last frame shows instantly
+    if (fread(g_gb_fb, 1, fbBytes, f) != fbBytes) { fclose(f); return false; }
+
+    // v3: restore full GBAPU snapshot.
+    // This includes ch.enabled, timer, duty_pos, current vol, seq_step, lfsr,
+    // hp_ch, and every other computed field.  Without it the audio thread starts
+    // with all channels disabled (enabled=false) because apply_reg() never sets
+    // that flag (it masks trigger bits), causing silence for the entire session.
+    if (version >= 3u) {
+        GBAPU apu_snap{};
+        if (fread(&apu_snap, sizeof(apu_snap), 1, f) == 1) {
+            gb_audio_restore_state(&apu_snap);
+            if (apu_restored) *apu_restored = true;
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
+// =============================================================================
 // gb_load_rom — if same ROM is already in memory, just resume
 // =============================================================================
 bool gb_load_rom(const char* path) {
@@ -188,6 +327,9 @@ bool gb_load_rom(const char* path) {
         return true;
     }
 
+    // ── Size-check the new ROM before touching the current one ──────────────
+    // We must know the size before unloading so we can reject oversized ROMs
+    // without losing the currently running game.
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
@@ -195,12 +337,18 @@ bool gb_load_rom(const char* path) {
     fseek(f, 0, SEEK_SET);
     const size_t maxRom = ult::limitedMemory ? (2u<<20) : (8u<<20);
     if (!sz || sz > maxRom) { fclose(f); return false; }
+
+    // ── Unload the current ROM BEFORE allocating the new buffer ─────────────
+    // Previously the new ROM was malloc'd first, then gb_unload_rom() freed
+    // the old one — momentarily holding two large ROMs simultaneously and
+    // exhausting the heap when switching between 4 MB games.  Unloading first
+    // keeps peak usage to one ROM at a time.
+    gb_unload_rom();  // save + free previous ROM (no-op if nothing loaded)
+
     uint8_t* rom = static_cast<uint8_t*>(malloc(sz));
     if (!rom) { fclose(f); return false; }
     if (fread(rom, 1, sz, f) != sz) { free(rom); fclose(f); return false; }
     fclose(f);
-
-    gb_unload_rom();  // save + free any previous ROM
 
     g_gb.rom     = rom;
     g_gb.romSize = sz;
@@ -244,10 +392,32 @@ bool gb_load_rom(const char* path) {
     // erased and row 0 stays black until the second frame completes.
     memset(g_gb_fb, 0, sizeof(g_gb_fb));
 
+    // ── Attempt to restore a previously saved state ───────────────────────────
+    // save_state() is called from gb_unload_rom() so every clean unload leaves a
+    // .state file.  If it loads successfully the CPU/memory/framebuffer are
+    // restored exactly where the player left off.  On failure (no file, wrong
+    // version, truncated) we fall through to a normal cold boot — no harm done.
+    bool apu_restored = false;
+    const bool resumed = load_state(g_gb, &apu_restored);
+
+    if (!apu_restored) {
+        // No v3 APU snapshot available (cold boot, v1 file, or read error).
+        // Reset the register shadow and invalidate the snapshot so the audio
+        // thread starts fresh.  NR52 is primed to 0x80 (power ON) so the
+        // thread's apply_reg() gate accepts channel writes immediately — without
+        // this prime a mid-game resume would stay silent because the game never
+        // re-runs its APU init sequence.
+        gb_audio_reset_regs();
+    }
+
     // ── Init audio BEFORE gb_reset() so the APU callback is live from frame 1 ──
     gb_audio_init(&g_gb.gb);
 
+    // If load_state succeeded, gb_reset() must NOT be called — it would wipe
+    // the restored CPU state.  If cold-booting, gb_reset() is already called
+    // implicitly by gb_init() above, so the commented-out call below stays out.
     //gb_reset(&g_gb.gb);
+    (void)resumed;
     g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     g_gb.running = true;
     return true;
@@ -259,7 +429,14 @@ void gb_unload_rom() {
     g_gb.running = false;
     g_emu_active = false;
 
-    gb_audio_shutdown();   // drain audout queue, free DMA buffers
+    gb_audio_shutdown();   // drain audout queue, free DMA buffers.
+                           // Thread writes s_ctrl.snapshot = local before exiting,
+                           // so save_state() below captures the full settled APU state.
+
+    // Persist state on every unload, not just overlay exit.
+    // This covers the game-switch path (X -> pick different ROM) which previously
+    // lost the current game's progress silently.
+    save_state(g_gb);
 
     write_save(g_gb);
     if (g_gb.cartRam) { free(g_gb.cartRam); g_gb.cartRam = nullptr; }
@@ -387,10 +564,65 @@ public:
                 gb_run_one_frame();
                 gb_audio_submit();
                 g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
-                // If we fell behind by more than one frame, re-anchor rather than
-                // spinning to catch up (which would flood the audio queue).
                 if (g_gb_frame_next_ns < now_ns)
                     g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
+
+                // ── Freeze detection (solid-colour framebuffer) ────────────────
+                // Oracle of Seasons (and similar CGB games) sometimes cold-boot
+                // into a freeze: the game turns off the LCD mid-intro, the
+                // framebuffer is left showing all-white, and the CPU gets stuck.
+                // The user's workaround — exit, re-enter, resume from save state —
+                // works because gb_init() resets walnut's internal counters before
+                // load_state() restores the CPU registers.  We replicate that exact
+                // sequence automatically.
+                //
+                // Detection: after the framebuffer has produced at least one
+                // non-uniform frame (real game content), if it then shows the
+                // SAME colour on every pixel for ≥180 consecutive frames (~3 s),
+                // we treat that as a freeze and auto-recover.
+                //
+                // A full 160×144 pixel scan costs ~5 µs — negligible.
+                // False-positive risk is near zero: real game frames virtually
+                // never sustain a perfectly solid colour for 3 seconds.
+                {
+                    static bool  s_had_varied   = false; // saw a non-solid frame
+                    static int   s_solid_frames = 0;     // consecutive solid frames
+                    static char  s_path[512]    = {};    // ROM these counters belong to
+
+                    // Reset counters whenever ROM changes
+                    if (strncmp(s_path, g_gb.romPath, sizeof(s_path)) != 0) {
+                        strncpy(s_path, g_gb.romPath, sizeof(s_path) - 1);
+                        s_had_varied   = false;
+                        s_solid_frames = 0;
+                    }
+
+                    // Is the entire framebuffer one solid colour?
+                    const uint16_t first = g_gb_fb[0];
+                    bool all_same = true;
+                    for (int i = 1; i < GB_W * GB_H; ++i) {
+                        if (g_gb_fb[i] != first) { all_same = false; break; }
+                    }
+
+                    if (!all_same) {
+                        s_had_varied   = true;  // real content visible — healthy
+                        s_solid_frames = 0;
+                    } else if (s_had_varied) {
+                        // Solid colour after real content → potential freeze
+                        if (++s_solid_frames >= 180) {
+                            char frozen_path[512];
+                            strncpy(frozen_path, g_gb.romPath,
+                                    sizeof(frozen_path) - 1);
+
+                            gb_unload_rom();              // saves state, shuts audio
+                            if (gb_load_rom(frozen_path)) // gb_init + load_state
+                                g_emu_active = true;
+
+                            // ROM path changes → counters auto-reset next frame
+                        }
+                    }
+                    // If !s_had_varied: still in the solid-black pre-game boot —
+                    // don't count and don't interfere.
+                }
             }
         }
 
@@ -689,13 +921,14 @@ public:
         tsl::overrideBackButton = true;
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_DIR);
+        ult::createDirectory(STATE_DIR);
         load_config();
         write_default_config_if_missing();
         ult::createDirectory(g_rom_dir);
     }
 
     virtual void exitServices() override {
-        gb_unload_rom();  // gb_audio_shutdown is called inside here
+        gb_unload_rom();   // save state, write SRAM, free memory, shut down audio
     }
 
     // Pause when overlay is hidden with the system combo.

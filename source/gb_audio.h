@@ -426,6 +426,14 @@ static struct GACtrl {
 
     // paused — thread submits silence; GBAPU state is fully preserved.
     std::atomic<bool> paused{false};
+
+    // Full GBAPU snapshot written by the audio thread on exit (gb_audio_shutdown).
+    // Restored on the next thread startup (gb_audio_init) so all runtime state
+    // (channel enabled flags, timers, duty_pos, vol, seq_step, lfsr, ...) is
+    // exact -- register replay alone cannot do this because apply_reg() never sets
+    // ch.enabled, so every channel stays silent after a save-state resume.
+    GBAPU snapshot{};
+    bool  snapshot_valid{false};
 } s_ctrl;
 
 
@@ -472,39 +480,45 @@ static void gb_audio_thread_fn(void*) {
     GBAPU local{};
     local.ch4.lfsr=0x7FFF;
 
-    // Restore HP capacitor state saved from the previous session.
-    // Without this, hp_ch[] starts at 0.0 while the APU is mid-audio
-    // (sustained notes), producing a ~5 ms undershoot transient heard as a
-    // click or crackle on the very first generated audio frame.
-    // On a fresh ROM load s_ctrl.hp_ch is all zeros — correct starting state.
-    memcpy(local.hp_ch, s_ctrl.hp_ch, sizeof(local.hp_ch));
+    if (s_ctrl.snapshot_valid) {
+        // Restore full GBAPU state from the previous session.  This is the only
+        // way to correctly resume mid-game audio: the snapshot contains all the
+        // runtime computed fields (ch.enabled, timer, duty_pos, current vol,
+        // seq_step, lfsr, ...) that apply_reg() cannot reconstruct because it
+        // deliberately ignores trigger bits.  Without ch.enabled=true the channels
+        // produce silence even when all registers are correctly configured.
+        local = s_ctrl.snapshot;
+    } else {
+        // Fresh start: restore HP capacitor state then replay saved registers.
+        // On a cold boot s_ctrl.hp_ch and s_ctrl.regs are all zeros -- correct.
+        // NR52 must be applied first so subsequent channel writes are not dropped
+        // by the apply_reg() power gate.
+        memcpy(local.hp_ch, s_ctrl.hp_ch, sizeof(local.hp_ch));
 
-    // Replay saved register state so the local GBAPU is in the right state
-    // before the main loop starts.  NR52 first to enable power so subsequent
-    // channel writes are accepted by apply_reg().
-    apply_reg(local,0x26,s_ctrl.regs[0x16]);          // NR52 — power on first
-    apply_reg(local,0x24,s_ctrl.regs[0x14]);          // NR50 master vol
-    apply_reg(local,0x25,s_ctrl.regs[0x15]);          // NR51 panning
-    apply_reg(local,0x10,s_ctrl.regs[0x00]);          // CH1
-    apply_reg(local,0x11,s_ctrl.regs[0x01]);
-    apply_reg(local,0x12,s_ctrl.regs[0x02]);
-    apply_reg(local,0x13,s_ctrl.regs[0x03]);
-    apply_reg(local,0x14,s_ctrl.regs[0x04]&0x7F);    // no retrigger
-    apply_reg(local,0x16,s_ctrl.regs[0x06]);          // CH2
-    apply_reg(local,0x17,s_ctrl.regs[0x07]);
-    apply_reg(local,0x18,s_ctrl.regs[0x08]);
-    apply_reg(local,0x19,s_ctrl.regs[0x09]&0x7F);
-    apply_reg(local,0x1A,s_ctrl.regs[0x0A]);          // CH3
-    apply_reg(local,0x1B,s_ctrl.regs[0x0B]);
-    apply_reg(local,0x1C,s_ctrl.regs[0x0C]);
-    apply_reg(local,0x1D,s_ctrl.regs[0x0D]);
-    apply_reg(local,0x1E,s_ctrl.regs[0x0E]&0x7F);
-    apply_reg(local,0x20,s_ctrl.regs[0x10]);          // CH4
-    apply_reg(local,0x21,s_ctrl.regs[0x11]);
-    apply_reg(local,0x22,s_ctrl.regs[0x12]);
-    apply_reg(local,0x23,s_ctrl.regs[0x13]&0x7F);
-    for(uint8_t r=0x30;r<=0x3F;++r)                  // wave RAM
-        apply_reg(local,r,s_ctrl.regs[r-0x10]);
+        apply_reg(local,0x26,s_ctrl.regs[0x16]);          // NR52 -- power on first
+        apply_reg(local,0x24,s_ctrl.regs[0x14]);          // NR50 master vol
+        apply_reg(local,0x25,s_ctrl.regs[0x15]);          // NR51 panning
+        apply_reg(local,0x10,s_ctrl.regs[0x00]);          // CH1
+        apply_reg(local,0x11,s_ctrl.regs[0x01]);
+        apply_reg(local,0x12,s_ctrl.regs[0x02]);
+        apply_reg(local,0x13,s_ctrl.regs[0x03]);
+        apply_reg(local,0x14,s_ctrl.regs[0x04]&0x7F);    // no retrigger
+        apply_reg(local,0x16,s_ctrl.regs[0x06]);          // CH2
+        apply_reg(local,0x17,s_ctrl.regs[0x07]);
+        apply_reg(local,0x18,s_ctrl.regs[0x08]);
+        apply_reg(local,0x19,s_ctrl.regs[0x09]&0x7F);
+        apply_reg(local,0x1A,s_ctrl.regs[0x0A]);          // CH3
+        apply_reg(local,0x1B,s_ctrl.regs[0x0B]);
+        apply_reg(local,0x1C,s_ctrl.regs[0x0C]);
+        apply_reg(local,0x1D,s_ctrl.regs[0x0D]);
+        apply_reg(local,0x1E,s_ctrl.regs[0x0E]&0x7F);
+        apply_reg(local,0x20,s_ctrl.regs[0x10]);          // CH4
+        apply_reg(local,0x21,s_ctrl.regs[0x11]);
+        apply_reg(local,0x22,s_ctrl.regs[0x12]);
+        apply_reg(local,0x23,s_ctrl.regs[0x13]&0x7F);
+        for(uint8_t r=0x30;r<=0x3F;++r)                  // wave RAM
+            apply_reg(local,r,s_ctrl.regs[r-0x10]);
+    }
 
     // Bresenham: accumulates GB_SPF_FRAC_INC each frame; flips 803→804 when
     // it overflows GB_CPU_HZ, giving exactly 48000 samples/sec on average.
@@ -584,8 +598,13 @@ static void gb_audio_thread_fn(void*) {
             next_ns = now_ns + GB_FRAME_NS;
     }
 
-    // Save HP capacitor state so the next thread startup (after shutdown/init)
-    // can restore it, avoiding the undershoot transient described above.
+    // Save full GBAPU state so the next thread startup can restore it exactly.
+    // This covers both the pause/resume path (X -> ROM menu -> re-enter same game)
+    // and the save-state path (shutdown -> save_state snapshots s_ctrl.snapshot).
+    // hp_ch is included inside the snapshot struct, so the separate s_ctrl.hp_ch
+    // copy is kept only for the legacy register-replay path (snapshot_valid=false).
+    s_ctrl.snapshot       = local;
+    s_ctrl.snapshot_valid = true;
     memcpy(s_ctrl.hp_ch, local.hp_ch, sizeof(local.hp_ch));
 }
 
@@ -727,19 +746,52 @@ static void gb_audio_shutdown() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// gb_audio_reset_regs — clear APU register state for a fresh ROM load.
+// gb_audio_reset_regs -- reset APU state for a new-game / cold-boot load.
 //
-// Called by gb_load_rom() after gb_unload_rom() when switching to a different
-// game.  Zeroing regs[] prevents the audio thread from replaying the old game's
-// NR10–NR52 register state (via apply_reg() on startup) into the new game's APU.
+// Called when no saved APU state is available.  Clears the register shadow and
+// invalidates the GBAPU snapshot so the audio thread does a fresh register
+// replay rather than restoring stale state from a different game.
 //
-// hp_ch[] is intentionally NOT touched here — it holds the DC-blocker filter
-// state.  Resetting it to 0.0 while the APU is mid-audio causes a ~5 ms
-// undershoot transient heard as a click on the first audio frame.  The new
-// game's audio settles the filter within a few frames naturally.
+// hp_ch[] is intentionally NOT touched: resetting it causes a ~5ms undershoot
+// transient (click) on the first generated frame.  The new game's audio
+// settles the DC-blocker naturally within a couple of frames.
+//
+// regs[0x16] (NR52) is primed to 0x80 (APU power ON) so that apply_reg()
+// accepts channel writes immediately.  For a cold boot the game will overwrite
+// it during its own init sequence (no effect).  For a v1 save-state resume the
+// game never re-runs init, so without this prime apply_reg() drops all channel
+// writes (power=false gate) -> permanent silence.
 // ─────────────────────────────────────────────────────────────────────────────
 static void gb_audio_reset_regs() {
     memset(s_ctrl.regs, 0, sizeof(s_ctrl.regs));
+    s_ctrl.regs[0x16]       = 0x80;   // NR52: APU power ON
+    s_ctrl.snapshot_valid   = false;  // force register-replay path on next init
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_save_state / gb_audio_restore_state
+//
+// Persist and restore the complete GBAPU snapshot that lives outside gb_s.
+// Must be called while the audio thread is NOT running (after shutdown / before
+// init).  gb_audio_shutdown() causes the thread to write s_ctrl.snapshot before
+// exiting, so the snapshot is fully settled when save_state() calls save here.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_save_state(GBAPU* dst) {
+    *dst = s_ctrl.snapshot;  // snapshot_valid guaranteed true after shutdown
+}
+
+static void gb_audio_restore_state(const GBAPU* src) {
+    s_ctrl.snapshot       = *src;
+    s_ctrl.snapshot_valid = true;
+    // Keep regs[] consistent with the snapshot for audio_read() callers.
+    // Extract the handful of registers peanut_gb reads back (NR52, NR50, NR51,
+    // wave RAM).  Channel registers are write-only from the game's perspective
+    // so their mirror values don't matter for correctness.
+    memset(s_ctrl.regs, 0, sizeof(s_ctrl.regs));
+    s_ctrl.regs[0x16] = src->power ? 0x80u : 0x00u;     // NR52
+    s_ctrl.regs[0x14] = src->nr50;                       // NR50
+    s_ctrl.regs[0x15] = src->nr51;                       // NR51
+    memcpy(&s_ctrl.regs[0x20], src->ch3.ram, 16);        // wave RAM (regs[0x20..0x2F])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
