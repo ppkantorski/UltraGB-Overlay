@@ -155,6 +155,12 @@ struct GBAPU {
     float hp_ch[4]={};
 };
 
+// Software master volume scalar (0.0 = silent, 1.0 = full).
+// Written by gb_audio_set_volume() from the UI thread; read every sample in
+// the mix loop.  relaxed ordering is fine — a one-frame lag on a slider drag
+// is imperceptible.
+static std::atomic<float> s_master_gain{1.0f};
+
 static inline int ch1_p(const GBAPU& a){return (2048-a.ch1.period)*4;}
 static inline int ch2_p(const GBAPU& a){return (2048-a.ch2.period)*4;}
 static inline int ch3_p(const GBAPU& a){return (2048-a.ch3.period)*2;}
@@ -384,7 +390,8 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp) {
 
         // ── Scale, clamp, write ──────────────────────────────────────────────
         // DC removed per-channel above; no combined-mix HP needed.
-        const float sl=ls*MIX_SCALE, sr=rs*MIX_SCALE;
+        const float mg=s_master_gain.load(std::memory_order_relaxed);
+        const float sl=ls*MIX_SCALE*mg, sr=rs*MIX_SCALE*mg;
         *dst++=sl> 32767.f? 32767:sl<-32767.f?-32767:static_cast<int16_t>(sl);
         *dst++=sr> 32767.f? 32767:sr<-32767.f?-32767:static_cast<int16_t>(sr);
     }
@@ -609,6 +616,18 @@ static void gb_audio_thread_fn(void*) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_set_volume — set master output volume (0–100).
+// Thread-safe: written from UI thread, read in audio thread via relaxed atomic.
+static void gb_audio_set_volume(u8 percent) {
+    s_master_gain.store(std::clamp(float(percent), 0.f, 100.f) / 100.f,
+                        std::memory_order_relaxed);
+}
+
+// gb_audio_get_volume — read back the current volume (0–100).
+static u8 gb_audio_get_volume() {
+    return static_cast<u8>(s_master_gain.load(std::memory_order_relaxed) * 100.f + 0.5f);
+}
+
 // gb_audio_init — call after gb_init_lcd(), before gb_reset().
 // ─────────────────────────────────────────────────────────────────────────────
 static bool gb_audio_init(gb_s*) {

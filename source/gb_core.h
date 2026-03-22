@@ -62,7 +62,7 @@ static constexpr int GB_W          = LCD_WIDTH;    // 160
 static constexpr int GB_H          = LCD_HEIGHT;   // 144
 
 static constexpr int VP_X          = 24;
-static constexpr int VP_Y          = (720 - 360) / 2 - 60-10;  // 120 — shifted up 60 px total to make room for virtual controls
+static constexpr int VP_Y          = (720 - 360) / 2 - 60-10-2;  // shifted up 62 px total
 static constexpr int VP_W          = 400;
 static constexpr int VP_H          = 360;
 

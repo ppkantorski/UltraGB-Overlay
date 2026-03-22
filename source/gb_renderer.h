@@ -1,19 +1,29 @@
 /********************************************************************************
  * File: gb_renderer.h
  * Description:
- *   Inline renderer that scales the 160×144 RGB555 GB framebuffer into the
- *   400×360 overlay viewport at position (24, 180) using nearest-neighbour
- *   integer scaling.  Each source pixel maps to either a 2×2, 2×3, 3×2, or
- *   3×3 destination rectangle (the mix achieves the exact 2.5× scale).
+ *   Inline renderer that scales the 160x144 RGB555/RGB565 GB framebuffer into
+ *   the 400x360 overlay viewport using nearest-neighbour integer scaling.
  *
- *   All rendering is done through tsl::gfx::Renderer::drawRect(), which is
- *   the standard drawing primitive available in libultrahand / libtesla.
+ *   Performance architecture - bypasses drawRect entirely for the game screen:
  *
- *   Performance note:
- *     This calls drawRect() up to 23,040 times per frame (160×144).  On the
- *     Switch this is typically fast enough, but if frame-rate drops are seen,
- *     consider optimising with horizontal run-length merging:
- *       for each output row, merge adjacent same-colour rects into one wider rect.
+ *   The Tesla overlay framebuffer is RGBA4444, block-linear (swizzled).
+ *   getPixelOffset(x, y) decomposes exactly as:
+ *       offset(x, y) = col_part(x) + row_part(y)
+ *   with zero cross terms, allowing a split LUT:
+ *       s_col_lut[ox]  - swizzle contribution of output column (400 u32s = 1.6 KB)
+ *       s_row_lut[oy]  - swizzle contribution of output row    (360 u32s = 1.4 KB)
+ *   Total LUT: ~3 KB static.  Verified algebraically against the full formula.
+ *
+ *   Inner loop per output pixel (inside a colour run):
+ *       framebuffer[s_row_lut[oy] + s_col_lut[ox]] = packed_color;
+ *   - one addition, one store, zero swizzle math, zero blend math.
+ *   Colour conversion fires exactly once per RLE run (not per pixel).
+ *
+ *   8x unrolled scatter-write loop lets the CPU pipeline independent stores
+ *   to non-contiguous swizzled addresses.
+ *
+ *   offsetWidthVar for the fixed 448-wide framebuffer:
+ *       ((448/2) >> 4) << 3 = 112  (compile-time constant OWV).
  ********************************************************************************/
 
 #pragma once
@@ -21,134 +31,202 @@
 #include <tesla.hpp>
 #include "gb_core.h"
 
-// ── Colour conversion ─────────────────────────────────────────────────────────
-// DMG pixels are RGB555: bits[4:0]=R, bits[9:5]=G, bits[14:10]=B
-// CGB pixels (from Walnut-CGB fixPalette) are RGB565: bits[15:11]=R, bits[10:5]=G, bits[4:0]=B
-// tsl::Color layout: {r4, g4, b4, a4} — map 5→4 bit by shifting right 1.
-//
-// We store both formats in g_gb_fb and detect via the MSB: RGB555 always
-// has bit 15 = 0 (max value 0x7FFF). RGB565 can have bit 15 = 1.
-// Rather than branching per pixel, we use a single unified converter:
-//   - For DMG (RGB555): R = bits[4:0]>>1, G = bits[9:5]>>1, B = bits[14:10]>>1
-//   - For CGB (RGB565): R = bits[15:11]>>1, G = bits[10:5]>>2, B = bits[4:0]>>1
-// We pick the converter once per frame based on gb->cgb.cgbMode.
-// Since g_gb_fb is a simple uint16 array shared between draw_line and the
-// renderer, we store a flag g_fb_is_rgb565 set by the draw_line callback.
-
-inline tsl::Color rgb555_to_tsl(const uint16_t c) {
-    return tsl::Color{
-        static_cast<uint8_t>( (c        & 0x1F) >> 1),  // R5 → R4
-        static_cast<uint8_t>(((c >>  5) & 0x1F) >> 1),  // G5 → G4
-        static_cast<uint8_t>(((c >> 10) & 0x1F) >> 1),  // B5 → B4
-        0xF
-    };
-}
-
-// RGB565: R5[15:11], G6[10:5], B5[4:0] → RGBA4444 (each channel 0–15)
-// Take the top 4 bits of each component — same approach as rgb555_to_tsl.
-inline tsl::Color rgb565_to_tsl(const uint16_t c) {
-    return tsl::Color{
-        static_cast<uint8_t>((c >> 12) & 0xF),   // R5 → R4: bits[15:12]
-        static_cast<uint8_t>((c >>  7) & 0xF),   // G6 → G4: bits[10:7]
-        static_cast<uint8_t>((c >>  1) & 0xF),   // B5 → B4: bits[4:1]
-        0xF
-    };
-}
-
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
 extern bool g_fb_is_rgb565;
 extern bool g_original_palette;
 
-// ── Background fill ───────────────────────────────────────────────────────────
-// Fills the full overlay area with solid black so the underlying game is hidden.
-//inline void render_gb_background(tsl::gfx::Renderer* renderer) {
-//    renderer->fillScreen(renderer->a(tsl::defaultBackgroundColor));
-//    renderer->drawWallpaper();
-//
-//    //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
-//    
-//    #if USING_WIDGET_DIRECTIVE
-//    if (m_showWidget)
-//        renderer->drawWidget();
-//    #endif
-//}
+// -- Colour conversion to packed RGBA4444 uint16 ------------------------------
+// tsl::Color layout (little-endian struct): r4 | g4<<4 | b4<<8 | a4<<12
+// Both converters produce a=0xF (fully opaque).
 
-// ── GB screen render ──────────────────────────────────────────────────────────
-// Scales g_gb_fb (160×144) into the overlay viewport using nearest-neighbour
-// scaling with three key optimisations:
+inline uint16_t rgb555_to_packed(const uint16_t c) {
+    const uint8_t r = ( c        & 0x1F) >> 1;
+    const uint8_t g = ((c >>  5) & 0x1F) >> 1;
+    const uint8_t b = ((c >> 10) & 0x1F) >> 1;
+    return static_cast<uint16_t>(r | (g << 4) | (b << 8) | 0xF000u);
+}
+
+inline uint16_t rgb565_to_packed(const uint16_t c) {
+    const uint8_t r = (c >> 12) & 0xF;
+    const uint8_t g = (c >>  7) & 0xF;
+    const uint8_t b = (c >>  1) & 0xF;
+    return static_cast<uint16_t>(r | (g << 4) | (b << 8) | 0xF000u);
+}
+
+// tsl::Color versions retained for border drawing
+inline tsl::Color rgb555_to_tsl(const uint16_t c) {
+    return tsl::Color{
+        static_cast<uint8_t>( (c        & 0x1F) >> 1),
+        static_cast<uint8_t>(((c >>  5) & 0x1F) >> 1),
+        static_cast<uint8_t>(((c >> 10) & 0x1F) >> 1),
+        0xF
+    };
+}
+inline tsl::Color rgb565_to_tsl(const uint16_t c) {
+    return tsl::Color{
+        static_cast<uint8_t>((c >> 12) & 0xF),
+        static_cast<uint8_t>((c >>  7) & 0xF),
+        static_cast<uint8_t>((c >>  1) & 0xF),
+        0xF
+    };
+}
+
+// -- Swizzle decomposition LUT ------------------------------------------------
+// Tesla's getPixelOffset(x, y) [no scissoring]:
+//   = ((((y&127)>>4) + ((x>>5)<<3) + ((y>>7)*OWV)) << 9)
+//   + ((y&8)<<5) + ((x&16)<<3) + ((y&6)<<4) + ((x&8)<<1) + ((y&1)<<3) + (x&7)
 //
-//  1. Static coordinate LUTs — the destination x/y extents for every source
-//     pixel are pre-computed once (all inputs are compile-time constants) and
-//     stored in int16 arrays. Eliminates 23,040 integer divisions per frame.
-//
-//  2. Horizontal RLE merging — adjacent source pixels with the same raw value
-//     are merged into a single wider drawRect.  Color conversion only fires on
-//     a flush, not per pixel.  Typical game frames drop from 23,040 drawRect
-//     calls to roughly 2,000–4,000.
-//
-//  3. g_fb_is_rgb565 hoisted out of both loops — the branch resolves once per
-//     frame, letting the inner loop be a pure comparison + occasional flush.
-inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
-    // ── LUT init (runs exactly once) ────────────────────────────────────────
-    static bool       lut_ready = false;
-    static int16_t    dx0[GB_W], dx1[GB_W];   // destination x extents
-    static int16_t    dy0[GB_H], dy1[GB_H];   // destination y extents
-    if (!lut_ready) {
-        for (int i = 0; i < GB_W; ++i) {
-            dx0[i] = static_cast<int16_t>( i      * VP_W / GB_W);
-            dx1[i] = static_cast<int16_t>((i + 1) * VP_W / GB_W);
-        }
-        for (int i = 0; i < GB_H; ++i) {
-            dy0[i] = static_cast<int16_t>( i      * VP_H / GB_H);
-            dy1[i] = static_cast<int16_t>((i + 1) * VP_H / GB_H);
-        }
-        lut_ready = true;
+// Every term is purely f(x) or purely g(y).  So offset = col_part(x)+row_part(y).
+// OWV = offsetWidthVar = ((framebufferWidth/2)>>4)<<3 = 112 for 448-wide FB.
+
+static constexpr uint32_t OWV = 112u;
+
+// LUTs indexed by viewport-relative coordinates:
+//   s_col_lut[ox]  for ox in [0, VP_W)  ->  col_part(VP_X + ox)
+//   s_row_lut[oy]  for oy in [0, VP_H)  ->  row_part(VP_Y + oy)
+static uint32_t s_col_lut[VP_W];   // 1600 bytes
+static uint32_t s_row_lut[VP_H];   // 1440 bytes
+static bool     s_lut_ready = false;
+
+static void init_swizzle_lut() {
+    for (int i = 0; i < VP_W; ++i) {
+        const uint32_t x = static_cast<uint32_t>(VP_X + i);
+        s_col_lut[i] = (((x >> 5) << 3) << 9)
+                     + ((x & 16u) << 3)
+                     + ((x &  8u) << 1)
+                     +  (x &  7u);
     }
+    for (int i = 0; i < VP_H; ++i) {
+        const uint32_t y = static_cast<uint32_t>(VP_Y + i);
+        s_row_lut[i] = ((((y & 127u) >> 4) + ((y >> 7) * OWV)) << 9)
+                     + ((y &  8u) << 5)
+                     + ((y &  6u) << 4)
+                     + ((y &  1u) << 3);
+    }
+    s_lut_ready = true;
+}
 
-    // ── Format flag — hoisted out of all loops ───────────────────────────────
-    const bool is565 = g_fb_is_rgb565;
+// -- Source-pixel coordinate LUTs ---------------------------------------------
+// Maps each GB source pixel index to its output viewport extent (VP-relative).
+static bool    s_coord_ready = false;
+static int16_t s_dx0[GB_W], s_dx1[GB_W];
+static int16_t s_dy0[GB_H], s_dy1[GB_H];
 
-    // ── Render with horizontal RLE ───────────────────────────────────────────
-    for (int sy = 0; sy < GB_H; ++sy) {
-        const int         row_y  = VP_Y + dy0[sy];
-        const int         row_h  = dy1[sy] - dy0[sy];
-        const uint16_t*   src    = g_gb_fb + sy * GB_W;
+static void init_coord_lut() {
+    for (int i = 0; i < GB_W; ++i) {
+        s_dx0[i] = static_cast<int16_t>( i      * VP_W / GB_W);
+        s_dx1[i] = static_cast<int16_t>((i + 1) * VP_W / GB_W);
+    }
+    for (int i = 0; i < GB_H; ++i) {
+        s_dy0[i] = static_cast<int16_t>( i      * VP_H / GB_H);
+        s_dy1[i] = static_cast<int16_t>((i + 1) * VP_H / GB_H);
+    }
+    s_coord_ready = true;
+}
+
+// -- GB screen render ---------------------------------------------------------
+// Hot path summary per frame:
+//   - Outer loop: 144 GB source rows
+//   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
+//   - Per run: one colour conversion (rgb555/565 -> packed uint16)
+//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset,
+//     which is: framebuffer[offset] = color  (direct write, no blend, no swizzle math)
+//   - No drawRect, no per-pixel getPixelOffset, no blend math (a=0xF).
+//
+// When ult::expandedMemory is true, the 144 source rows are split evenly across
+// ult::renderThreads (same global thread pool used by drawBitmapRGBA4444).
+// Each source row maps to a disjoint set of output rows so there are zero
+// shared writes — no locks needed.
+
+static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
+                                   const bool is565,
+                                   const int sy_start, const int sy_end) {
+    for (int sy = sy_start; sy < sy_end; ++sy) {
+        const int oy0 = s_dy0[sy];
+        const int oy1 = s_dy1[sy];
+        const uint16_t* __restrict__ src = g_gb_fb + sy * GB_W;
 
         int      run_sx  = 0;
         uint16_t run_pix = src[0];
 
-        for (int sx = 1; sx < GB_W; ++sx) {
-            const uint16_t pix = src[sx];
-            if (pix == run_pix) continue;  // extend run
+        for (int sx = 1; sx <= GB_W; ++sx) {
+            const uint16_t pix = (sx < GB_W) ? src[sx] : static_cast<uint16_t>(~run_pix);
+            if (pix == run_pix) continue;
 
-            // Flush accumulated run
-            renderer->drawRect(
-                VP_X + dx0[run_sx], row_y,
-                dx1[sx - 1] - dx0[run_sx], row_h,
-                is565 ? rgb565_to_tsl(run_pix) : rgb555_to_tsl(run_pix));
+            // -- Flush run [run_sx, sx) ---------------------------------------
+            const int ox0   = s_dx0[run_sx];
+            const int ox1   = s_dx1[sx - 1];
+            const int run_w = ox1 - ox0;
+
+            // Colour conversion: once per run
+            const uint16_t packed = is565
+                ? rgb565_to_packed(run_pix)
+                : rgb555_to_packed(run_pix);
+            const tsl::Color color = *reinterpret_cast<const tsl::Color*>(&packed);
+
+            for (int oy = oy0; oy < oy1; ++oy) {
+                const uint32_t row_base = s_row_lut[oy];
+                const uint32_t* __restrict__ cl = s_col_lut + ox0;
+                int ox = 0;
+
+                // 8x unrolled: independent stores, CPU can pipeline them
+                for (; ox + 7 < run_w; ox += 8) {
+                    renderer->setPixelAtOffset(row_base + cl[ox + 0], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 1], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 2], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 3], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 4], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 5], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 6], color);
+                    renderer->setPixelAtOffset(row_base + cl[ox + 7], color);
+                }
+                for (; ox < run_w; ++ox)
+                    renderer->setPixelAtOffset(row_base + cl[ox], color);
+            }
 
             run_sx  = sx;
             run_pix = pix;
         }
-
-        // Flush final run on this row
-        renderer->drawRect(
-            VP_X + dx0[run_sx], row_y,
-            dx1[GB_W - 1] - dx0[run_sx], row_h,
-            is565 ? rgb565_to_tsl(run_pix) : rgb555_to_tsl(run_pix));
     }
 }
 
-// ── Optional: border around the viewport ─────────────────────────────────────
-// Draws a 1-pixel border in a dark colour so the GB screen has a clean edge.
+inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
+    if (!s_lut_ready)   init_swizzle_lut();
+    if (!s_coord_ready) init_coord_lut();
+
+    const bool is565 = g_fb_is_rgb565;
+
+    if (!ult::expandedMemory) {
+        // Single-threaded path (low-memory devices)
+        render_gb_screen_chunk(renderer, is565, 0, GB_H);
+        return;
+    }
+
+    // Multi-threaded path: divide GB source rows across the global thread pool.
+    // GB_H=144 rows, each thread gets an equal slice.  The last thread absorbs
+    // any remainder so every row is covered with no overlap.
+    const int numThreads  = static_cast<int>(ult::numThreads);
+    const int chunkSize   = std::max(1, GB_H / numThreads);
+
+    for (int i = 0; i < numThreads; ++i) {
+        const int sy_start = i * chunkSize;
+        const int sy_end   = (i == numThreads - 1) ? GB_H : sy_start + chunkSize;
+        if (sy_start >= GB_H) {
+            ult::renderThreads[i] = std::thread([](){});
+            continue;
+        }
+        ult::renderThreads[i] = std::thread(render_gb_screen_chunk,
+                                             renderer, is565, sy_start, sy_end);
+    }
+    for (auto& t : ult::renderThreads)
+        t.join();
+}
+
+// -- Optional: border around the viewport -------------------------------------
 inline void render_gb_border(tsl::gfx::Renderer* renderer) {
     const tsl::Color border{0x3, 0x3, 0x3, 0xF};
-    // Top
     renderer->drawRect(VP_X - 1, VP_Y - 1, VP_W + 2, 1, border);
-    // Bottom
     renderer->drawRect(VP_X - 1, VP_Y + VP_H, VP_W + 2, 1, border);
-    // Left
     renderer->drawRect(VP_X - 1, VP_Y, 1, VP_H, border);
-    // Right
     renderer->drawRect(VP_X + VP_W, VP_Y, 1, VP_H, border);
 }
