@@ -162,6 +162,7 @@ static bool g_emu_active = false;
 static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
 PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC warm-tint by default
 bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
+bool g_vp_2x                  = false;  // false=2.5× (default), true=2× pixel-perfect
 // On a CGB cold boot, counts frames until the bounce reload fires.
 // -1 = inactive.  Set to 0 on cold boot, incremented each frame,
 // reload triggered when it reaches 60 (~1 second of game time).
@@ -862,8 +863,10 @@ public:
             }
         }
 
+        render_gb_letterbox(renderer);
         render_gb_screen(renderer);
         render_gb_border(renderer);
+        render_gbc_logo(renderer);
 
         //const char* sl = strrchr(g_gb.romPath, '/');
         //renderer->drawString(sl ? sl+1 : g_gb.romPath, false,
@@ -1012,7 +1015,9 @@ class GameConfigGui;  // forward declare
 // =============================================================================
 class GBEmulatorGui : public tsl::Gui {
     bool m_waitForRelease = true;  // ignore input until all buttons are released
-    u64 m_prevTouchKeys = 0;       // track previous touch state
+    u64  m_prevTouchKeys  = 0;     // track previous touch state
+    bool m_vp_tap_pending = false; // true while a screen-region tap is in progress
+    int  m_vp_tap_frames  = 0;     // frames held so far for the current tap
 public:
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = true;
@@ -1042,6 +1047,40 @@ public:
             m_waitForRelease = false;
         }
 
+        // ── Screen-region tap → scale toggle ─────────────────────────────────
+        // A quick tap (< 20 frames, ~333 ms) anywhere on the GB screen area
+        // that doesn't hit a game button toggles between 2.5× and 2× scale.
+        // Game buttons are below the screen so there is zero overlap — the VP
+        // is a completely dead zone for all other input.
+        {
+            const bool touching = (touchPos.x != 0 || touchPos.y != 0) &&
+                                  static_cast<int>(touchPos.y) < FOOTER_Y;
+            const int tx = static_cast<int>(touchPos.x) - static_cast<int>(ult::layerEdge);
+            const int ty = static_cast<int>(touchPos.y);
+            const bool in_vp = touching &&
+                tx >= vp_x() && tx < vp_x() + vp_w() &&
+                ty >= vp_y() && ty < vp_y() + vp_h();
+
+            if (in_vp && !m_vp_tap_pending) {
+                // Touch just entered the screen region — arm the tap detector.
+                m_vp_tap_pending = true;
+                m_vp_tap_frames  = 0;
+            }
+            if (m_vp_tap_pending) {
+                if (!touching) {
+                    // Finger lifted — it was a quick tap, fire the toggle.
+                    if (m_vp_tap_frames < 20)
+                        toggle_vp_scale();
+                    m_vp_tap_pending = false;
+                } else if (!in_vp) {
+                    // Finger dragged out of the VP without releasing — not a tap.
+                    m_vp_tap_pending = false;
+                } else {
+                    ++m_vp_tap_frames;
+                }
+            }
+        }
+
         // ── Touch → virtual button state ──────────────────────────────────────
         // Sample the first active touch point each frame and map it to GB keys.
         // D-pad touch area is split into 4 directional arms by comparing the
@@ -1057,7 +1096,7 @@ public:
         g_touch_keys = 0;
         if ((touchPos.x != 0 || touchPos.y != 0) &&
             static_cast<int>(touchPos.y) < FOOTER_Y) {
-            const int tx = static_cast<int>(touchPos.x);
+            const int tx = static_cast<int>(touchPos.x) - static_cast<int>(ult::layerEdge);
             const int ty = static_cast<int>(touchPos.y);
 
             // D-pad — split into 4 arms from the measured glyph centre

@@ -35,6 +35,18 @@
 extern bool g_fb_is_rgb565;
 // PaletteMode defined in gb_core.h (included above)
 
+// ── Runtime viewport scale toggle ─────────────────────────────────────────────
+// false = 2.5× (400×360, default), true = 2× (320×288, pixel-perfect integer).
+// Toggled by a quick tap on the screen region.
+// VP_X/VP_Y/VP_W/VP_H constexpr values in gb_core.h are the 2.5× maximums and
+// still used for static array sizing — runtime queries go through these inlines.
+extern bool g_vp_2x;
+inline int vp_x() { return g_vp_2x ? 64  : VP_X; }         // 2×: (448-320)/2 = 64
+inline int vp_y() { return g_vp_2x ? VP_Y + (VP_H-288)/2   // 2×: centre on same midpoint
+                                    : VP_Y; }               // 2.5×: original position
+inline int vp_w() { return g_vp_2x ? 320 : VP_W; }
+inline int vp_h() { return g_vp_2x ? 288 : VP_H; }
+
 // -- Colour conversion to packed RGBA4444 uint16 ------------------------------
 // tsl::Color layout (little-endian struct): r4 | g4<<4 | b4<<8 | a4<<12
 // Both converters produce a=0xF (fully opaque).
@@ -89,15 +101,17 @@ static uint32_t s_row_lut[VP_H];   // 1440 bytes
 static bool     s_lut_ready = false;
 
 static void init_swizzle_lut() {
-    for (int i = 0; i < VP_W; ++i) {
-        const uint32_t x = static_cast<uint32_t>(VP_X + i);
+    const int cvp_x = vp_x(), cvp_y = vp_y();
+    const int cvp_w = vp_w(), cvp_h = vp_h();
+    for (int i = 0; i < cvp_w; ++i) {
+        const uint32_t x = static_cast<uint32_t>(cvp_x + i);
         s_col_lut[i] = (((x >> 5) << 3) << 9)
                      + ((x & 16u) << 3)
                      + ((x &  8u) << 1)
                      +  (x &  7u);
     }
-    for (int i = 0; i < VP_H; ++i) {
-        const uint32_t y = static_cast<uint32_t>(VP_Y + i);
+    for (int i = 0; i < cvp_h; ++i) {
+        const uint32_t y = static_cast<uint32_t>(cvp_y + i);
         s_row_lut[i] = ((((y & 127u) >> 4) + ((y >> 7) * OWV)) << 9)
                      + ((y &  8u) << 5)
                      + ((y &  6u) << 4)
@@ -113,15 +127,24 @@ static int16_t s_dx0[GB_W], s_dx1[GB_W];
 static int16_t s_dy0[GB_H], s_dy1[GB_H];
 
 static void init_coord_lut() {
+    const int cvp_w = vp_w(), cvp_h = vp_h();
     for (int i = 0; i < GB_W; ++i) {
-        s_dx0[i] = static_cast<int16_t>( i      * VP_W / GB_W);
-        s_dx1[i] = static_cast<int16_t>((i + 1) * VP_W / GB_W);
+        s_dx0[i] = static_cast<int16_t>( i      * cvp_w / GB_W);
+        s_dx1[i] = static_cast<int16_t>((i + 1) * cvp_w / GB_W);
     }
     for (int i = 0; i < GB_H; ++i) {
-        s_dy0[i] = static_cast<int16_t>( i      * VP_H / GB_H);
-        s_dy1[i] = static_cast<int16_t>((i + 1) * VP_H / GB_H);
+        s_dy0[i] = static_cast<int16_t>( i      * cvp_h / GB_H);
+        s_dy1[i] = static_cast<int16_t>((i + 1) * cvp_h / GB_H);
     }
     s_coord_ready = true;
+}
+
+// Toggle between 2.5× and 2× scale.  Invalidates both LUTs so they rebuild
+// on the very next draw() call — zero overhead on every other frame.
+inline void toggle_vp_scale() {
+    g_vp_2x = !g_vp_2x;
+    s_lut_ready   = false;
+    s_coord_ready = false;
 }
 
 // -- GB screen render ---------------------------------------------------------
@@ -222,11 +245,81 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
         t.join();
 }
 
-// -- Optional: border around the viewport -------------------------------------
+// -- Game Boy Color logo below pixel-perfect screen --------------------------
+// Only drawn in 2× (pixel-perfect) mode.
+// The border always spans the full 2.5× outer frame (VP_X/Y/W/H).
+// In 2× mode the game image is 288px tall, leaving a 36px gap at the bottom:
+//   gap top    = vp_y() + vp_h() = 144 + 288 = 432
+//   gap bottom = VP_Y   + VP_H   = 108 + 360 = 468
+//   gap height = 36px → 4px padding each side → font size 18.
+inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
+    if (!g_vp_2x) return;
+
+    static constexpr int LOGO_SIZE = 18;
+    // gap top=432, gap bottom=468, centred baseline:
+    static constexpr int LOGO_Y    = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1;
+
+    static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
+    static constexpr tsl::Color C_RED = {0xF, 0x1, 0x1, 0xF};  // C
+    static constexpr tsl::Color C_ORA = {0xF, 0x7, 0x0, 0xF};  // O
+    static constexpr tsl::Color C_YEL = {0xF, 0xD, 0x0, 0xF};  // L
+    static constexpr tsl::Color C_GRN = {0x0, 0xA, 0x2, 0xF};  // O
+    static constexpr tsl::Color C_IND = {0x3, 0x2, 0xC, 0xF};  // R
+
+    static bool measured = false;
+    static u32  w_prefix = 0, wC = 0, wO = 0, wL = 0, wO2 = 0, wR = 0;
+
+    if (!measured) {
+        auto [wp,  hp]  = renderer->getTextDimensions("GAME BOY ", false, LOGO_SIZE);
+        auto [wc,  hc]  = renderer->getTextDimensions("C", false, LOGO_SIZE);
+        auto [wo,  ho]  = renderer->getTextDimensions("O", false, LOGO_SIZE);
+        auto [wl,  hl]  = renderer->getTextDimensions("L", false, LOGO_SIZE);
+        auto [wo2, ho2] = renderer->getTextDimensions("O", false, LOGO_SIZE);
+        auto [wr,  hr]  = renderer->getTextDimensions("R", false, LOGO_SIZE);
+        w_prefix = wp; wC = wc; wO = wo; wL = wl; wO2 = wo2; wR = wr;
+        (void)hp; (void)hc; (void)ho; (void)hl; (void)ho2; (void)hr;
+        measured = true;
+    }
+
+    const u32 total_w = w_prefix + wC + wO + wL + wO2 + wR;
+    int x = static_cast<int>(FB_W / 2 - total_w / 2);
+
+    renderer->drawString("GAME BOY ", false, x, LOGO_Y, LOGO_SIZE, WHITE);
+    x += static_cast<int>(w_prefix);
+    renderer->drawString("C", false, x, LOGO_Y, LOGO_SIZE, C_RED); x += static_cast<int>(wC);
+    renderer->drawString("O", false, x, LOGO_Y, LOGO_SIZE, C_ORA); x += static_cast<int>(wO);
+    renderer->drawString("L", false, x, LOGO_Y, LOGO_SIZE, C_YEL); x += static_cast<int>(wL);
+    renderer->drawString("O", false, x, LOGO_Y, LOGO_SIZE, C_GRN); x += static_cast<int>(wO2);
+    renderer->drawString("R", false, x, LOGO_Y, LOGO_SIZE, C_IND);
+}
+
+// -- Letterbox fill for 2× pixel-perfect mode ---------------------------------
+// Fills the strips between the 2× game image and the fixed outer border with
+// a shade just above black so the gaps look intentional regardless of wallpaper.
+// No-op in 2.5× mode.  Must be called BEFORE render_gb_screen so game pixels
+// overwrite cleanly.
+inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
+    if (!g_vp_2x) return;
+    const tsl::Color NEAR_BLACK = renderer->a({0x2, 0x2, 0x2, 0xE});
+    const int ix = vp_x(), iy = vp_y(), iw = vp_w(), ih = vp_h();
+    // Left strip
+    renderer->drawRect(VP_X,       VP_Y, ix - VP_X,              VP_H, NEAR_BLACK);
+    // Right strip
+    renderer->drawRect(ix + iw,    VP_Y, (VP_X + VP_W) - (ix + iw), VP_H, NEAR_BLACK);
+    // Top strip (between the side strips)
+    renderer->drawRect(ix,         VP_Y, iw, iy - VP_Y,          NEAR_BLACK);
+    // Bottom strip (between the side strips) — logo lives here
+    renderer->drawRect(ix, iy + ih, iw, (VP_Y + VP_H) - (iy + ih), NEAR_BLACK);
+}
+
+// -- Border around the viewport -----------------------------------------------
+// Always drawn at the fixed 2.5× outer frame (VP_X/Y/W/H) regardless of scale.
+// In 2× mode this creates the letterbox frame that encloses the game image,
+// fills, and logo as one cohesive unit.
 inline void render_gb_border(tsl::gfx::Renderer* renderer) {
-    const tsl::Color border{0x3, 0x3, 0x3, 0xF};
-    renderer->drawRect(VP_X - 1, VP_Y - 1, VP_W + 2, 1, border);
-    renderer->drawRect(VP_X - 1, VP_Y + VP_H, VP_W + 2, 1, border);
-    renderer->drawRect(VP_X - 1, VP_Y, 1, VP_H, border);
-    renderer->drawRect(VP_X + VP_W, VP_Y, 1, VP_H, border);
+    static constexpr tsl::Color BORDER{0x3, 0x3, 0x3, 0xF};
+    renderer->drawRect(VP_X - 1, VP_Y - 1,    VP_W + 2, 1,    BORDER);  // top
+    renderer->drawRect(VP_X - 1, VP_Y + VP_H, VP_W + 2, 1,    BORDER);  // bottom
+    renderer->drawRect(VP_X - 1, VP_Y,        1,        VP_H, BORDER);  // left
+    renderer->drawRect(VP_X + VP_W, VP_Y,     1,        VP_H, BORDER);  // right
 }
