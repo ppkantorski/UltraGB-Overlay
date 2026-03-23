@@ -1956,6 +1956,33 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			if (!lcd_enabled && (val & LCDC_ENABLE))
 			{
 				gb->lcd_blank = true;
+				/* FIX: On real hardware the LCD always restarts at LY=0 in
+				 * Mode 2 (OAM scan).  Leaving Mode 0 (HBlank) here causes CGB
+				 * games that poll STAT immediately after LCDC enable (e.g.
+				 * Pokemon Crystal/Gold room-transition code) to spin in a tight
+				 * loop forever, producing a permanent white-screen freeze.
+				 * Setting Mode 2 lets that polling loop exit correctly. */
+				gb->hram_io[IO_STAT] =
+					(gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				gb->counter.lcd_count = 0;
+				/* FIX: Reset lcd_off_count on LCD re-enable.  Without this,
+				 * accumulated lcd_off_count from a previous lcd-off period
+				 * lingers and causes a spurious synthetic VBlank almost
+				 * immediately after the next LCD disable, corrupting the
+				 * subsequent scene transition (staircase / town-map freeze). */
+				gb->counter.lcd_off_count = 0;
+				/* Update the LYC coincidence flag to match hardware state, but
+				 * do NOT fire the LCDC interrupt here.  On real hardware the
+				 * LYC interrupt fires on LY *transitions* (rising edge of
+				 * LY==LYC), not at the moment of LCD enable.  LY was already 0
+				 * while the LCD was off, so there is no rising edge — firing the
+				 * interrupt here is spurious and disrupts games that use LYC for
+				 * mid-frame effects (palette cycling, tile-map swaps, etc.),
+				 * causing wrong tile/glyph rendering in the first room. */
+				if(gb->hram_io[IO_LY] == gb->hram_io[IO_LYC])
+					gb->hram_io[IO_STAT] |= STAT_LYC_COINC;
+				else
+					gb->hram_io[IO_STAT] &= ~STAT_LYC_COINC;
 			}
 			/* Check if LCD is being switched off. */
 			else if (lcd_enabled && !(val & LCDC_ENABLE))
@@ -1993,6 +2020,12 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 					}
 				}
 #endif
+				/* FIX: Clear lcd_blank on disable so that a game that enables
+				 * the LCD then immediately disables it (a common CGB pattern
+				 * during scene transitions) does not leave lcd_blank=true
+				 * lingering into the next re-enable, which would suppress the
+				 * first legitimately rendered frame. */
+				gb->lcd_blank = false;
 			}
 			return;
 		}
@@ -3242,9 +3275,6 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		/* *INDENT-ON* */
 	};
 	static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
-
-	/* Promote EI's 1-instruction-delayed IME before interrupt check. */
-	if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 
 	/* Handle interrupts */
 	/* If gb_halt is positive, then an interrupt must have occurred by the
@@ -5210,6 +5240,11 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 	do
 	{
+		/* Promote EI: IME enabled after the instruction following EI
+		 * completes.  Must fire here (post-opcode) not pre-opcode, so
+		 * a pending interrupt cannot be serviced on the same step as
+		 * the EI instruction itself. */
+		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
 		gb->counter.div_count += inst_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)
@@ -5364,8 +5399,18 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
-				if(gb->hram_io[IO_IE] & VBLANK_INTR)
-					gb->hram_io[IO_IF] |= VBLANK_INTR;
+				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
+				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
+				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
+				 * to run during room transitions (when IME is enabled or re-enabled),
+				 * corrupting palette/scroll state -> blank screen (Gold/Silver/Crystal)
+				 * or stack corruption -> game reset (Crystal "GBC only" message). */
+				/* FIX: If the game is HALTed with no enabled interrupts
+				 * pending, the do-while condition stays true forever even
+				 * though gb_frame is already set, stalling gb_run_frame
+				 * indefinitely.  Break out so the frame can complete. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+					break;
 			}
 			continue;
 		}
@@ -5433,7 +5478,7 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				}
 #endif
                                 /* If halted forever, then return on VBLANK. */
-                                if(gb->gb_halt && !gb->hram_io[IO_IE])
+                                if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
 					break;
 			}
 			/* Start of normal Line (not in VBLANK) */
@@ -5542,8 +5587,6 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 	}
 #endif
 	/* Handle interrupts */
-	/* Promote EI's 1-instruction-delayed IME before interrupt check. */
-	if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 
 	/* If gb_halt is positive, then an interrupt must have occurred by the
 	 * time we reach here, because on HALT, we jump to the next interrupt
@@ -7185,6 +7228,11 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 	do
 	{
+		/* Promote EI: IME enabled after the instruction following EI
+		 * completes.  Must fire here (post-opcode) not pre-opcode, so
+		 * a pending interrupt cannot be serviced on the same step as
+		 * the EI instruction itself. */
+		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
 		gb->counter.div_count += inst_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)
@@ -7339,8 +7387,18 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
-				if(gb->hram_io[IO_IE] & VBLANK_INTR)
-					gb->hram_io[IO_IF] |= VBLANK_INTR;
+				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
+				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
+				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
+				 * to run during room transitions (when IME is enabled or re-enabled),
+				 * corrupting palette/scroll state -> blank screen (Gold/Silver/Crystal)
+				 * or stack corruption -> game reset (Crystal "GBC only" message). */
+				/* FIX: If the game is HALTed with no enabled interrupts
+				 * pending, the do-while condition stays true forever even
+				 * though gb_frame is already set, stalling gb_run_frame
+				 * indefinitely.  Break out so the frame can complete. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+					break;
 			}
 			continue;
 		}
@@ -7408,7 +7466,7 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				}
 #endif
                                 /* If halted forever, then return on VBLANK. */
-                                if(gb->gb_halt && !gb->hram_io[IO_IE])
+                                if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
 					break;
 			}
 			/* Start of normal Line (not in VBLANK) */
@@ -7725,6 +7783,18 @@ void gb_reset(struct gb_s *gb)
 	gb->cgb.dmaSize = 0;
 	gb->cgb.dmaSource = 0;
 	gb->cgb.dmaDest = 0;
+	/* FIX: Pre-compute fixPalette from the freshly-initialised BGPalette /
+	 * OAMPalette bytes.  Without this, fixPalette is zero (all black) from
+	 * BSS until the game issues its first FF69/FF6B write, making the first
+	 * rendered CGB frame entirely black. */
+	for(int _fpi = 0; _fpi < 0x20; _fpi++) {
+		uint16_t _bg_bgr  = (uint16_t)gb->cgb.BGPalette [_fpi*2]
+		                  | ((uint16_t)gb->cgb.BGPalette [_fpi*2+1] << 8);
+		uint16_t _oam_bgr = (uint16_t)gb->cgb.OAMPalette[_fpi*2]
+		                  | ((uint16_t)gb->cgb.OAMPalette[_fpi*2+1] << 8);
+		gb->cgb.fixPalette[      _fpi] = bgr555_to_rgb565_accurate(_bg_bgr);
+		gb->cgb.fixPalette[0x20+_fpi] = bgr555_to_rgb565_accurate(_oam_bgr);
+	}
 #endif
 }
 
@@ -8102,9 +8172,6 @@ void __gb_step_cpu_x(struct gb_s *gb)
 		/* *INDENT-ON* */
 	};
 	static const uint_fast16_t TAC_CYCLES[4] = {1024, 16, 64, 256};
-
-	/* Promote EI's 1-instruction-delayed IME before interrupt check. */
-	if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 
 	/* Handle interrupts */
 	/* If gb_halt is positive, then an interrupt must have occurred by the
@@ -9743,6 +9810,11 @@ void __gb_step_cpu_x(struct gb_s *gb)
 
 	do
 	{
+		/* Promote EI: IME enabled after the instruction following EI
+		 * completes.  Must fire here (post-opcode) not pre-opcode, so
+		 * a pending interrupt cannot be serviced on the same step as
+		 * the EI instruction itself. */
+		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
 		gb->counter.div_count += inst_cycles;
 		while(gb->counter.div_count >= DIV_CYCLES)
@@ -9897,8 +9969,18 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
-				if(gb->hram_io[IO_IE] & VBLANK_INTR)
-					gb->hram_io[IO_IF] |= VBLANK_INTR;
+				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
+				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
+				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
+				 * to run during room transitions (when IME is enabled or re-enabled),
+				 * corrupting palette/scroll state -> blank screen (Gold/Silver/Crystal)
+				 * or stack corruption -> game reset (Crystal "GBC only" message). */
+				/* FIX: If the game is HALTed with no enabled interrupts
+				 * pending, the do-while condition stays true forever even
+				 * though gb_frame is already set, stalling gb_run_frame
+				 * indefinitely.  Break out so the frame can complete. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+					break;
 			}
 			continue;
 		}
@@ -9966,7 +10048,7 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				}
 #endif
                                 /* If halted forever, then return on VBLANK. */
-                                if(gb->gb_halt && !gb->hram_io[IO_IE])
+                                if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
 					break;
 			}
 			/* Start of normal Line (not in VBLANK) */
