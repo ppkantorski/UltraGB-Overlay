@@ -38,7 +38,8 @@ using namespace ult;
 static constexpr const char* CONFIG_DIR  = "sdmc:/config/ultragb/";
 static constexpr const char* CONFIG_FILE = "sdmc:/config/ultragb/config.ini";
 static constexpr const char* SAVE_DIR    = "sdmc:/config/ultragb/saves/";
-static constexpr const char* STATE_DIR   = "sdmc:/config/ultragb/states/";
+static constexpr const char* STATE_DIR    = "sdmc:/config/ultragb/states/";
+static constexpr const char* CONFIGURE_DIR = "sdmc:/config/ultragb/configure/";
 static char g_rom_dir[256]       = "sdmc:/roms/gb/";
 static char g_last_rom_path[256] = {};   // basename of last-played ROM, persisted to config.ini
 
@@ -56,10 +57,8 @@ static void load_config() {
         }
     }
 
-    // original_palette
-    const std::string pal_val = ult::parseValueFromIniSection(path, "config", "original_palette");
-    if (!pal_val.empty())
-        g_original_palette = (pal_val == "true" || pal_val == "1");
+    // original_palette key is superseded by per-game palette_mode in configure/<rom>.ini
+    // (kept for legacy: if a user has it in config.ini it is silently ignored now)
 
     // last_rom — basename of the last-played ROM file
     const std::string last_rom_val = ult::parseValueFromIniSection(path, "config", "last_rom");
@@ -81,10 +80,6 @@ static void write_default_config_if_missing() {
     if (existing_dir.empty())
         ult::setIniFileValue(path, "config", "rom_dir", g_rom_dir,
                              "Set rom_dir to your .gb/.gbc folder");
-    const std::string existing_pal = ult::parseValueFromIniSection(path, "config", "original_palette");
-    if (existing_pal.empty())
-        ult::setIniFileValue(path, "config", "original_palette", "true",
-                             "true = classic DMG greyscale, false = GB color");
     const std::string existing_vol = ult::parseValueFromIniSection(path, "config", "volume");
     if (existing_vol.empty())
         ult::setIniFileValue(path, "config", "volume", "100",
@@ -99,14 +94,74 @@ static void save_last_rom(const char* fullPath) {
     ult::setIniFileValue(std::string(CONFIG_FILE), "config", "last_rom", base, "");
 }
 
+// =============================================================================
+// Per-game config helpers
+// Each ROM gets its own ini at: CONFIGURE_DIR/<filename>.ini
+// e.g.  sdmc:/config/ultragb/configure/pokered.gb.ini
+//
+// Key: palette_mode = "GBC" | "DMG" | "Native"   (default absent = "GBC")
+//   GBC    – warm amber tones (default; closest to GBC colour-compat look)
+//   DMG    – classic green Game Boy LCD tint
+//   Native – true greyscale, no colour tint at all
+//
+// Only meaningful for true DMG ROMs (header byte 0x143 bit7 clear).
+// CGB ROMs always use hardware colour regardless of this setting.
+// =============================================================================
+
+// Peek at ROM header byte 0x143 to determine CGB support without loading the ROM.
+// 0x80 = CGB compatible, 0xC0 = CGB only.
+static bool rom_has_cgb_flag(const char* romPath) {
+    FILE* f = fopen(romPath, "rb");
+    if (!f) return false;
+    uint8_t flag = 0;
+    if (fseek(f, 0x143, SEEK_SET) == 0)
+        fread(&flag, 1, 1, f);
+    fclose(f);
+    return (flag & 0x80) != 0;
+}
+
+static void build_game_config_path(const char* romPath, char* out, size_t outSz) {
+    const char* sl = strrchr(romPath, '/');
+    const char* base = sl ? sl + 1 : romPath;
+    snprintf(out, outSz, "%s%s.ini", CONFIGURE_DIR, base);
+}
+
+static const char* palette_mode_to_str(PaletteMode m) {
+    switch (m) {
+        case PaletteMode::DMG:    return "DMG";
+        case PaletteMode::NATIVE: return "Native";
+        default:                  return "GBC";
+    }
+}
+
+static PaletteMode str_to_palette_mode(const std::string& s) {
+    if (s == "DMG")    return PaletteMode::DMG;
+    if (s == "Native") return PaletteMode::NATIVE;
+    return PaletteMode::GBC;  // default (empty or "GBC")
+}
+
+static PaletteMode load_game_palette_mode(const char* romPath) {
+    char cfgPath[640];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    return str_to_palette_mode(
+        ult::parseValueFromIniSection(cfgPath, "config", "palette_mode"));
+}
+
+static void save_game_palette_mode(const char* romPath, PaletteMode m) {
+    char cfgPath[640];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    ult::createDirectory(CONFIGURE_DIR);
+    ult::setIniFileValue(cfgPath, "config", "palette_mode", palette_mode_to_str(m), "");
+}
+
 
 // =============================================================================
 GBState  g_gb;
 uint16_t g_gb_fb[GB_W * GB_H] = {};
 static bool g_emu_active = false;
 static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
-bool g_original_palette = true;   // true = DMG greyscale, false = GB green tint
-bool g_fb_is_rgb565     = false;  // true when CGB mode; set in gb_load_rom
+PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC warm-tint by default
+bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
 
 // =============================================================================
 // Virtual on-screen button layout (Game GB skin)
@@ -478,6 +533,10 @@ bool gb_load_rom(const char* path) {
 #else
     g_fb_is_rgb565 = false;
 #endif
+    // Apply per-game palette for DMG games. CGB games always use hardware colour
+    // so palette_mode has no effect on them, but we still load/store it so
+    // GameConfigGui can show the correct current value.
+    g_palette_mode = g_fb_is_rgb565 ? PaletteMode::GBC : load_game_palette_mode(path);
 
     size_t ramSz = 0;
     gb_get_save_size_s(&g_gb.gb, &ramSz);
@@ -788,21 +847,21 @@ public:
                     static bool  s_had_varied   = false; // saw a non-solid frame
                     static int   s_solid_frames = 0;     // consecutive solid frames
                     static char  s_path[256]    = {};    // ROM these counters belong to
-
+                    
                     // Reset counters whenever ROM changes
                     if (strncmp(s_path, g_gb.romPath, sizeof(s_path)) != 0) {
                         strncpy(s_path, g_gb.romPath, sizeof(s_path) - 1);
                         s_had_varied   = false;
                         s_solid_frames = 0;
                     }
-
+                    
                     // Is the entire framebuffer one solid colour?
                     const uint16_t first = g_gb_fb[0];
                     bool all_same = true;
                     for (int i = 1; i < GB_W * GB_H; ++i) {
                         if (g_gb_fb[i] != first) { all_same = false; break; }
                     }
-
+                    
                     if (!all_same) {
                         s_had_varied   = true;  // real content visible — healthy
                         s_solid_frames = 0;
@@ -812,11 +871,11 @@ public:
                             char frozen_path[256];
                             strncpy(frozen_path, g_gb.romPath,
                                     sizeof(frozen_path) - 1);
-
+                            
                             gb_unload_rom();              // saves state, shuts audio
                             if (gb_load_rom(frozen_path)) // gb_init + load_state
                                 g_emu_active = true;
-
+                            
                             // ROM path changes → counters auto-reset next frame
                         }
                     }
@@ -970,6 +1029,7 @@ public:
 };
 
 class RomSelectorGui; // forward declare
+class GameConfigGui;  // forward declare
 // =============================================================================
 // GBEmulatorGui — input handled at the Gui level (same pattern as TetrisGui)
 // =============================================================================
@@ -1133,6 +1193,106 @@ static bool rom_is_playable(const std::string& path) {
     return sz <= (2u << 20);  // 4 MB or 6 MB heap
 }
 
+// =============================================================================
+// GameConfigGui — per-ROM configuration screen
+//
+// Press Y on any ROM in the selector to open this screen.
+// Settings are stored in: sdmc:/config/ultragb/configure/<filename>.ini
+//
+// Palette Mode (DMG .gb games only — cycles on each A press):
+//   GBC    → warm amber tones; closest to how a Game Boy Color would show it
+//   DMG    → classic green LCD tint of the original Game Boy
+//   Native → true greyscale, no colour tint
+//
+// CGB ROMs (.gbc / header flag 0x80) always use hardware colour — the palette
+// item is replaced with an informational note.
+//
+// B / X — return to ROM selector, auto-scrolled back to this game.
+// =============================================================================
+class GameConfigGui : public tsl::Gui {
+    std::string m_romPath;
+    std::string m_romLabel;
+public:
+    GameConfigGui(std::string romPath, std::string romLabel)
+        : m_romPath(std::move(romPath)), m_romLabel(std::move(romLabel)) {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        // ROM filename as section header
+        list->addItem(new tsl::elm::CategoryHeader(m_romLabel));
+        list->addItem(new tsl::elm::CategoryHeader("Display"));
+
+        const bool isCgb = rom_has_cgb_flag(m_romPath.c_str());
+
+        if (!isCgb) {
+            // Cycling Palette Mode item: A cycles GBC → DMG → Native → GBC…
+            // Value label updates in-place so the current selection is always visible.
+            PaletteMode cur = load_game_palette_mode(m_romPath.c_str());
+
+            auto* modeItem = new tsl::elm::ListItem("Palette Mode");
+            modeItem->setValue(palette_mode_to_str(cur));
+
+            modeItem->setClickListener([this, modeItem, cur](u64 keys) mutable -> bool {
+                if (!(keys & KEY_A)) return false;
+                // Advance through the three modes in order
+                cur = static_cast<PaletteMode>((static_cast<int>(cur) + 1) % 3);
+                modeItem->setValue(palette_mode_to_str(cur));
+                save_game_palette_mode(m_romPath.c_str(), cur);
+                // Apply live if the ROM is currently the loaded one
+                if (g_gb.rom &&
+                    strncmp(g_gb.romPath, m_romPath.c_str(), sizeof(g_gb.romPath)) == 0)
+                    g_palette_mode = cur;
+                triggerRumbleClick.store(true, std::memory_order_release);
+                return true;
+            });
+            list->addItem(modeItem);
+
+            // Short legend so the user knows what each value means
+            auto* legend = new tsl::elm::CustomDrawer(
+                [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
+                    r->drawString(
+                        "GBC    \u2014 warm tones (default)\n"
+                        "DMG    \u2014 classic green tint\n"
+                        "Native \u2014 true greyscale",
+                        false, x + 16, y + 18, 14,
+                        tsl::Color{0x8, 0x8, 0x8, 0xF});
+                });
+            list->addItem(legend, 72);
+        } else {
+            // .gbc / CGB-flagged ROM — palette setting has no effect
+            auto* note = new tsl::elm::CustomDrawer(
+                [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
+                    r->drawString(
+                        "Native CGB ROM \u2014 always full hardware color.",
+                        false, x + 16, y + 28, 15,
+                        tsl::Color{0x8, 0x8, 0x8, 0xF});
+                });
+            list->addItem(note, 60);
+        }
+
+        auto* frame = new AnimatedOverlayFrame("UltraGB", "");
+        frame->setContent(list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & (KEY_B | KEY_X)) {
+            // Write g_last_rom_path so RomSelectorGui::createUI jumpToItem scrolls
+            // back to exactly this ROM when the list is rebuilt.
+            save_last_rom(m_romPath.c_str());
+            triggerExitFeedback();
+            tsl::swapTo<RomSelectorGui>();
+            return true;
+        }
+        return false;
+    }
+};
+
 class RomSelectorGui : public tsl::Gui {
     VolumeTrackBar* m_vol_slider  = nullptr;
     u8              m_vol         = 100;
@@ -1148,7 +1308,7 @@ public:
         
         auto* list  = new tsl::elm::List();
 
-        auto* pathHeader = new tsl::elm::CategoryHeader("Game Boy ROMs");
+        auto* pathHeader = new tsl::elm::CategoryHeader("Game Boy ROMs "+ ult::DIVIDER_SYMBOL + "  Configure");
         list->addItem(pathHeader);
 
         const std::vector<std::string> roms = scan_roms(g_rom_dir);
@@ -1191,7 +1351,15 @@ public:
                     item->setTextColor(tsl::warningTextColor);
                 // Only isLive (ROM already in memory) can use the fast-resume path.
                 // isLast only affects the symbol/jump — the ROM still needs loading.
-                item->setClickListener([path, isLive](u64 keys) -> bool {
+                item->setClickListener([path, label, isLive](u64 keys) -> bool {
+                    // Y → open per-game configuration screen for this ROM
+                    if (keys & KEY_Y) {
+                        save_last_rom(path.c_str());  // ensure we scroll back here on return
+                        triggerNavigationFeedback();
+                        tsl::swapTo<GameConfigGui>(path, label);
+                        return true;
+                    }
+
                     if (!(keys & KEY_A)) return false;
 
                     // Reject unplayable ROMs before touching any audio state.
@@ -1309,6 +1477,7 @@ public:
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_DIR);
         ult::createDirectory(STATE_DIR);
+        ult::createDirectory(CONFIGURE_DIR);
         load_config();
         write_default_config_if_missing();
         ult::createDirectory(g_rom_dir);

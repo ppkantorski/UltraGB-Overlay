@@ -33,7 +33,7 @@
 
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
 extern bool g_fb_is_rgb565;
-extern bool g_original_palette;
+// PaletteMode defined in gb_core.h (included above)
 
 // -- Colour conversion to packed RGBA4444 uint16 ------------------------------
 // tsl::Color layout (little-endian struct): r4 | g4<<4 | b4<<8 | a4<<12

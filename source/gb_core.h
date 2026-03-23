@@ -79,6 +79,7 @@ static constexpr uint16_t DMG_GREY[4] = {
 };
 
 // ── GBC green palette (RGB555) ────────────────────────────────────────────────
+// Used for "DMG" mode: mimics the original Game Boy's iconic green LCD screen.
 static constexpr uint16_t GBC_GREEN[4] = {
     0x06F3,  // 0 – lightest green
     0x06B1,  // 1 – light green
@@ -86,10 +87,27 @@ static constexpr uint16_t GBC_GREEN[4] = {
     0x04E1,  // 3 – darkest green
 };
 
-// Palette selection — defined in main.cpp, read from config.ini [config].
-// true  = classic DMG greyscale
-// false = GBC-style green tint (for DMG games running without CGB hardware)
-extern bool g_original_palette;
+// ── GBC warm palette (RGB555) ─────────────────────────────────────────────────
+// Used for "GBC" mode (default): warm amber tones that give DMG games a
+// colorized feel distinct from the green DMG palette.
+// R > G > B at each shade for a consistently warm/amber look.
+//   (R=30,G=28,B=20) | (R=22,G=16,B=6) | (R=12,G=8,B=3) | (R=3,G=2,B=1)
+static constexpr uint16_t GBC_WARM[4] = {
+    0x539E,  // 0 – warm cream-white
+    0x18D6,  // 1 – warm mid-tan
+    0x0C8C,  // 2 – dark warm brown
+    0x0443,  // 3 – near-black
+};
+
+// ── Palette mode ──────────────────────────────────────────────────────────────
+// Per-DMG-game setting stored in sdmc:/config/ultragb/configure/<rom>.ini
+//   GBC    (default) — warm amber tint, closest to GBC colour-compat mode
+//   DMG              — classic green Game Boy LCD tint
+//   NATIVE           — true greyscale, no colour tint
+// CGB games (.gbc / header flag 0x80) always use hardware colour; this setting
+// has no effect on them.
+enum class PaletteMode : uint8_t { GBC = 0, DMG, NATIVE };
+extern PaletteMode g_palette_mode;
 
 // ── Global emulator state ─────────────────────────────────────────────────────
 struct GBState {
@@ -160,7 +178,7 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
 //   DMG mode (non-CGB ROM):
 //     WALNUT_GB_12_COLOUR=1: bits[1:0]=colour index, bits[5:4]=source
 //       (LCD_PALETTE_BG=0x20=BG, else sprite).  We only need bits[1:0].
-//     We apply g_original_palette ? DMG_GREY : GBC_GREEN per-pixel.
+//     We select palette based on g_palette_mode (GBC/DMG/NATIVE) per-pixel.
 static void gb_lcd_draw_line(struct gb_s* gb,
                               const uint8_t* pixels,
                               const uint_fast8_t line)
@@ -177,8 +195,10 @@ static void gb_lcd_draw_line(struct gb_s* gb,
     }
 #endif
 
-    // DMG path: map 2-bit colour index through selected palette (RGB555).
-    const uint16_t* pal = g_original_palette ? DMG_GREY : GBC_GREEN;
+    // DMG path: map 2-bit colour index through the selected palette (RGB555).
+    const uint16_t* pal = (g_palette_mode == PaletteMode::NATIVE) ? DMG_GREY
+                        : (g_palette_mode == PaletteMode::DMG)    ? GBC_GREEN
+                        :                                            GBC_WARM;
     for (int x = 0; x < GB_W; x++)
         row[x] = pal[pixels[x] & 3];
 }
