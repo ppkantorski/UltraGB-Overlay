@@ -162,6 +162,10 @@ static bool g_emu_active = false;
 static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
 PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC warm-tint by default
 bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
+// On a CGB cold boot, counts frames until the bounce reload fires.
+// -1 = inactive.  Set to 0 on cold boot, incremented each frame,
+// reload triggered when it reaches 60 (~1 second of game time).
+static int g_cgb_bounce_frames = -1;
 
 // =============================================================================
 // Virtual on-screen button layout (Game GB skin)
@@ -593,6 +597,13 @@ bool gb_load_rom(const char* path) {
     // implicitly by gb_init() above, so the commented-out call below stays out.
     //gb_reset(&g_gb.gb);
     (void)resumed;
+
+    // On a CGB cold boot (no existing state file), start the bounce counter.
+    // After 60 frames (~1 s) the draw loop does a full gb_unload_rom + gb_load_rom,
+    // replicating "exit at the Nintendo/Capcom logo + re-enter" which fixes
+    // Oracle of Seasons' intro freeze.  CGB only; DMG and resumed states stay -1.
+    g_cgb_bounce_frames = (!resumed && g_fb_is_rgb565) ? 0 : -1;
+
     g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     g_gb.running = true;
     return true;
@@ -826,61 +837,27 @@ public:
                 if (g_gb_frame_next_ns < now_ns)
                     g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
 
-                // ── Freeze detection (solid-colour framebuffer) ────────────────
-                // Oracle of Seasons (and similar CGB games) sometimes cold-boot
-                // into a freeze: the game turns off the LCD mid-intro, the
-                // framebuffer is left showing all-white, and the CPU gets stuck.
-                // The user's workaround — exit, re-enter, resume from save state —
-                // works because gb_init() resets walnut's internal counters before
-                // load_state() restores the CPU registers.  We replicate that exact
-                // sequence automatically.
-                //
-                // Detection: after the framebuffer has produced at least one
-                // non-uniform frame (real game content), if it then shows the
-                // SAME colour on every pixel for ≥180 consecutive frames (~3 s),
-                // we treat that as a freeze and auto-recover.
-                //
-                // A full 160×144 pixel scan costs ~5 µs — negligible.
-                // False-positive risk is near zero: real game frames virtually
-                // never sustain a perfectly solid colour for 3 seconds.
-                {
-                    static bool  s_had_varied   = false; // saw a non-solid frame
-                    static int   s_solid_frames = 0;     // consecutive solid frames
-                    static char  s_path[256]    = {};    // ROM these counters belong to
-                    
-                    // Reset counters whenever ROM changes
-                    if (strncmp(s_path, g_gb.romPath, sizeof(s_path)) != 0) {
-                        strncpy(s_path, g_gb.romPath, sizeof(s_path) - 1);
-                        s_had_varied   = false;
-                        s_solid_frames = 0;
+                // ── CGB cold-boot bounce ──────────────────────────────────────
+                // After 60 frames of a CGB cold boot, do a full unload + reload.
+                // gb_unload_rom saves the post-60-frame CPU state and shuts audio
+                // properly; gb_load_rom calls gb_init() (resets timing counters)
+                // then load_state() (restores CPU).  Identical to pressing X at
+                // the Nintendo/Capcom logo then re-entering — the manual fix for
+                // Oracle of Seasons' intro freeze.
+                if (g_cgb_bounce_frames >= 0) {
+                    if (++g_cgb_bounce_frames >= 60) {
+                        g_cgb_bounce_frames = -1;  // disarm before reload
+                        char path[512] = {};
+                        strncpy(path, g_gb.romPath, sizeof(path) - 1);
+                        gb_unload_rom();
+                        if (gb_load_rom(path))
+                            g_emu_active = true;
+                        // No return here — g_gb_fb was restored from the state
+                        // file with the exact pre-bounce pixels, so we fall
+                        // through and render that frame normally.  Removing the
+                        // early-return eliminates the one-frame blank flash that
+                        // caused buttons and screen to blink on the bounce.
                     }
-                    
-                    // Is the entire framebuffer one solid colour?
-                    const uint16_t first = g_gb_fb[0];
-                    bool all_same = true;
-                    for (int i = 1; i < GB_W * GB_H; ++i) {
-                        if (g_gb_fb[i] != first) { all_same = false; break; }
-                    }
-                    
-                    if (!all_same) {
-                        s_had_varied   = true;  // real content visible — healthy
-                        s_solid_frames = 0;
-                    } else if (s_had_varied) {
-                        // Solid colour after real content → potential freeze
-                        if (++s_solid_frames >= 180) {
-                            char frozen_path[256];
-                            strncpy(frozen_path, g_gb.romPath,
-                                    sizeof(frozen_path) - 1);
-                            
-                            gb_unload_rom();              // saves state, shuts audio
-                            if (gb_load_rom(frozen_path)) // gb_init + load_state
-                                g_emu_active = true;
-                            
-                            // ROM path changes → counters auto-reset next frame
-                        }
-                    }
-                    // If !s_had_varied: still in the solid-black pre-game boot —
-                    // don't count and don't interfere.
                 }
             }
         }
