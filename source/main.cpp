@@ -1658,8 +1658,9 @@ public:
         // footer page button.  KEY_DRIGHT / KEY_DLEFT handle physical d-pad.
         const bool simulatedNext = ult::simulatedNextPage.exchange(
             false, std::memory_order_acq_rel);
-        const bool wantRight = simulatedNext || (keysDown & KEY_DRIGHT);
-        const bool wantLeft  = (keysDown & KEY_DLEFT);
+        const bool sliderActive = ult::allowSlide.load(std::memory_order_acquire);
+        const bool wantRight = !sliderActive && (simulatedNext || (keysDown & KEY_DRIGHT));
+        const bool wantLeft  = !sliderActive && (keysDown & KEY_DLEFT);
 
         if ((wantRight && m_page == Page::ROMs) ||
             (wantLeft  && m_page == Page::Settings)) {
