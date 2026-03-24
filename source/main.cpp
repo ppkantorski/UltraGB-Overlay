@@ -1672,7 +1672,13 @@ public:
                 m_frame->setPageNames("", "Settings"); // right-arrow footer button
                 m_frame->setContent(m_rom_list);
             }
-            tsl::shiftItemFocus(nullptr);  // reset focus into the new list
+            // shiftItemFocus(nullptr) does nothing — Gui::requestFocus guards on nullptr.
+        // removeFocus() clears m_focusedElement so the old ROM list item no longer
+        // wins the onClick race.  restoreFocus() resets m_initialFocusSet so the
+        // main loop's auto-focus fires next frame, routing through the frame's
+        // requestFocus() → new content list → first focusable item.
+        this->removeFocus();
+        this->restoreFocus();
             triggerNavigationFeedback();
             return true;
         }
