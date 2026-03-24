@@ -23,6 +23,7 @@
 #include "gb_renderer.h"
 #include "gb_audio.h"       // ← GB APU → audout bridge
 #include "elm_volume.hpp"    // ← VolumeTrackBar
+#include "elm_ultraframe.hpp" // ← UltraGBOverlayFrame (two-page frame)
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1362,6 +1363,9 @@ public:
 
     virtual void draw(tsl::gfx::Renderer* renderer) override {
         tsl::elm::OverlayFrame::draw(renderer);
+#if USING_WIDGET_DIRECTIVE
+        renderer->drawWidget();
+#endif
         draw_ultraboy_title(renderer, 20, 67, 50);
     }
 };
@@ -1406,7 +1410,7 @@ public:
 
         // ROM filename as section header
         list->addItem(new tsl::elm::CategoryHeader(m_romLabel));
-        list->addItem(new tsl::elm::CategoryHeader("Display"));
+        //list->addItem(new tsl::elm::CategoryHeader("Display"));
 
         const bool isCgb = rom_has_cgb_flag(m_romPath.c_str());
 
@@ -1479,25 +1483,45 @@ public:
 };
 
 class RomSelectorGui : public tsl::Gui {
-    VolumeTrackBar* m_vol_slider  = nullptr;
-    u8              m_vol         = 100;
-    u8              m_vol_backup  = 100;
+    // ── Page tracking ──────────────────────────────────────────────────────
+    enum class Page { ROMs, Settings };
+    Page                 m_page          = Page::ROMs;
+
+    // ── Frame (non-owning — Tesla owns the root element returned by createUI) ──
+    UltraGBOverlayFrame* m_frame         = nullptr;
+
+    // ── ROM list (page left) — owned by this Gui, deleted in destructor ────
+    tsl::elm::List*      m_rom_list      = nullptr;
+
+    // ── Settings list (page right) — owned by this Gui ────────────────────
+    tsl::elm::List*      m_settings_list = nullptr;
+
+    // ── Volume state (lives in Settings page) ─────────────────────────────
+    VolumeTrackBar*      m_vol_slider    = nullptr;
+    u8                   m_vol           = 100;
+    u8                   m_vol_backup    = 100;
+
 public:
     ~RomSelectorGui() {
-        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+        // m_frame is owned by Tesla — do NOT delete.
+        // Both lists are owned by us; Tesla never sees them directly
+        // (it only holds m_frame, which carries a non-owning pointer).
+        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE lists are freed
+        delete m_rom_list;
+        delete m_settings_list;
     }
+
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = false;
 
-        // Initialize the audio service
-        if (ult::useSoundEffects && !ult::limitedMemory) {
+        if (ult::useSoundEffects && !ult::limitedMemory)
             ult::Audio::initialize();
-        }
-        
-        auto* list  = new tsl::elm::List();
 
-        auto* pathHeader = new tsl::elm::CategoryHeader("Game Boy ROMs "+ ult::DIVIDER_SYMBOL + "  Configure");
-        list->addItem(pathHeader);
+        // ── ROM list (page left) ──────────────────────────────────────────
+        m_rom_list = new tsl::elm::List();
+
+        m_rom_list->addItem(new tsl::elm::CategoryHeader(
+            "ROMs " + ult::DIVIDER_SYMBOL + "  Configure"));
 
         const std::vector<std::string> roms = scan_roms(g_rom_dir);
 
@@ -1508,102 +1532,88 @@ public:
                 "Edit: sdmc:/config/ultragb/config.ini", g_rom_dir);
             auto* empty = new tsl::elm::CustomDrawer(
                 [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
-                    r->drawString(msg, false, x+16, y+30, 16,
-                                  tsl::Color{0x8,0x8,0x8,0xF});
+                    r->drawString(msg, false, x + 16, y + 30, 16,
+                                  tsl::Color{0x8, 0x8, 0x8, 0xF});
                 });
-            list->addItem(empty, 200);
+            m_rom_list->addItem(empty, 200);
         } else {
-            std::string jumpLabel;  // label of the item to scroll to on first display
+            std::string jumpLabel;
             for (const auto& path : roms) {
                 const char* sl = strrchr(path.c_str(), '/');
-                std::string label = sl ? std::string(sl+1) : path;
+                std::string label = sl ? std::string(sl + 1) : path;
 
-                // Show in-progress symbol if:
-                //   a) ROM is currently loaded in this session (returning from game via X), OR
-                //   b) No ROM is loaded yet but basename matches last_rom in config (cold launch)
                 const bool isLive = g_gb.rom && g_gb.romPath[0] &&
-                                    strncmp(g_gb.romPath, path.c_str(), sizeof(g_gb.romPath)) == 0;
+                    strncmp(g_gb.romPath, path.c_str(), sizeof(g_gb.romPath)) == 0;
                 const bool isLast = !isLive && !g_gb.rom && g_last_rom_path[0] &&
-                                    strcmp(label.c_str(), g_last_rom_path) == 0;
-                // Only show in-progress state if the ROM is actually playable on this
-                // memory tier — a saved last_rom that requires more RAM than available
-                // can't be resumed, so showing the symbol would be misleading.
+                    strcmp(label.c_str(), g_last_rom_path) == 0;
+                // Only show in-progress state if the ROM is playable on this memory tier.
                 const bool inProgress = (isLive || isLast) && rom_is_playable(path);
 
-                if (inProgress && jumpLabel.empty())
+                // Jump to any last-rom match regardless of playability — so returning
+                // from GameConfigGui via Y on an unplayable (warning-coloured) ROM
+                // still scrolls back to that item.
+                if ((isLive || isLast) && jumpLabel.empty())
                     jumpLabel = label;
 
-                auto* item = new tsl::elm::MiniListItem(label,
-                                                    inProgress ? ult::INPROGRESS_SYMBOL : "");
+                auto* item = new tsl::elm::MiniListItem(
+                    label, inProgress ? ult::INPROGRESS_SYMBOL : "");
                 if (!rom_is_playable(path))
                     item->setTextColor(tsl::warningTextColor);
-                // Only isLive (ROM already in memory) can use the fast-resume path.
-                // isLast only affects the symbol/jump — the ROM still needs loading.
+
+                // Only isLive can use the fast-resume path; isLast still needs loading.
                 item->setClickListener([path, label, isLive](u64 keys) -> bool {
-                    // Y → open per-game configuration screen for this ROM
+                    // Y → open per-game configuration screen
                     if (keys & KEY_Y) {
-                        save_last_rom(path.c_str());  // ensure we scroll back here on return
+                        save_last_rom(path.c_str());
                         triggerNavigationFeedback();
                         tsl::swapTo<GameConfigGui>(path, label);
                         return true;
                     }
-
                     if (!(keys & KEY_A)) return false;
-
-                    // Reject unplayable ROMs before touching any audio state.
-                    // gb_load_rom() will fire the notification and return false.
                     if (!isLive && !rom_is_playable(path)) {
                         gb_load_rom(path.c_str());
                         return false;
                     }
-
-                    // Audio::exit() shuts down UI sound effects before the game
-                    // takes over audio.  Must come before gb_load_rom() / gb_audio_init()
-                    // since both start GB audio internally.
-                    // Audio::initialize() is called by RomSelectorGui::createUI() when
-                    // the user returns to the selector, restoring UI sound effects.
+                    // Audio::exit() shuts down UI sound before the game takes over.
+                    // Audio::initialize() is called by createUI() when user returns.
                     if (ult::useSoundEffects && !ult::limitedMemory)
                         ult::Audio::exit();
-
                     if (isLive) {
-                        // Fast resume — ROM is already in memory, no large alloc needed.
                         gb_audio_init(&g_gb.gb);
                         g_gb_frame_next_ns = 0;
                         g_gb.running = true;
                         save_last_rom(path.c_str());
                         tsl::swapTo<GBEmulatorGui>();
                     } else {
-                        // Deferred load — store the path and let GBEmulatorGui::createUI()
-                        // call gb_load_rom() AFTER ~RomSelectorGui() has freed all list
-                        // items.  Calling gb_load_rom() here (while the List and all its
-                        // MiniListItem / std::string allocations are still live) scatters
-                        // small heap objects through the just-freed ROM region, preventing
-                        // dlmalloc from coalescing a contiguous block large enough for the
-                        // new ROM, causing spurious OOM on the 4 MB heap tier.
+                        // Deferred load: store path, let GBEmulatorGui::createUI() call
+                        // gb_load_rom() AFTER ~RomSelectorGui() has freed all list items.
                         save_last_rom(path.c_str());
-                        strncpy(g_pending_rom_path, path.c_str(), sizeof(g_pending_rom_path) - 1);
+                        strncpy(g_pending_rom_path, path.c_str(),
+                                sizeof(g_pending_rom_path) - 1);
                         g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
                         tsl::swapTo<GBEmulatorGui>();
                     }
                     return true;
                 });
-                list->addItem(item);
+                m_rom_list->addItem(item);
             }
 
-            // Scroll to and centre the in-progress item immediately — works both on
-            // cold launch (last_rom from config) and when returning from a game (X).
+            // Scroll to and centre the in-progress item immediately.
             if (!jumpLabel.empty())
-                list->jumpToItem(jumpLabel, "", true);
+                m_rom_list->jumpToItem(jumpLabel, "", true);
         }
 
-        // ── Volume ───────────────────────────────────────────────────────────
-        list->addItem(new tsl::elm::CategoryHeader(
+        // ── Settings list (page right) ────────────────────────────────────
+        m_settings_list = new tsl::elm::List();
+
+        m_settings_list->addItem(new tsl::elm::CategoryHeader(
             "Volume " + ult::DIVIDER_SYMBOL + "  Toggle Mute"));
 
         m_vol        = gb_audio_get_volume();
         m_vol_backup = (m_vol > 0) ? m_vol : static_cast<u8>(100);
 
-        auto* vol_slider = new VolumeTrackBar("\uE13C", false, false, true, "Game Boy", "%", false);
+        auto* vol_slider = new VolumeTrackBar(
+            "\uE13C", false, false, true, "Game Boy", "%", false);
         vol_slider->setProgress(m_vol);
         vol_slider->setValueChangedListener([this](u8 value) {
             m_vol = value;
@@ -1624,14 +1634,17 @@ public:
             ult::setIniFileValue(std::string(CONFIG_FILE), "config", "volume",
                                  std::to_string(m_vol), "");
         });
-        list->addItem(vol_slider);
+        m_settings_list->addItem(vol_slider);
 
-        auto* frame = new AnimatedOverlayFrame("UltraGB", APP_VERSION);
-        frame->m_showWidget = true;
-        frame->setContent(list);
-        return frame;
+        // ── Frame ─────────────────────────────────────────────────────────
+        // Start on the ROMs page; footer shows "Settings" as the right page.
+        m_page  = Page::ROMs;
+        m_frame = new UltraGBOverlayFrame("", "Settings");
+        m_frame->setContent(m_rom_list);
+        return m_frame;
     }
 
+    // -------------------------------------------------------------------------
     // B closes the overlay. overrideBackButton=true means the framework will
     // never auto-call goBack() for us — we must handle KEY_B explicitly here.
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -1640,7 +1653,31 @@ public:
                              HidAnalogStickState rightJoy) override {
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
 
-        // Y — mute/unmute toggle (mirrors icon-tap callback logic).
+        // ── Page navigation ──────────────────────────────────────────────
+        // simulatedNextPage is set by the framework when the user taps the
+        // footer page button.  KEY_DRIGHT / KEY_DLEFT handle physical d-pad.
+        const bool simulatedNext = ult::simulatedNextPage.exchange(
+            false, std::memory_order_acq_rel);
+        const bool wantRight = simulatedNext || (keysDown & KEY_DRIGHT);
+        const bool wantLeft  = (keysDown & KEY_DLEFT);
+
+        if ((wantRight && m_page == Page::ROMs) ||
+            (wantLeft  && m_page == Page::Settings)) {
+            if (m_page == Page::ROMs) {
+                m_page = Page::Settings;
+                m_frame->setPageNames("ROMs", "");    // left-arrow footer button
+                m_frame->setContent(m_settings_list);
+            } else {
+                m_page = Page::ROMs;
+                m_frame->setPageNames("", "Settings"); // right-arrow footer button
+                m_frame->setContent(m_rom_list);
+            }
+            tsl::shiftItemFocus(nullptr);  // reset focus into the new list
+            triggerNavigationFeedback();
+            return true;
+        }
+
+        // ── Y — mute/unmute toggle (works on both pages) ─────────────────
         if (keysDown & KEY_Y) {
             if (m_vol_slider) {
                 if (m_vol > 0) {
@@ -1658,10 +1695,12 @@ public:
             return true;
         }
 
+        // ── B — close the overlay ────────────────────────────────────────
         if (keysDown & KEY_B) {
             tsl::Overlay::get()->close();
             return true;
         }
+
         return false;
     }
 };
