@@ -155,7 +155,10 @@ static void save_game_palette_mode(const char* romPath, PaletteMode m) {
 }
 
 
-// =============================================================================
+// ROM buffer is allocated in gb_load_rom and freed in gb_unload_rom.
+// The wallpaper is always evicted BEFORE the ROM buffer is allocated, so that
+// the new malloc sees the maximum possible contiguous free region.
+
 GBState  g_gb;
 uint16_t g_gb_fb[GB_W * GB_H] = {};
 static bool g_emu_active = false;
@@ -466,54 +469,85 @@ bool gb_load_rom(const char* path) {
                         : ROM_2MB;
     if (sz > maxRom) { fclose(f); return false; }
 
-    // ── Unload the current ROM BEFORE allocating the new buffer ─────────────
-    // Previously the new ROM was malloc'd first, then gb_unload_rom() freed
-    // the old one — momentarily holding two large ROMs simultaneously and
-    // exhausting the heap when switching between 4 MB games.  Unloading first
-    // keeps peak usage to one ROM at a time.
-    gb_unload_rom();  // save + free previous ROM (no-op if nothing loaded)
+    // ── Memory management: evict wallpaper FIRST, then unload old ROM ────────
+    //
+    // Critical ordering: the wallpaper (~630 KB) must be freed BEFORE we free
+    // the old ROM buffer, so that by the time malloc(new ROM) runs both slabs
+    // are gone and the allocator sees the maximum possible contiguous free
+    // region.  Freeing old ROM first and wallpaper second leaves the two freed
+    // regions separated by whatever was between them, risking a failed
+    // malloc(4 MB) even with enough total free bytes.
+    //
+    // Memory tiers and wallpaper eviction:
+    //   4 MB heap  (limitedMemory)         — max 2 MB ROM, no wallpaper anyway
+    //   6 MB heap  (neither flag)          — max 2 MB ROM, wallpaper safe with 2 MB ROM
+    //   8 MB heap  (expandedMemory)        — max 4 MB ROM, wallpaper MUST be evicted for >2 MB ROM
+    //   10 MB+ heap (furtherExpandedMemory)— max 8 MB ROM, wallpaper safe at all sizes
 
-    // ── Wallpaper memory management ──────────────────────────────────────────
-    // ROMs larger than 2 MB (GBC titles) cannot safely coexist with the wallpaper
-    // buffer on an 8 MB heap unless furtherExpandedMemory is true.
-    //
-    // draw() and handleInput() run sequentially on one thread: by the time
-    // handleInput() calls gb_load_rom(), draw() has fully returned and all
-    // render worker threads are joined.  inPlot is guaranteed false — no
-    // spin-wait or mutex is required.
-    //
-    // We set refreshWallpaper=true first so drawWallpaper() skips the blit for
-    // the entire game session.  The wallpaper is freed with the swap trick
-    // (guaranteed deallocation — shrink_to_fit is non-binding in C++ and newlib
-    // may ignore it, leaving the buffer allocated and causing OOM on malloc).
-    // reloadWallpaper() in gb_unload_rom() restores the wallpaper and clears
-    // refreshWallpaper when the game exits.
     static constexpr size_t WALLPAPER_EVICT_THRESHOLD = 2u << 20;  // 2 MB
-    if (sz > WALLPAPER_EVICT_THRESHOLD && !ult::furtherExpandedMemory
-            && !ult::wallpaperData.empty()) {
-        // Signal drawWallpaper to skip the blit path from now on.
-        // draw() and handleInput() run sequentially on one thread — by the time
-        // handleInput() fires gb_load_rom(), the current frame's draw() has fully
-        // returned and all render worker threads are joined, so inPlot is
-        // guaranteed false.  No spin-wait or mutex is needed.
+    const bool need_evict = (sz > WALLPAPER_EVICT_THRESHOLD && !ult::furtherExpandedMemory);
+
+    // Step 1 — Before evicting the wallpaper or freeing the old ROM, flush the
+    // glyph cache.  This is the key step that prevents intermittent malloc(4 MB)
+    // failures on the 8 MB heap tier.
+    //
+    // Why fragmentation happens without this:
+    //   After loading and unloading a 2 MB game the freed ROM block is returned
+    //   to the allocator.  The menu then renders its ROM-selector list, filling
+    //   that hole with scattered small glyph allocations.  When the user next
+    //   picks a 4 MB game we evict the wallpaper (630 KB) and free the old ROM
+    //   buffer — but those glyph allocs sit *between* the two freed regions,
+    //   preventing the allocator from coalescing them.  The largest contiguous
+    //   free block ends up being ~2 MB, not 4 MB, and malloc fails.
+    //
+    // Flushing the glyph cache first releases all those scattered small allocs
+    // before we do anything else.  The freed glyph memory, freed wallpaper, and
+    // freed old ROM all collapse into one large contiguous region that malloc
+    // can satisfy.  The cache repopulates automatically when the user returns to
+    // the ROM selector.
+    //
+    // We call FontManager::clearCache() directly rather than setting
+    // clearGlyphCacheNow, because that atomic is consumed by endFrame() which
+    // runs on the same thread and won't execute before our malloc below.
+    tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+
+    // Step 2 — Evict wallpaper before touching any other allocations.
+    // The swap trick guarantees deallocation (shrink_to_fit is non-binding).
+    if (need_evict && !ult::wallpaperData.empty()) {
         ult::refreshWallpaper.store(true, std::memory_order_release);
-
-        // Guaranteed deallocation via swap trick.
-        // shrink_to_fit() is non-binding in the C++ standard and newlib may
-        // ignore it entirely, leaving ~630 KB allocated and causing OOM when
-        // we immediately malloc(4 MB) below.  The swap with a default-constructed
-        // vector is the only portable way to guarantee the buffer is freed.
         { std::vector<u8> tmp; tmp.swap(ult::wallpaperData); }
-
-        g_wallpaper_evicted = true;
     }
 
-    uint8_t* rom = static_cast<uint8_t*>(malloc(sz));
-    if (!rom) { fclose(f); return false; }
-    if (fread(rom, 1, sz, f) != sz) { free(rom); fclose(f); return false; }
+    // Step 3 — Unload the old ROM.
+    // Suppress the wallpaper reload inside gb_unload_rom when the new ROM is
+    // also large: we just evicted the wallpaper and don't want it reloaded only
+    // to be immediately evicted again (reload→evict churn adds one extra malloc/
+    // free cycle on an already-tight heap).  When the new ROM is small we leave
+    // g_wallpaper_evicted alone so gb_unload_rom naturally reloads the wallpaper.
+    if (need_evict) g_wallpaper_evicted = false;  // suppress reload inside unload
+    gb_unload_rom();   // frees old ROM buffer + cartRam, saves state, audio shutdown
+    // Set the eviction flag for the new session so gb_unload_rom reloads on exit.
+    // If !need_evict and prev game was large, gb_unload_rom already reloaded.
+    g_wallpaper_evicted = need_evict;
+
+    // Step 4 — Allocate the new ROM buffer.
+    // At this point: glyph cache flushed, wallpaper freed (if need_evict), old
+    // ROM freed, old cartRam freed.  The heap has maximum contiguous space.
+    uint8_t* rom_buf = static_cast<uint8_t*>(malloc(sz));
+    if (!rom_buf) {
+        fclose(f);
+        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        return false;
+    }
+    if (fread(rom_buf, 1, sz, f) != sz) {
+        free(rom_buf);
+        fclose(f);
+        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        return false;
+    }
     fclose(f);
 
-    g_gb.rom     = rom;
+    g_gb.rom     = rom_buf;
     g_gb.romSize = sz;
     strncpy(g_gb.romPath, path, sizeof(g_gb.romPath)-1);
     build_save_path(path, g_gb.savePath, sizeof(g_gb.savePath));
@@ -524,10 +558,17 @@ bool gb_load_rom(const char* path) {
                 gb_cart_ram_read, gb_cart_ram_write,
                 gb_error, nullptr);
     if (err != GB_INIT_NO_ERROR) {
-        free(g_gb.rom); g_gb.rom = nullptr;
-        g_gb.romSize = 0;
-        g_gb.romPath[0] = '\0';
+        // g_gb.rom is the freshly-allocated rom_buf — free it now.
+        free(g_gb.rom);
+        g_gb.rom         = nullptr;
+        g_gb.romSize     = 0;
+        g_gb.romPath[0]  = '\0';
         g_gb.savePath[0] = '\0';
+        // Restore wallpaper if we evicted it for this load attempt.
+        if (g_wallpaper_evicted) {
+            g_wallpaper_evicted = false;
+            ult::reloadWallpaper();
+        }
         return false;
     }
 
@@ -557,8 +598,16 @@ bool gb_load_rom(const char* path) {
         if (!g_gb.cartRam) {
             // Can't allocate cart RAM — running without it would silently corrupt
             // any game that uses SRAM. Clean up and fail.
-            free(g_gb.rom); g_gb.rom = nullptr;
-            g_gb.romSize = 0; g_gb.romPath[0] = '\0'; g_gb.savePath[0] = '\0';
+            free(g_gb.rom);  // free the ROM buffer we just allocated
+            g_gb.rom         = nullptr;
+            g_gb.romSize     = 0;
+            g_gb.romPath[0]  = '\0';
+            g_gb.savePath[0] = '\0';
+            // Restore wallpaper if we evicted it for this load attempt.
+            if (g_wallpaper_evicted) {
+                g_wallpaper_evicted = false;
+                ult::reloadWallpaper();
+            }
             return false;
         }
         g_gb.cartRamSz = ramSz;
@@ -628,6 +677,8 @@ void gb_unload_rom() {
     write_save(g_gb);
     if (g_gb.cartRam) { free(g_gb.cartRam); g_gb.cartRam = nullptr; }
     g_gb.cartRamSz   = 0;
+    // Free the ROM buffer.  It was malloc'd in gb_load_rom and is owned solely
+    // by g_gb.rom — no persistent slab, clean release every unload.
     free(g_gb.rom);
     g_gb.rom         = nullptr;
     g_gb.romSize     = 0;
@@ -758,45 +809,19 @@ public:
         ult::hasNextPageButton.store(false, std::memory_order_release);
         renderer->fillScreen(renderer->a(tsl::defaultBackgroundColor));
 
-        // When the game is running, skip rendering the wallpaper behind the GB
-        // screen — render_gb_screen will overwrite it with fully-opaque game
-        // pixels anyway.  Instead draw the wallpaper only in the four strips
-        // that are actually visible around the viewport.
+        // Draw the full wallpaper in a single pass regardless of game state.
         //
-        // processBMPChunk's row-level scissor check (hasScissor && baseY outside
-        // range → continue) skips the entire NEON inner loop for excluded rows,
-        // saving all blend work for the ~144,000 pixels the game covers (44% of
-        // the 448x720 framebuffer).
+        // Previous approach: 4 scissored drawWallpaper calls when running,
+        // each iterating all 720 rows with an early-continue for excluded rows.
+        // Total cost: 4 × 720 row iterations even though ~360 rows per pass
+        // were skipped — more row-loop overhead than a single full-framebuffer pass.
         //
-        // VP geometry: x=[VP_X, VP_X+VP_W) = [24,424), y=[VP_Y, VP_Y+VP_H)
-        if (g_gb.running && g_emu_active) {
-            // Top strip: full width, above the game screen
-            if constexpr (VP_Y > 0) {
-                renderer->enableScissoring(0, 0, FB_W, VP_Y);
-                renderer->drawWallpaper();
-                renderer->disableScissoring();
-            }
-            // Bottom strip: full width, below the game screen
-            if constexpr (VP_Y + VP_H < FB_H) {
-                renderer->enableScissoring(0, VP_Y + VP_H, FB_W, FB_H - (VP_Y + VP_H));
-                renderer->drawWallpaper();
-                renderer->disableScissoring();
-            }
-            // Left strip: beside the game screen (vertical band)
-            if constexpr (VP_X > 0) {
-                renderer->enableScissoring(0, VP_Y, VP_X, VP_H);
-                renderer->drawWallpaper();
-                renderer->disableScissoring();
-            }
-            // Right strip: beside the game screen (vertical band)
-            if constexpr (VP_X + VP_W < FB_W) {
-                renderer->enableScissoring(VP_X + VP_W, VP_Y, FB_W - (VP_X + VP_W), VP_H);
-                renderer->drawWallpaper();
-                renderer->disableScissoring();
-            }
-        } else {
-            renderer->drawWallpaper();
-        }
+        // Current approach: one drawWallpaper call covers the entire 448×720
+        // framebuffer.  render_gb_letterbox and render_gb_screen both use direct
+        // setPixelAtOffset writes with a=0xF (fully opaque), so they overwrite
+        // the wallpaper pixels in the game viewport area.  The extra ~92K pixels
+        // blended under the viewport cost far less than the 3 saved full passes.
+        renderer->drawWallpaper();
     
         //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
         
@@ -850,7 +875,20 @@ public:
                         g_cgb_bounce_frames = -1;  // disarm before reload
                         char path[512] = {};
                         strncpy(path, g_gb.romPath, sizeof(path) - 1);
+
+                        // Suppress wallpaper reload/evict churn during bounce.
+                        // The wallpaper is already absent (large CGB ROM evicted
+                        // it when first loaded).  If we let gb_unload_rom reload
+                        // it, gb_load_rom would immediately evict it again — two
+                        // extra 630 KB malloc/free cycles on the 8 MB heap that
+                        // can cause the subsequent malloc(4 MB) to fail.
+                        // Clear g_wallpaper_evicted so gb_unload_rom skips the
+                        // reload, then restore it so gb_load_rom knows to evict.
+                        const bool bounce_evicted = g_wallpaper_evicted;
+                        if (bounce_evicted) g_wallpaper_evicted = false;
                         gb_unload_rom();
+                        if (bounce_evicted) g_wallpaper_evicted = true;
+
                         if (gb_load_rom(path))
                             g_emu_active = true;
                         // No return here — g_gb_fb was restored from the state
@@ -873,7 +911,7 @@ public:
         //    VP_X+4, VP_Y-14, 12, tsl::defaultTextColor);
         {
             const std::string backStr = "\uE0E2 "+ult::DIVIDER_SYMBOL+" "+ult::BACK;
-            static auto [bw, bh] = renderer->getTextDimensions(backStr, false, 15);
+            static const auto [bw, bh] = renderer->getTextDimensions(backStr, false, 15);
             renderer->drawStringWithColoredSections(backStr, false, tsl::s_dividerSpecialChars,
                 VP_X + VP_W - bw, VP_Y+VP_H+16+2, 15, tsl::defaultTextColor, tsl::textSeparatorColor);
         }
@@ -884,27 +922,27 @@ public:
         // the font's internal bearing/ascender so the hit region tracks the
         // glyph exactly rather than a hand-guessed geometric centre.
         if (!g_btns_measured) {
-            static auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
+            static const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
             g_dpad_hx  = DPAD_DRAW_X  + dw / 2;
             g_dpad_hy  = (DPAD_DRAW_Y - 10) - dh / 2 + 10;
 
-            static auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
+            static const auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
             g_abtn_hx  = ABTN_DRAW_X  + aw / 2;
             g_abtn_hy  = ABTN_DRAW_Y  - ah / 2;
 
-            static auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
+            static const auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
             g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
             g_bbtn_hy  = BBTN_DRAW_Y  - bh / 2;
 
-            static auto [sw, sh] = renderer->getTextDimensions("\uE0F1", false, START_SIZE);
+            static const auto [sw, sh] = renderer->getTextDimensions("\uE0F1", false, START_SIZE);
             g_start_hx = START_DRAW_X + sw / 2;
             g_start_hy = START_DRAW_Y - sh / 2;
 
-            static auto [selw, selh] = renderer->getTextDimensions("\uE0F2", false, SELECT_SIZE);
+            static const auto [selw, selh] = renderer->getTextDimensions("\uE0F2", false, SELECT_SIZE);
             g_select_hx = SELECT_DRAW_X + selw / 2;
             g_select_hy = SELECT_DRAW_Y - selh / 2;
 
-            static auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
+            static const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
             g_div_half_w = static_cast<int>(divw) / 2;
 
             g_btns_measured = true;
@@ -924,10 +962,10 @@ public:
             static constexpr s32 FULL    = 131;  // +3 for vertical length
             static constexpr s32 LIP     = 2;
             // Vertical bar — shifted 1px down, bottom extended 2px
-            renderer->drawRect(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 3,
+            renderer->drawRectAdaptive(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 3,
                                ARM_W + LIP*2, FULL + LIP*2 + 2, BK);
             // Horizontal bar — shifted 1px lower
-            renderer->drawRect(DPAD_CX - (FULL + LIP*2)/2, DPAD_CY - (ARM_H + LIP*2)/2 + 5,
+            renderer->drawRectAdaptive(DPAD_CX - (FULL + LIP*2)/2, DPAD_CY - (ARM_H + LIP*2)/2 + 5,
                                FULL + LIP*2, ARM_H + LIP*2, BK);
         }
 
@@ -1500,7 +1538,7 @@ public:
     }
 
     virtual void exitServices() override {
-        gb_unload_rom();   // save state, write SRAM, free memory, shut down audio
+        gb_unload_rom();   // save state, write SRAM, shut down audio, free ROM buffer
     }
 
     // Pause when overlay is hidden with the system combo.
