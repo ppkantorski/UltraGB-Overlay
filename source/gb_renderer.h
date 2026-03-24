@@ -382,6 +382,16 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
     fill(ix,         ix + iw,             0,     iy);
     // Bottom strip: x = [vp_x(),         vp_x()+vp_w())  y = [vp_y()+vp_h(), VP_Y+VP_H)
     fill(ix,         ix + iw,             iy + ih, VP_H);
+
+
+    // Power indicator LED — in the left letterbox strip, slightly above centre,
+    // mimicking where the power light lives on a real GBC.
+    //   x: centre of left strip (VP_X to vp_x()) in absolute coords → VP_X + ix/2
+    //   y: upper third of the full strip height                      → VP_Y + VP_H/3
+    //const int led_cx = VP_X + ix / 2 -2;
+    //const int led_cy = VP_Y + VP_H / 3;
+    //renderer->drawCircle(led_cx, led_cy, 4, true, {0x7, 0x0, 0x0, 0xF});  // dark rim
+    //renderer->drawCircle(led_cx, led_cy, 3, true, {0xF, 0x2, 0x2, 0xF});  // red fill
 }
 
 // -- Border around the viewport -----------------------------------------------

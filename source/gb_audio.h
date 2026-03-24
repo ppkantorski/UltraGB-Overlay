@@ -640,12 +640,21 @@ static bool gb_audio_init(gb_s*) {
     s_ctrl.cur=0;
     s_ctrl.paused.store(false,std::memory_order_relaxed);
 
+    // If DMA buffers were pre-allocated by gb_audio_preinit_dma(), reuse them
+    // directly — do NOT free and re-allocate.  Pre-allocation happens in
+    // gb_load_rom immediately after gb_unload_rom(), while the heap is clean
+    // (before the large ROM malloc).  aligned_alloc(0x1000) needs a contiguous
+    // free block of ~8191 bytes; after a ~2 MB ROM is malloc'd on a 4 MB heap
+    // that space may not exist, causing a spurious "Not enough memory" failure
+    // even though total free bytes are sufficient.  Skipping re-allocation here
+    // when the buffers are already valid fixes that race.
     for(int i=0;i<4;++i){
-        free(s_ctrl.dma[i]);
-        s_ctrl.dma[i]=static_cast<int16_t*>(aligned_alloc(GB_DMA_ALIGN,GB_DMA_CAP));
         if(!s_ctrl.dma[i]){
-            for(int j=0;j<i;++j){free(s_ctrl.dma[j]);s_ctrl.dma[j]=nullptr;}
-            return false;
+            s_ctrl.dma[i]=static_cast<int16_t*>(aligned_alloc(GB_DMA_ALIGN,GB_DMA_CAP));
+            if(!s_ctrl.dma[i]){
+                for(int j=0;j<i;++j){free(s_ctrl.dma[j]);s_ctrl.dma[j]=nullptr;}
+                return false;
+            }
         }
         memset(s_ctrl.dma[i],0,GB_DMA_CAP);
     }
@@ -686,7 +695,7 @@ static bool gb_audio_init(gb_s*) {
     s_ctrl.thread_run.store(true,std::memory_order_relaxed);
     if(R_FAILED(threadCreate(&s_ctrl.thread_handle,
                               gb_audio_thread_fn,nullptr,
-                              nullptr,0x4000,0x2B,-2)))
+                              nullptr,0x1000,0x2B,-2)))
     {
         s_ctrl.thread_run.store(false);
         audoutStopAudioOut();
@@ -762,6 +771,41 @@ static void gb_audio_shutdown() {
     }
 
     for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;s_ctrl.ab[i]={};}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_preinit_dma — allocate DMA buffers while the heap is clean.
+//
+// Call this in gb_load_rom AFTER gb_unload_rom() and BEFORE malloc(romSz).
+//
+// Why this exists:
+//   aligned_alloc(0x1000, 0x1000) internally requests a free block of
+//   ~8191 bytes so dlmalloc can guarantee 4096-byte alignment.  On a 4 MB
+//   heap, after a ~2 MB ROM buffer has been malloc'd, the largest remaining
+//   contiguous free region may be smaller than 8191 bytes even though total
+//   free memory is sufficient.  Calling this before the ROM malloc ensures
+//   the four DMA buffers land in clean, unfragmented space.
+//
+//   gb_audio_init() checks each dma[i] for non-null before allocating, so
+//   if the buffers are already present here it simply memsets them to zero
+//   and skips re-allocation entirely.
+//
+//   No-op if all four buffers are already allocated (e.g. isLive fast-resume
+//   path where gb_audio_shutdown was never called for this session).
+// ─────────────────────────────────────────────────────────────────────────────
+static bool gb_audio_preinit_dma() {
+    for(int i=0;i<4;++i){
+        if(!s_ctrl.dma[i]){
+            s_ctrl.dma[i]=static_cast<int16_t*>(aligned_alloc(GB_DMA_ALIGN,GB_DMA_CAP));
+            if(!s_ctrl.dma[i]){
+                // Partial allocation — roll back and report failure.
+                for(int j=0;j<i;++j){free(s_ctrl.dma[j]);s_ctrl.dma[j]=nullptr;}
+                return false;
+            }
+            memset(s_ctrl.dma[i],0,GB_DMA_CAP);
+        }
+    }
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

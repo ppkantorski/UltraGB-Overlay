@@ -71,6 +71,11 @@ static void load_config() {
         const int v = std::stoi(vol_val);
         gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100)));
     }
+
+    // pixel_perfect — 0 = 2.5× (default), 1 = 2× pixel-perfect
+    const std::string pp_val = ult::parseValueFromIniSection(path, "config", "pixel_perfect");
+    if (!pp_val.empty())
+        g_vp_2x = (pp_val == "1");
 }
 
 static void write_default_config_if_missing() {
@@ -78,12 +83,13 @@ static void write_default_config_if_missing() {
     // Write keys only if they don't already exist
     const std::string existing_dir = ult::parseValueFromIniSection(path, "config", "rom_dir");
     if (existing_dir.empty())
-        ult::setIniFileValue(path, "config", "rom_dir", g_rom_dir,
-                             "Set rom_dir to your .gb/.gbc folder");
+        ult::setIniFileValue(path, "config", "rom_dir", g_rom_dir);
     const std::string existing_vol = ult::parseValueFromIniSection(path, "config", "volume");
     if (existing_vol.empty())
-        ult::setIniFileValue(path, "config", "volume", "100",
-                             "Master GB audio volume (0-100)");
+        ult::setIniFileValue(path, "config", "volume", "100");
+    const std::string existing_pp = ult::parseValueFromIniSection(path, "config", "pixel_perfect");
+    if (existing_pp.empty())
+        ult::setIniFileValue(path, "config", "pixel_perfect", "0");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -92,6 +98,12 @@ static void save_last_rom(const char* fullPath) {
     const char* base = sl ? sl + 1 : fullPath;
     strncpy(g_last_rom_path, base, sizeof(g_last_rom_path) - 1);
     ult::setIniFileValue(std::string(CONFIG_FILE), "config", "last_rom", base, "");
+}
+
+// Persist the current scale mode to config.ini.
+static void save_pixel_perfect() {
+    ult::setIniFileValue(std::string(CONFIG_FILE), "config", "pixel_perfect",
+                         g_vp_2x ? "1" : "0", "");
 }
 
 // =============================================================================
@@ -203,7 +215,7 @@ static constexpr int BBTN_DRAW_Y = 633-4-2-2;   // baseline
 static constexpr int BBTN_SIZE   = 58;
 static constexpr int BBTN_R      = 31;
 
-// Start (+) — \uE0F1   and   Select (−) — \uE0F2
+// Start (+) — \uE0EF   and   Select (−) — \uE0F0
 // Both buttons are centred symmetrically about the overlay midline (FB_W/2 = 224).
 // A gap of 16 px separates the two glyphs (8 px each side of centre).
 // IMPORTANT: must stay above FOOTER_Y (FB_H - 73 = 647).  Any touch whose
@@ -314,7 +326,11 @@ static void build_state_path(const char* romPath, char* out, size_t outSz) {
 }
 
 static void save_state(GBState& s) {
-    if (!s.rom || !s.romPath[0]) return;
+    // Only romPath is needed to derive the state file path.
+    // The ROM buffer itself is NOT read by this function — gb_s (BSS), cartRam,
+    // and g_gb_fb are the only data sources.  The caller may free s.rom before
+    // calling save_state() to reduce peak heap pressure.
+    if (!s.romPath[0]) return;
 
     mkdir(STATE_DIR, 0777);
 
@@ -443,28 +459,31 @@ bool gb_load_rom(const char* path) {
 
     // ── Heap-tier capability check ────────────────────────────────────────────
     // Memory tiers (set by tesla.hpp at startup):
-    //   limitedMemory        = 4 MB heap  → max ROM 2 MB
+    //   limitedMemory        = 4 MB heap  → max ROM 1 MB
     //   (neither)            = 6 MB heap  → max ROM 2 MB (can't fit 4 MB ROMs)
     //   expandedMemory       = 8 MB heap  → max ROM 4 MB (wallpaper evicted below)
-    //   furtherExpandedMemory= >8 MB heap → max ROM 8 MB
+    //   furtherExpandedMemory= >8 MB heap → max ROM 6 MB
     //
     // Notify the user with an actionable message before touching any state.
     static constexpr size_t ROM_2MB = 2u << 20;
     static constexpr size_t ROM_4MB = 4u << 20;
-    static constexpr size_t ROM_8MB = 8u << 20;
+    static constexpr size_t ROM_6MB = 6u << 20;
 
-    if (sz > ROM_2MB && (ult::limitedMemory || !ult::expandedMemory)) {
-        // 4 MB heap can't fit a 2 MB ROM; 6 MB heap can't fit a 4 MB ROM.
-        const std::string msg = ult::limitedMemory ? "Requires at least 6MB."
-                                                   : "Requires at least 8MB.";
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + msg);
+    // Limited (4 MB heap): reject any ROM >= 2 MB — only ROMs strictly below 2 MB fit.
+    if (ult::limitedMemory && sz >= ROM_2MB) {
+        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 6MB.");
+        fclose(f); return false;
+    }
+    // Default (6 MB heap): reject ROMs > 2 MB.
+    if (!ult::expandedMemory && sz > ROM_2MB) {
+        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 8MB.");
         fclose(f); return false;
     }
     if (sz > ROM_4MB && ult::expandedMemory && !ult::furtherExpandedMemory) {
         if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 10MB.");
         fclose(f); return false;
     }
-    const size_t maxRom = ult::furtherExpandedMemory ? ROM_8MB
+    const size_t maxRom = ult::furtherExpandedMemory ? ROM_6MB
                         : ult::expandedMemory        ? ROM_4MB
                         : ROM_2MB;
     if (sz > maxRom) { fclose(f); return false; }
@@ -485,7 +504,13 @@ bool gb_load_rom(const char* path) {
     //   10 MB+ heap (furtherExpandedMemory)— max 8 MB ROM, wallpaper safe at all sizes
 
     static constexpr size_t WALLPAPER_EVICT_THRESHOLD = 2u << 20;  // 2 MB
-    const bool need_evict = (sz > WALLPAPER_EVICT_THRESHOLD && !ult::furtherExpandedMemory);
+    const bool need_evict = (sz > WALLPAPER_EVICT_THRESHOLD && !ult::furtherExpandedMemory && ult::expandedMemory);
+
+    if (g_gb.rom && g_gb.running) {
+        g_gb.running = false;
+        g_emu_active = false;
+        gb_audio_shutdown();   // ← free DMA buffers BEFORE clearCache
+    }
 
     // Step 1 — Before evicting the wallpaper or freeing the old ROM, flush the
     // glyph cache.  This is the key step that prevents intermittent malloc(4 MB)
@@ -530,12 +555,33 @@ bool gb_load_rom(const char* path) {
     // If !need_evict and prev game was large, gb_unload_rom already reloaded.
     g_wallpaper_evicted = need_evict;
 
+    // Step 3.5 — Pre-allocate DMA buffers BEFORE the large ROM malloc.
+    //
+    // aligned_alloc(0x1000, 0x1000) needs a contiguous free block of ~8191
+    // bytes to satisfy its alignment contract.  On a 4 MB heap, after
+    // malloc(sz) claims up to ~2 MB the heap may have no such block left,
+    // even with plenty of total free bytes — causing gb_audio_init (called
+    // later) to fail with an invisible OOM that leaves audio dead and the
+    // emulator in a broken state.
+    //
+    // Calling gb_audio_preinit_dma() here, while the heap is clean (glyph
+    // cache flushed, old ROM freed, wallpaper freed), guarantees the four
+    // 4 KB aligned buffers land in unfragmented space.  gb_audio_init()
+    // detects non-null dma[] pointers and skips re-allocation.
+    if (!gb_audio_preinit_dma()) {
+        fclose(f);
+        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Not enough memory.");
+        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        return false;
+    }
+
     // Step 4 — Allocate the new ROM buffer.
     // At this point: glyph cache flushed, wallpaper freed (if need_evict), old
-    // ROM freed, old cartRam freed.  The heap has maximum contiguous space.
+    // ROM freed, old cartRam freed, DMA buffers pre-allocated.
     uint8_t* rom_buf = static_cast<uint8_t*>(malloc(sz));
     if (!rom_buf) {
         fclose(f);
+        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Not enough memory.");
         if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
         return false;
     }
@@ -669,6 +715,16 @@ void gb_unload_rom() {
                            // Thread writes s_ctrl.snapshot = local before exiting,
                            // so save_state() below captures the full settled APU state.
 
+    // Free the ROM buffer BEFORE save_state so the ~1 MB slab is released while
+    // save_state writes to disk.  save_state() only reads gb_s (BSS), cartRam,
+    // and g_gb_fb — none of which depend on the ROM buffer being live.
+    // On a 4 MB heap this eliminates the peak where ROM + cartRam + FILE buffer
+    // were all simultaneously allocated, which was causing intermittent malloc
+    // failures when loading the next game.
+    free(g_gb.rom);
+    g_gb.rom     = nullptr;
+    g_gb.romSize = 0;
+
     // Persist state on every unload, not just overlay exit.
     // This covers the game-switch path (X -> pick different ROM) which previously
     // lost the current game's progress silently.
@@ -677,11 +733,6 @@ void gb_unload_rom() {
     write_save(g_gb);
     if (g_gb.cartRam) { free(g_gb.cartRam); g_gb.cartRam = nullptr; }
     g_gb.cartRamSz   = 0;
-    // Free the ROM buffer.  It was malloc'd in gb_load_rom and is owned solely
-    // by g_gb.rom — no persistent slab, clean release every unload.
-    free(g_gb.rom);
-    g_gb.rom         = nullptr;
-    g_gb.romSize     = 0;
     g_gb.romPath[0]  = '\0';
     g_gb.savePath[0] = '\0';
 
@@ -873,7 +924,7 @@ public:
                 if (g_cgb_bounce_frames >= 0) {
                     if (++g_cgb_bounce_frames >= 60) {
                         g_cgb_bounce_frames = -1;  // disarm before reload
-                        char path[512] = {};
+                        char path[256] = {};
                         strncpy(path, g_gb.romPath, sizeof(path) - 1);
 
                         // Suppress wallpaper reload/evict churn during bounce.
@@ -910,10 +961,11 @@ public:
         //renderer->drawString(sl ? sl+1 : g_gb.romPath, false,
         //    VP_X+4, VP_Y-14, 12, tsl::defaultTextColor);
         {
-            const std::string backStr = "\uE0E2 "+ult::DIVIDER_SYMBOL+" "+ult::BACK;
+            static const std::vector<std::string> backButton = {"\uE0E2"};
+            const std::string backStr = "\uE0E2 "+ult::BACK;
             static const auto [bw, bh] = renderer->getTextDimensions(backStr, false, 15);
-            renderer->drawStringWithColoredSections(backStr, false, tsl::s_dividerSpecialChars,
-                VP_X + VP_W - bw, VP_Y+VP_H+16+2, 15, tsl::defaultTextColor, tsl::textSeparatorColor);
+            renderer->drawStringWithColoredSections(backStr, false, backButton,
+                VP_X + VP_W - bw, VP_Y+VP_H+16+2, 15, tsl::defaultTextColor, VBTN_COLOR);
         }
 
         // ── Virtual Game GB controls ─────────────────────────────────────────
@@ -934,11 +986,11 @@ public:
             g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
             g_bbtn_hy  = BBTN_DRAW_Y  - bh / 2;
 
-            static const auto [sw, sh] = renderer->getTextDimensions("\uE0F1", false, START_SIZE);
+            static const auto [sw, sh] = renderer->getTextDimensions("\uE0EF", false, START_SIZE);
             g_start_hx = START_DRAW_X + sw / 2;
             g_start_hy = START_DRAW_Y - sh / 2;
 
-            static const auto [selw, selh] = renderer->getTextDimensions("\uE0F2", false, SELECT_SIZE);
+            static const auto [selw, selh] = renderer->getTextDimensions("\uE0F0", false, SELECT_SIZE);
             g_select_hx = SELECT_DRAW_X + selw / 2;
             g_select_hy = SELECT_DRAW_Y - selh / 2;
 
@@ -960,13 +1012,13 @@ public:
             static constexpr s32 ARM_W   = 46;
             static constexpr s32 ARM_H   = 48;   // +2 vertically taller
             static constexpr s32 FULL    = 131;  // +3 for vertical length
-            static constexpr s32 LIP     = 2;
+            static constexpr s32 LIP     = 4;   // uniform border, matches A/B circle thickness
             // Vertical bar — shifted 1px down, bottom extended 2px
-            renderer->drawRectAdaptive(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 3,
+            renderer->drawRectAdaptive(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 4,
                                ARM_W + LIP*2, FULL + LIP*2 + 2, BK);
             // Horizontal bar — shifted 1px lower
-            renderer->drawRectAdaptive(DPAD_CX - (FULL + LIP*2)/2, DPAD_CY - (ARM_H + LIP*2)/2 + 5,
-                               FULL + LIP*2, ARM_H + LIP*2, BK);
+            renderer->drawRectAdaptive(DPAD_CX - (FULL + LIP*2)/2 -1, DPAD_CY - (ARM_H + LIP*2)/2 + 6,
+                               FULL + LIP*2 +1, ARM_H + LIP*2 -1, BK);
         }
 
         // A button: filled black circle matching the hit-test radius.
@@ -1030,10 +1082,10 @@ public:
         }
         renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y,  ABTN_SIZE,  VBTN_COLOR);
         renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y,  BBTN_SIZE,  VBTN_COLOR);
-        renderer->drawString("\uE0F2", false, SELECT_DRAW_X, SELECT_DRAW_Y + 1, SELECT_SIZE, VBTN_COLOR);
+        renderer->drawString("\uE0F0", false, SELECT_DRAW_X, SELECT_DRAW_Y + 1, SELECT_SIZE, VBTN_COLOR);
         renderer->drawString(ult::DIVIDER_SYMBOL, false,
             FB_W / 2 - g_div_half_w, START_DRAW_Y + 1, START_SIZE, tsl::textSeparatorColor);
-        renderer->drawString("\uE0F1", false, START_DRAW_X,  START_DRAW_Y  + 1, START_SIZE,  VBTN_COLOR);
+        renderer->drawString("\uE0EF", false, START_DRAW_X,  START_DRAW_Y  + 1, START_SIZE,  VBTN_COLOR);
 
         if (!ult::useRightAlignment)
             renderer->drawRect(447, 0, 448, 720, a(tsl::edgeSeparatorColor));
@@ -1056,7 +1108,11 @@ class GBEmulatorGui : public tsl::Gui {
     u64  m_prevTouchKeys  = 0;     // track previous touch state
     bool m_vp_tap_pending = false; // true while a screen-region tap is in progress
     int  m_vp_tap_frames  = 0;     // frames held so far for the current tap
+    bool m_rs_tap_pending = false; // true while an RS quick-release is in progress
+    int  m_rs_tap_frames  = 0;     // frames RS has been held so far
 public:
+    ~GBEmulatorGui() {}
+
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = true;
         m_waitForRelease = true;
@@ -1115,6 +1171,37 @@ public:
                     m_vp_tap_pending = false;
                 } else {
                     ++m_vp_tap_frames;
+                }
+            }
+        }
+
+        // ── RS quick-release → scale toggle ──────────────────────────────────
+        // A quick press-and-release of RS (right stick click) with no other
+        // buttons held toggles between 2.5× and 2× pixel-perfect scale and
+        // persists the choice to config.ini.  "Quick" = released within 20
+        // frames (~333 ms).  Requiring keysHeld == KEY_RSTICK during the hold
+        // ensures accidental combos (e.g. RS + ZL for system overlay) don't fire.
+        {
+            const bool rs_down      = (keysDown & KEY_RSTICK) != 0;
+            const bool rs_held_alone = (keysHeld == KEY_RSTICK);
+
+            if (rs_down && !m_rs_tap_pending) {
+                m_rs_tap_pending = true;
+                m_rs_tap_frames  = 0;
+            }
+            if (m_rs_tap_pending) {
+                if (!(keysHeld & KEY_RSTICK)) {
+                    // RS released — fire toggle only if it was a quick solo tap.
+                    if (m_rs_tap_frames < 20) {
+                        toggle_vp_scale();
+                        save_pixel_perfect();
+                    }
+                    m_rs_tap_pending = false;
+                } else if (!rs_held_alone) {
+                    // Another button joined the hold — abort, treat as a combo.
+                    m_rs_tap_pending = false;
+                } else {
+                    ++m_rs_tap_frames;
                 }
             }
         }
@@ -1200,6 +1287,7 @@ public:
             // Restore normal clickable-item state for the ROM selector UI.
             ult::noClickableItems.store(false, std::memory_order_release);
             gb_unload_rom();  // sets running=false, emu_active=false, frees all
+            tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
             triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>();
             return true;
@@ -1244,7 +1332,8 @@ static bool rom_is_playable(const std::string& path) {
     const size_t sz = static_cast<size_t>(st.st_size);
     if (ult::furtherExpandedMemory) return sz <= (8u << 20);
     if (ult::expandedMemory)        return sz <= (4u << 20);
-    return sz <= (2u << 20);  // 4 MB or 6 MB heap
+    if (ult::limitedMemory)         return sz <  (2u << 20);  // 4 MB heap: strictly < 2 MB
+    return sz <= (2u << 20);  // default 6 MB heap: up to and including 2 MB
 }
 
 // =============================================================================
@@ -1422,6 +1511,8 @@ public:
                         gb_load_rom(path.c_str());
                         return false;
                     }
+
+                    tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
 
                     // Audio::exit() shuts down UI sound effects before the game
                     // takes over audio.  Must come before gb_load_rom() / gb_audio_init()
