@@ -41,7 +41,8 @@ static constexpr const char* SAVE_DIR    = "sdmc:/config/ultragb/saves/";
 static constexpr const char* STATE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* CONFIGURE_DIR = "sdmc:/config/ultragb/configure/";
 static char g_rom_dir[256]       = "sdmc:/roms/gb/";
-static char g_last_rom_path[256] = {};   // basename of last-played ROM, persisted to config.ini
+static char g_last_rom_path[256]    = {};   // basename of last-played ROM, persisted to config.ini
+static char g_pending_rom_path[512] = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
 
 static void load_config() {
     const std::string path = CONFIG_FILE;
@@ -872,7 +873,8 @@ public:
         // setPixelAtOffset writes with a=0xF (fully opaque), so they overwrite
         // the wallpaper pixels in the game viewport area.  The extra ~92K pixels
         // blended under the viewport cost far less than the 3 saved full passes.
-        renderer->drawWallpaper();
+        if (ult::expandedMemory)
+            renderer->drawWallpaper();
     
         //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
         
@@ -1110,20 +1112,59 @@ class GBEmulatorGui : public tsl::Gui {
     int  m_vp_tap_frames  = 0;     // frames held so far for the current tap
     bool m_rs_tap_pending = false; // true while an RS quick-release is in progress
     int  m_rs_tap_frames  = 0;     // frames RS has been held so far
+    bool m_load_failed    = false; // deferred load failed; swap back to selector in update()
 public:
-    ~GBEmulatorGui() {}
+    ~GBEmulatorGui() {
+        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+    }
 
     virtual tsl::elm::Element* createUI() override {
-        g_emu_active = true;
-        m_waitForRelease = true;
-        // No bottom bar is drawn in-game. Tell the framework there are no
-        // clickable items so footer-zone touches don't highlight the select
-        // button or fire its rumble / simulation callbacks.
-        ult::noClickableItems.store(true, std::memory_order_release);
+        // ── Deferred ROM load ─────────────────────────────────────────────────
+        // g_pending_rom_path is set by the click listener instead of calling
+        // gb_load_rom() there.  By the time createUI() runs, ~RomSelectorGui()
+        // has already destroyed all MiniListItem objects and their std::string
+        // labels, so the heap is fully defragmented before we call malloc(ROM).
+        // We also clear the glyph cache here (belt-and-suspenders: ~RomSelectorGui
+        // already cleared it, but a second clear is free if the cache is empty).
+        if (g_pending_rom_path[0] != '\0') {
+            tsl::gfx::FontManager::clearCache(); // ensure glyphs are gone
+
+            char path[512];
+            strncpy(path, g_pending_rom_path, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+            g_pending_rom_path[0] = '\0'; // consume before the load attempt
+
+            if (!gb_load_rom(path)) {
+                // Load failed (OOM, bad ROM, etc.) — notification already shown
+                // by gb_load_rom.  Signal update() to swap back to the selector.
+                m_load_failed = true;
+            }
+        }
+
+        if (m_load_failed) {
+            // Don't activate the emulator; update() will swap back immediately.
+            g_emu_active = false;
+            ult::noClickableItems.store(false, std::memory_order_release);
+        } else {
+            g_emu_active = true;
+            m_waitForRelease = true;
+            // No bottom bar is drawn in-game. Tell the framework there are no
+            // clickable items so footer-zone touches don't highlight the select
+            // button or fire its rumble / simulation callbacks.
+            ult::noClickableItems.store(true, std::memory_order_release);
+        }
         return new GBScreenElement();
     }
 
-    virtual void update() override {}
+    virtual void update() override {
+        // Deferred load failed: swap back to the ROM selector.
+        // Done here rather than createUI() because swapTo during createUI()
+        // can confuse the framework's GUI stack.
+        if (m_load_failed) {
+            m_load_failed = false;
+            tsl::swapTo<RomSelectorGui>();
+        }
+    }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
                              const HidTouchState& touchPos,
@@ -1286,8 +1327,8 @@ public:
             g_touch_keys  = 0;
             // Restore normal clickable-item state for the ROM selector UI.
             ult::noClickableItems.store(false, std::memory_order_release);
-            gb_unload_rom();  // sets running=false, emu_active=false, frees all
             tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+            gb_unload_rom();  // sets running=false, emu_active=false, frees all
             triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>();
             return true;
@@ -1441,6 +1482,9 @@ class RomSelectorGui : public tsl::Gui {
     u8              m_vol         = 100;
     u8              m_vol_backup  = 100;
 public:
+    ~RomSelectorGui() {
+        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+    }
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = false;
 
@@ -1512,8 +1556,6 @@ public:
                         return false;
                     }
 
-                    tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
-
                     // Audio::exit() shuts down UI sound effects before the game
                     // takes over audio.  Must come before gb_load_rom() / gb_audio_init()
                     // since both start GB audio internally.
@@ -1523,14 +1565,25 @@ public:
                         ult::Audio::exit();
 
                     if (isLive) {
+                        // Fast resume — ROM is already in memory, no large alloc needed.
                         gb_audio_init(&g_gb.gb);
                         g_gb_frame_next_ns = 0;
                         g_gb.running = true;
+                        save_last_rom(path.c_str());
+                        tsl::swapTo<GBEmulatorGui>();
                     } else {
-                        if (!gb_load_rom(path.c_str())) return false;
+                        // Deferred load — store the path and let GBEmulatorGui::createUI()
+                        // call gb_load_rom() AFTER ~RomSelectorGui() has freed all list
+                        // items.  Calling gb_load_rom() here (while the List and all its
+                        // MiniListItem / std::string allocations are still live) scatters
+                        // small heap objects through the just-freed ROM region, preventing
+                        // dlmalloc from coalescing a contiguous block large enough for the
+                        // new ROM, causing spurious OOM on the 4 MB heap tier.
+                        save_last_rom(path.c_str());
+                        strncpy(g_pending_rom_path, path.c_str(), sizeof(g_pending_rom_path) - 1);
+                        g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+                        tsl::swapTo<GBEmulatorGui>();
                     }
-                    save_last_rom(path.c_str());
-                    tsl::swapTo<GBEmulatorGui>();
                     return true;
                 });
                 list->addItem(item);
