@@ -1549,10 +1549,7 @@ public:
                 // Only show in-progress state if the ROM is playable on this memory tier.
                 const bool inProgress = (isLive || isLast) && rom_is_playable(path);
 
-                // Jump to any last-rom match regardless of playability — so returning
-                // from GameConfigGui via Y on an unplayable (warning-coloured) ROM
-                // still scrolls back to that item.
-                if ((isLive || isLast) && jumpLabel.empty())
+                if (inProgress && jumpLabel.empty())
                     jumpLabel = label;
 
                 auto* item = new tsl::elm::MiniListItem(
@@ -1561,9 +1558,12 @@ public:
                     item->setTextColor(tsl::warningTextColor);
 
                 // Only isLive can use the fast-resume path; isLast still needs loading.
-                item->setClickListener([path, label, isLive](u64 keys) -> bool {
-                    // Y → open per-game configuration screen
-                    if (keys & KEY_Y) {
+                // Capture m_page by pointer so KEY_Y is ignored when the Settings
+                // page is active -- onClick fires before Gui::handleInput so the
+                // lambda must gate this itself.
+                item->setClickListener([path, label, isLive, page = &m_page](u64 keys) -> bool {
+                    // Y -> open per-game configuration screen (ROMs page only)
+                    if ((keys & KEY_Y) && *page == Page::ROMs) {
                         save_last_rom(path.c_str());
                         triggerNavigationFeedback();
                         tsl::swapTo<GameConfigGui>(path, label);
@@ -1677,8 +1677,10 @@ public:
             return true;
         }
 
-        // ── Y — mute/unmute toggle (works on both pages) ─────────────────
-        if (keysDown & KEY_Y) {
+        // ── Y — mute/unmute toggle (Settings page only) ─────────────────
+        // On the ROMs page, KEY_Y is handled by each item's click listener
+        // (opens GameConfigGui for that ROM) and must not be intercepted here.
+        if (m_page == Page::Settings && (keysDown & KEY_Y)) {
             if (m_vol_slider) {
                 if (m_vol > 0) {
                     m_vol_backup = m_vol;
