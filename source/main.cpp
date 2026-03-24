@@ -42,7 +42,7 @@ static constexpr const char* STATE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* CONFIGURE_DIR = "sdmc:/config/ultragb/configure/";
 static char g_rom_dir[256]       = "sdmc:/roms/gb/";
 static char g_last_rom_path[256]    = {};   // basename of last-played ROM, persisted to config.ini
-static char g_pending_rom_path[512] = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
+static char g_pending_rom_path[256] = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
 
 static void load_config() {
     const std::string path = CONFIG_FILE;
@@ -471,23 +471,21 @@ bool gb_load_rom(const char* path) {
     static constexpr size_t ROM_6MB = 6u << 20;
 
     // Limited (4 MB heap): reject any ROM >= 2 MB — only ROMs strictly below 2 MB fit.
-    if (ult::limitedMemory && sz >= ROM_2MB) {
+    // A ROM exactly 2 MB passes check 2 below (which is strictly >), so it runs
+    // fine on the 6 MB heap — "Requires at least 6MB" is the correct message here.
+    if (ult::limitedMemory && sz >= ROM_2MB && sz < ROM_4MB) {
         if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 6MB.");
         fclose(f); return false;
     }
     // Default (6 MB heap): reject ROMs > 2 MB.
-    if (!ult::expandedMemory && sz > ROM_2MB) {
+    if (!ult::expandedMemory && sz >= ROM_4MB && sz < ROM_6MB) {
         if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 8MB.");
         fclose(f); return false;
     }
-    if (sz > ROM_4MB && ult::expandedMemory && !ult::furtherExpandedMemory) {
+    if (!ult::furtherExpandedMemory && sz >= ROM_6MB) {
         if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 10MB.");
         fclose(f); return false;
     }
-    const size_t maxRom = ult::furtherExpandedMemory ? ROM_6MB
-                        : ult::expandedMemory        ? ROM_4MB
-                        : ROM_2MB;
-    if (sz > maxRom) { fclose(f); return false; }
 
     // ── Memory management: evict wallpaper FIRST, then unload old ROM ────────
     //
@@ -929,14 +927,15 @@ public:
                         char path[256] = {};
                         strncpy(path, g_gb.romPath, sizeof(path) - 1);
 
-                        // Suppress wallpaper reload/evict churn during bounce.
-                        // The wallpaper is already absent (large CGB ROM evicted
-                        // it when first loaded).  If we let gb_unload_rom reload
-                        // it, gb_load_rom would immediately evict it again — two
-                        // extra 630 KB malloc/free cycles on the 8 MB heap that
-                        // can cause the subsequent malloc(4 MB) to fail.
-                        // Clear g_wallpaper_evicted so gb_unload_rom skips the
-                        // reload, then restore it so gb_load_rom knows to evict.
+                        // Keep the audio thread alive through the bounce.
+                        // s_bounce_keepalive causes gb_audio_shutdown (inside
+                        // gb_unload_rom) to pause the thread rather than kill it,
+                        // and gb_audio_init (inside gb_load_rom) to unpause it
+                        // rather than restart the hardware session.  The thread
+                        // feeds silence into the hardware queue throughout —
+                        // eliminating the audible gap the full teardown caused.
+                        s_bounce_keepalive = true;
+
                         const bool bounce_evicted = g_wallpaper_evicted;
                         if (bounce_evicted) g_wallpaper_evicted = false;
                         gb_unload_rom();
@@ -944,6 +943,8 @@ public:
 
                         if (gb_load_rom(path))
                             g_emu_active = true;
+
+                        s_bounce_keepalive = false;
                         // No return here — g_gb_fb was restored from the state
                         // file with the exact pre-bounce pixels, so we fall
                         // through and render that frame normally.  Removing the
