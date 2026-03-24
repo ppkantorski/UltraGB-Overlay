@@ -2278,11 +2278,23 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		case 0x69:
 			// native rgb565 version
 	    gb->cgb.BGPalette[gb->cgb.BGPaletteID & 0x3F] = val;
+			/* FIX (glyph blink): Only rebuild fixPalette when the high byte of a
+			 * colour word has just been written (odd palette ID = high byte).
+			 * GBC colour entries are two bytes: ID even = low byte, ID odd = high
+			 * byte.  Rebuilding on the low-byte write uses a stale high byte from
+			 * the previous colour, producing a garbage RGB565 value for exactly one
+			 * scanline whenever __gb_draw_line fires between the two writes.  That
+			 * manifests as a thin black/wrong-colour line on glyphs or a full-tile
+			 * blink on sprites.  Deferring to the high-byte write means the entry
+			 * is always reconstructed from a fully-committed pair. */
+			if(gb->cgb.BGPaletteID & 0x01)
+			{
 #if WALNUT_GB_RGB565_BIGENDIAN
-			gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565BE_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
+				gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565BE_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
 #else
-  	  gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
+				gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
 #endif
+			}
 			if(gb->cgb.BGPaletteInc) {
 				gb->cgb.BGPaletteID++;
 				gb->cgb.BGPaletteID = (gb->cgb.BGPaletteID) & 0x3F;
@@ -2298,11 +2310,17 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		/* CGB OAM Palette*/
 		case 0x6B:
 			gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3F)] = val;
+			/* FIX (glyph/sprite blink): Same two-byte atomicity guard as case 0x69.
+			 * Only commit fixPalette[0x20+...] when the high byte (odd ID) is
+			 * written so the scanline renderer never sees a half-updated entry. */
+			if(gb->cgb.OAMPaletteID & 0x01)
+			{
 #if WALNUT_GB_RGB565_BIGENDIAN
-			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565BE_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
+				gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565BE_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
 #else
-			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
+				gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
 #endif
+			}
 			if(gb->cgb.OAMPaletteInc) {
 				gb->cgb.OAMPaletteID++;
 				gb->cgb.OAMPaletteID = (gb->cgb.OAMPaletteID) & 0x3F;
@@ -3054,6 +3072,32 @@ void __gb_draw_line(struct gb_s *gb)
 	}
 
 	// draw sprites
+#if WALNUT_FULL_GBC_SUPPORT
+	/* FIX (sprite-on-sprite + sprite-behind-BG priority):
+	 * Snapshot the background pixel buffer before any sprite can overwrite it.
+	 * The priority checks (pixelsPrio / OBJ_PRIORITY) must always be evaluated
+	 * against the ORIGINAL BG colour index, not the colour written by a
+	 * previously-drawn lower-priority sprite.  Without this, two bugs arise:
+	 *
+	 *   1. BG tile has priority-bit=1, BG colour=0 (transparent).
+	 *      Lower-priority sprite (high OAM index, drawn first) correctly draws
+	 *      because BG is transparent.  Higher-priority sprite (low OAM index,
+	 *      drawn later) checks pixels[disp_x] & 0x3 == first-sprite's c != 0,
+	 *      mistakes it for a non-zero BG colour, and is incorrectly blocked.
+	 *      Result: wrong sprite tile visible, or stale sprite "wins."
+	 *
+	 *   2. BG colour is non-zero, higher-priority sprite has OBJ_PRIORITY=1
+	 *      (behind BG).  Lower-priority sprite already drew there (OBJ_PRIORITY=0,
+	 *      legitimately in front of BG).  Without restoring the BG value, the
+	 *      lower-priority sprite colour stays even though the winning (higher-
+	 *      priority) sprite should cause the BG to show.
+	 *
+	 * The snapshot costs one 160-byte memcpy per scanline and zero extra branches
+	 * in the hot pixel loop (bgColors[] replaces the pixels[] reads in the checks
+	 * directly). */
+	uint8_t bgColors[160];
+	if(cgbMode) memcpy(bgColors, pixels, sizeof(bgColors));
+#endif
 	if(gb->hram_io[IO_LCDC] & LCDC_OBJ_ENABLE)
 	{
 		uint8_t sprite_number;
@@ -3206,15 +3250,34 @@ void __gb_draw_line(struct gb_s *gb)
 #if WALNUT_FULL_GBC_SUPPORT
 				if(cgbMode)
 				{
+					/* FIX (sprite-on-sprite priority): always evaluate BG priority
+					 * against bgColors[] (the pre-sprite BG snapshot), not pixels[]
+					 * which may already hold a lower-OAM-priority sprite's colour.
+					 * Using pixels[] caused two visible bugs:
+					 *   1. A lower-priority sprite's non-zero colour index was
+					 *      mistaken for a non-zero BG colour, incorrectly blocking
+					 *      a higher-priority sprite that should have won.
+					 *   2. When the highest-priority sprite defers to BG (OBJ_PRIORITY=1
+					 *      over a non-zero BG), a lower-priority sprite that already
+					 *      drew to that pixel remained visible instead of the BG.
+					 *      The restore below corrects this: if the best sprite at a
+					 *      pixel loses to BG, BG wins — not the next sprite down. */
+					uint8_t bgColorIdx = bgColors[disp_x] & 0x3;
 					uint8_t isBackgroundDisabled = c && !(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE);
 					uint8_t isPixelPriorityNonConflicting = c &&
-															!(pixelsPrio[disp_x] && (pixels[disp_x] & 0x3)) &&
-															!((OF & OBJ_PRIORITY) && (pixels[disp_x] & 0x3));
+															!(pixelsPrio[disp_x] && bgColorIdx) &&
+															!((OF & OBJ_PRIORITY) && bgColorIdx);
 
 					if(isBackgroundDisabled || isPixelPriorityNonConflicting)
 					{
 						/* Set pixel colour. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;  // add 0x20 to differentiate from BG
+					}
+					else if(c)
+					{
+						/* This sprite defers to BG. Restore the original BG pixel so
+						 * any lower-priority sprite that already drew here is evicted. */
+						pixels[disp_x] = bgColors[disp_x];
 					}
 				}
 				else
