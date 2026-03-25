@@ -53,6 +53,8 @@ extern "C" {
     void    audio_write(uint8_t addr, uint8_t val);
 }
 
+#include "sgb_core.h"            // ── SGB ADD ── decoder + palette state machine
+
 extern "C" {
 #include "walnut_cgb.h"
 }
@@ -938,6 +940,22 @@ static void gb_cart_ram_write(struct gb_s*, const uint_fast32_t addr, const uint
 static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
     // Silently swallow emulation errors; the game will just glitch rather than crash.
 }
+
+// ── SGB ADD ── (boot ROM removed) ────────────────────────────────────────────
+// The real SGB2 boot ROM cannot be used directly: it contains a bidirectional
+// handshake loop (at 0x50–0x5E: CP 0x34 / JR NZ) that waits for the Super
+// Famicom to drive P10–P13 with specific response bytes.  In a standalone GB
+// emulator there is no SFC, so joypad reads always return 0x0F and the boot
+// ROM spins forever, never reaching "LD A,0xFF / LDH [0x50],A" at 0xFE–0xFF.
+// A therefore stays 0x01, the game detects DMG, and no PAL commands are sent.
+//
+// Instead, in main.cpp we:
+//   1. Skip gb_set_bootrom() entirely (gb_reset uses its no-bootrom path).
+//   2. After gb_reset(), write cpu_reg.a = 0xFF directly — the same value the
+//      boot ROM would have left in A had the SFC responded correctly.
+//   3. IO_BOOT is already 0x01 on the no-bootrom reset path, so the joypad
+//      hook's IO_BOOT guard is satisfied immediately.
+// ── END SGB ADD ──────────────────────────────────────────────────────────────
 
 // ── LCD draw-line callback ────────────────────────────────────────────────────
 // Walnut-CGB pixel byte encoding:

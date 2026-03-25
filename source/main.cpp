@@ -716,6 +716,7 @@ bool gb_load_rom(const char* path) {
     // For CGB games this is a no-op in the renderer (fixPalette path is used instead),
     // but calling it is harmless and keeps g_gbc_pal_found/idx accurate for the UI.
     gb_select_dmg_palette();
+    sgb_init();     // ── SGB ADD ── reset packet decoder and palette state
 
     size_t ramSz = 0;
     gb_get_save_size_s(&g_gb.gb, &ramSz);
@@ -769,8 +770,50 @@ bool gb_load_rom(const char* path) {
     // If load_state succeeded, gb_reset() must NOT be called — it would wipe
     // the restored CPU state.  If cold-booting, gb_reset() is already called
     // implicitly by gb_init() above, so the commented-out call below stays out.
+    // Exception: the SGB cold-boot block below intentionally calls gb_reset()
+    // even on resume — see that block's comment for the full rationale.
     //gb_reset(&g_gb.gb);
-    (void)resumed;
+
+    // ── SGB ADD ── SGB cold boot: install the boot ROM and restart the CPU.
+    //
+    // Runs unconditionally for any DMG game in SGB palette mode — even on resume.
+    //
+    // Why ignore `resumed` here:
+    //   A save state from a non-SGB session has A=0x01 at the point the game
+    //   first ran.  The game detected DMG (not SGB2) and will NEVER send PAL
+    //   commands.  Resuming that state in SGB mode means the SGB palette decoder
+    //   stays empty forever and gb_select_dmg_palette()'s static GBC table colours
+    //   show instead of the real SGB palette — exactly the "looks like GBC" bug.
+    //
+    //   The only safe fix is to always restart the CPU from 0x0000 with the SGB2
+    //   boot ROM installed so the game sees A=0xFF at 0x0100 and sends PAL commands.
+    //
+    // Cart RAM safety:
+    //   load_state() has already written the saved cart RAM into g_gb.cartRam.
+    //   gb_reset() resets CPU registers, MBC banking, counters, and HRAM IO —
+    //   it does NOT touch g_gb.cartRam or its size field.  The player's in-game
+    //   save data (Pokémon, Zelda, etc.) survives the reset intact.
+    if (!g_fb_is_rgb565 && g_palette_mode == PaletteMode::SGB) {
+        // Do NOT install the real SGB2 boot ROM.  The boot ROM contains a
+        // bidirectional SFC handshake loop (CP 0x34 / JR NZ at 0x5B–0x5E)
+        // that spins forever in a standalone emulator — the SFC is never
+        // present to drive P10–P13, so joypad reads always return 0x0F and
+        // the loop never exits.  A therefore stays 0x01, the game detects
+        // DMG, and no PAL commands are ever sent.
+        //
+        // The fix: use the normal (no-bootrom) reset path, which sets
+        //   A=0x01, PC=0x0100, IO_BOOT=0x01, LCDC=0x91, SP=0xFFFE …
+        // then manually write A=0xFF — identically to what the last two boot
+        // ROM instructions ("LD A,0xFF / LDH [0x50],A") would have done had
+        // the SFC responded.  IO_BOOT is 0x01 from reset, so the joypad hook
+        // guard fires from the very first FF00 write the game makes.
+        g_gb.gb.gb_bootrom_read = nullptr;  // ensure no-bootrom reset path
+        gb_reset(&g_gb.gb);                 // A=0x01, PC=0x0100, IO_BOOT=0x01
+        g_gb.gb.cpu_reg.a = 0xFF;          // SGB2 identifier → game sends PAL cmds
+        sgb_activate();                     // enable decoder and per-frame apply hook
+    }
+    (void)resumed;  // suppress unused-variable warning on non-SGB paths
+    // ── END SGB ADD ──
 
     // On a CGB cold boot (no existing state file), start the bounce counter.
     // After 60 frames (~1 s) the draw loop does a full gb_unload_rom + gb_load_rom,
@@ -1001,6 +1044,7 @@ public:
 
             if (now_ns >= g_gb_frame_next_ns) {
                 gb_run_one_frame();
+                sgb_apply_if_dirty();   // ── SGB ADD ── flush any new palette commands
                 apply_lcd_ghosting();   // 50/50 blend of raw current vs raw prev frame
                 gb_audio_submit();
 

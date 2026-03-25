@@ -10,8 +10,8 @@
  * Protocol (verified against SGB2 boot ROM disassembly):
  *   Bit encoding over FF00 writes (upper nibble only, lower nibble = input):
  *     0x00  reset / start-of-packet pulse
- *     0x10  bit = 1  (P14 low: direction row selected)
- *     0x20  bit = 0  (P15 low: button row selected)
+ *     0x10  bit = 1  (P15 low: bit5=0 in FF00, action/button row selected)
+ *     0x20  bit = 0  (P14 low: bit4=0 in FF00, direction row selected)
  *     0x30  idle / strobe between bits (ignored)
  *
  *   Each packet = 128 bits (16 bytes), transmitted LSB-first.
@@ -62,12 +62,26 @@ extern uint16_t g_dmg_flat_pal[64];
 static uint16_t s_sgb_pal[4][4]  = {};
 static bool     s_sgb_dirty      = false;
 
+// ── Active flag ───────────────────────────────────────────────────────────────
+// Set true only when a DMG game is running in SGB palette mode.
+// Gates both the walnut joypad hook and sgb_apply_if_dirty so non-SGB games
+// pay zero cost (one short-circuit branch, before any memory reads or writes).
+// Reset to false by sgb_init() on every ROM load; set true by sgb_activate()
+// in main.cpp once the SGB cold boot is confirmed.
+static bool     s_sgb_active     = false;
+
 // ── Packet decoder state ──────────────────────────────────────────────────────
 // Tiny two-state FSM: IDLE waits for a reset pulse; RECV accumulates bits.
 enum class SgbDecState : uint8_t { IDLE, RECV };
 static SgbDecState s_sgb_dec     = SgbDecState::IDLE;
 static uint8_t     s_sgb_buf[16] = {};   // 128-bit packet buffer
 static int         s_sgb_bits    = 0;    // bits received so far (0..127)
+// Previous masked write value — needed to distinguish the SGB clock-low (0x00
+// written immediately after a data bit, i.e. prev=0x10/0x20) from the
+// packet-start/abort-reset pulse (0x00 written after an idle strobe, i.e.
+// prev=0x30).  Without this, a reset on every 0x00 wipes the buffer after
+// every single bit and the decoder never accumulates 128 bits.
+static uint8_t     s_sgb_prev    = 0x30u;
 
 // ── sgb_init ─────────────────────────────────────────────────────────────────
 // Reset decoder + palette. Call once when a ROM is loaded.
@@ -75,12 +89,20 @@ static int         s_sgb_bits    = 0;    // bits received so far (0..127)
 // with the best static approximation; sgb_apply_if_dirty() will overwrite once
 // the game sends real palette commands.
 static inline void sgb_init() {
+    s_sgb_active = false;   // disabled until sgb_activate() is called
     s_sgb_dec   = SgbDecState::IDLE;
     s_sgb_bits  = 0;
+    s_sgb_prev  = 0x30u;   // idle/strobe — clean slate for first packet
     memset(s_sgb_buf, 0, sizeof(s_sgb_buf));
     memset(s_sgb_pal, 0, sizeof(s_sgb_pal));
     s_sgb_dirty = false;
 }
+
+// ── sgb_activate ─────────────────────────────────────────────────────────────
+// Enable the decoder and apply hook. Call in main.cpp after confirming that
+// the SGB boot ROM is running (or has run in a resumed session).
+// Must be called AFTER sgb_init() so the flag is not immediately cleared.
+static inline void sgb_activate() { s_sgb_active = true; }
 
 // ── sgb_process_packet ───────────────────────────────────────────────────────
 // Called when 128 bits have been received. Decodes PAL commands and stores
@@ -124,61 +146,100 @@ static inline void sgb_process_packet() {
 
 // ── sgb_observe_joyp ─────────────────────────────────────────────────────────
 // Called from the FF00 write handler in walnut_cgb.h with the raw value the
-// game writes — before any input-state masking. Cost: ~3 comparisons when idle,
-// one bit-shift + array write during packet reception.
+// game writes — before any input-state masking.
 //
 // Must be called ONLY after IO_BOOT != 0 (boot ROM has exited) so the boot
-// ROM's own init packets (which carry zeroed WRAM data) are ignored.
+// ROM's own init packets are ignored.
+//
+// SGB serial protocol (per Pan Docs, verified against SGB2 ASM):
+//   Packet start:  ... 0x30, 0x00, 0x30 ...
+//   Per data bit:  0x00 (clock-low), 0x10 (bit=1) or 0x20 (bit=0), 0x30 (clock-high)
+//   Stop bit:      0x00, 0x20, 0x30  (always 0, ignored — packet done at bit 128)
+//
+// Critical detail: 0x00 is written BEFORE EVERY BIT as the clock-low pulse.
+// The previous implementation reset the decoder on every 0x00, which meant
+// the buffer was wiped after every single bit — 128 bits never accumulated.
+//
+// Fix: track s_sgb_prev.  A decoder reset fires only when 0x00 follows 0x30
+// (the actual packet-start / abort-restart signal).  Clock-low 0x00 writes
+// (prev = 0x10 or 0x20 from the previous data write) are silently ignored.
+//
+// Normal joypad polling (e.g. 0x30 → 0x10 → read → 0x30) is also harmless:
+// a 0x10 or 0x20 write is only counted as a data bit when it follows a 0x00,
+// so 0x30→0x10/0x20 sequences from normal joypad reads never accumulate bits.
 static inline void sgb_observe_joyp(uint8_t val) {
-    // Mask to bits[5:4] only — the input bits in the lower nibble are joypad
-    // state, not SGB signalling.
     val &= 0x30u;
 
-    if (val == 0x00u) {
-        // Reset / start-of-packet pulse — (re)start the decoder.
-        s_sgb_dec  = SgbDecState::RECV;
-        s_sgb_bits = 0;
-        memset(s_sgb_buf, 0, sizeof(s_sgb_buf));
+    if (val == 0x30u) {
+        // Idle / clock-high / strobe — always ignore, but remember it so the
+        // next 0x00 can trigger a proper packet-start reset.
+        s_sgb_prev = 0x30u;
         return;
     }
 
-    if (s_sgb_dec != SgbDecState::RECV) return;
-    if (val == 0x30u) return;   // idle strobe between bits — ignore
-
-    // 0x10 → bit=1 (P14 low), 0x20 → bit=0 (P15 low).
-    const uint8_t bit = (val == 0x10u) ? 1u : 0u;
-
-    const int byte_idx = s_sgb_bits >> 3;
-    const int bit_pos  = s_sgb_bits & 7;
-
-    if (byte_idx < 16)   // bounds guard (should always hold)
-        s_sgb_buf[byte_idx] |= (uint8_t)(bit << bit_pos);
-
-    if (++s_sgb_bits == 128) {
-        sgb_process_packet();
-        s_sgb_dec = SgbDecState::IDLE;
+    if (val == 0x00u) {
+        // Packet-start reset: 0x00 arriving after a 0x30 (idle strobe), OR
+        // when the decoder is IDLE (first write ever / after a completed packet).
+        // Clock-low 0x00 writes that arrive after a data bit (prev = 0x10/0x20)
+        // are silently dropped — they are NOT a reset.
+        if (s_sgb_dec == SgbDecState::IDLE || s_sgb_prev == 0x30u) {
+            s_sgb_dec  = SgbDecState::RECV;
+            s_sgb_bits = 0;
+            memset(s_sgb_buf, 0, sizeof(s_sgb_buf));
+        }
+        s_sgb_prev = 0x00u;
+        return;
     }
+
+    // val == 0x10 or 0x20 (data bit).
+    //
+    // Only count as a valid SGB bit when:
+    //   1. Decoder is in RECV mode, AND
+    //   2. The immediately previous write was 0x00 (the clock-low pulse).
+    //
+    // This rejects normal joypad polling (0x30 → 0x10/0x20) and any stray
+    // 0x10/0x20 writes that are not part of a properly clocked SGB transfer.
+    if (s_sgb_dec == SgbDecState::RECV && s_sgb_prev == 0x00u) {
+        // Pan Docs SGB Command Packet spec:
+        //   Bit = 1 → P15 LOW (bit5=0, action/button row)  → game writes 0x10
+        //   Bit = 0 → P14 LOW (bit4=0, direction row)      → game writes 0x20
+        const uint8_t bit = (val == 0x10u) ? 1u : 0u;
+
+        const int byte_idx = s_sgb_bits >> 3;
+        const int bit_pos  = s_sgb_bits & 7;
+
+        if (byte_idx < 16)   // bounds guard
+            s_sgb_buf[byte_idx] |= (uint8_t)(bit << bit_pos);
+
+        if (++s_sgb_bits == 128) {
+            sgb_process_packet();
+            s_sgb_dec = SgbDecState::IDLE;
+        }
+    }
+
+    s_sgb_prev = val;
 }
 
 // ── sgb_apply_if_dirty ───────────────────────────────────────────────────────
 // Converts decoded SGB RGB555 colours to RGBA4444 and writes them into the
 // branchless flat-palette table g_dmg_flat_pal that gb_lcd_draw_line reads.
 // Call once per frame after gb_run_one_frame(). Is a no-op when no new palette
-// commands have been received since the last call.
+// commands have been received since the last call, or when not in SGB mode.
 //
-// RGBA4444 packing (mirrors gb_pack_rgb555 in gb_core.h):
-//   Strip LSB of each 5-bit channel → 4-bit channel; alpha = 0xF.
-//   Layout (LE): r4 | (g4<<4) | (b4<<8) | 0xF000.
+// RGBA4444 packing — single expression, no temporaries:
+//   Extract bits[4:1]→[3:0] (R),  bits[9:6]→[7:4] (G),  bits[14:11]→[11:8] (B),
+//   then OR alpha nibble 0xF000.
+//   Masks needed: R=(c>>1)&0x000F, G=(c>>2)&0x00F0, B=(c>>3)&0x0F00.
 static inline void sgb_apply_if_dirty() {
-    if (!s_sgb_dirty) return;
+    if (!s_sgb_active || !s_sgb_dirty) return;
     s_sgb_dirty = false;
 
-    // Inline rgb555→rgba4444 conversion (same formula as gb_pack_rgb555).
+    // Inline rgb555→rgba4444: one expression, zero temporaries.
     auto pack = [](const uint16_t c) -> uint16_t {
-        const uint8_t r = ( c        & 0x1Fu) >> 1u;
-        const uint8_t g = ((c >>  5) & 0x1Fu) >> 1u;
-        const uint8_t b = ((c >> 10) & 0x1Fu) >> 1u;
-        return (uint16_t)(r | (uint16_t)(g << 4) | (uint16_t)(b << 8) | 0xF000u);
+        return (uint16_t)(((c >> 1) & 0x000Fu)
+                        | ((c >> 2) & 0x00F0u)
+                        | ((c >> 3) & 0x0F00u)
+                        | 0xF000u);
     };
 
     // BG   → SGB palette 0  (primary game colours)
