@@ -231,7 +231,43 @@ static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generate_samples — writes GB_SPF stereo int16 samples into dst.
+// SPSC event queue
+//
+// EVT_CAP = 4096: Pokémon Yellow's Pikachu voice engine fires a timer IRQ at
+// ~8 kHz.  Each interrupt writes NR30=0 (DAC off), 16 wave RAM bytes, NR30=0x80
+// (DAC on), NR33, NR34 (trigger) — ~20 events.  At 8 kHz that is ~134 IRQs ×
+// 20 = ~2 680 events per frame.  The old cap of 512 caused queue overflow and
+// silently dropped the critical NR30=0x80 / NR34 writes, leaving CH3's DAC in
+// the OFF state every frame → complete silence on the voice channel.
+// ─────────────────────────────────────────────────────────────────────────────
+struct RegEvent { uint8_t addr, val; };
+// SPSC ring — must be power-of-2 for the bitmask drain.
+// One frame worst-case (Pokémon Yellow Pikachu voice): ~134 IRQs × 20 events
+// ≈ 2,680 events.  4096 holds a full frame plus ~1,400 slots of headroom.
+// At 60 fps / 59.73 fps the render thread is at most ~1 frame ahead of the
+// audio thread in steady state, so 4096 is sufficient.  Saves 8 KB vs 8192.
+static constexpr uint32_t EVT_CAP  = 4096u;
+static constexpr uint32_t EVT_MASK = EVT_CAP - 1u;
+
+// Per-frame local copy — does NOT need to be power-of-2 (flat array, not ring).
+// Bounded by one sentinel's worth of events; 3072 > 2,680 with comfortable
+// margin.  Saves 10 KB vs a second EVT_CAP-sized buffer.
+static constexpr uint32_t LOC_CAP  = 3072u;
+
+// Flat event buffer owned exclusively by the audio thread.  The audio thread
+// copies its frame's events here before passing them to generate_samples().
+// File-scope (not stack) because the audio thread stack is only 0x1000 bytes.
+static RegEvent s_local_evts[LOC_CAP];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generate_samples — writes n_samp stereo int16 samples into dst,
+// distributing the supplied register events proportionally across the frame.
+//
+// Event distribution:
+//   Event j of n_evts total is applied just before sample floor(j*n_samp/n_evts).
+//   This maps each of Pokémon Yellow's ~134 wave-table updates to its correct
+//   ~6-sample window (48 kHz / 8 kHz = 6 output samples per voice sample),
+//   reproducing intelligible speech rather than a garbled 60 Hz buzz.
 //
 // Output pipeline per sample:
 //   1. Frame sequencer tick (length / sweep / volume envelope, integer)
@@ -249,17 +285,39 @@ static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
 //   4. NR51 panning + NR50 master volume mix (float).
 //   5. DC blocker (HP_R capacitor), no low-pass filter.
 // ─────────────────────────────────────────────────────────────────────────────
-static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp) {
+static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
+                             const RegEvent* evts = nullptr, uint32_t n_evts = 0) {
     static constexpr uint32_t STEP =
         static_cast<uint32_t>((static_cast<uint64_t>(GB_CPU_HZ)<<16)/GB_OUT_RATE);
 
     static constexpr float DAC_SCALE = 1.0f / 7.5f;  // [0..15] → [-1..+1]
     static constexpr float MIX_SCALE = 900.0f;        // ~88% of int16 range
 
-    const float lv = static_cast<float>(((a.nr50>>4)&7)+1);
-    const float rv = static_cast<float>((a.nr50&7)+1);
+    uint32_t evt_idx = 0;   // next event to apply
 
     for (uint32_t i=0; i<n_samp; ++i) {
+        // ── Proportional event distribution ───────────────────────────────────
+        // Apply every event whose mapped sample index is <= i.
+        // Event j maps to sample floor(j * n_samp / n_evts), distributing all
+        // wave-table / trigger writes evenly across the frame so each voice
+        // sample occupies its correct ~6-output-sample window.
+        // Division by n_evts is safe: the while guard (evt_idx < n_evts) ensures
+        // n_evts > 0 before the body is entered, so the n_evts == 0 case —
+        // which is the only one that could divide by zero — never reaches the
+        // division.  The early exit is implicit but guaranteed by the condition.
+        while (evt_idx < n_evts) {
+            const uint32_t due = static_cast<uint32_t>(
+                static_cast<uint64_t>(evt_idx) * n_samp / n_evts);
+            if (due > i) break;
+            apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
+            ++evt_idx;
+        }
+
+        // NR50 master volume — recomputed each sample so mid-frame NR50 events
+        // (rare but possible) take effect at the correct sample boundary.
+        const float lv = static_cast<float>(((a.nr50>>4)&7)+1);
+        const float rv = static_cast<float>((a.nr50&7)+1);
+
         a.cycle_frac+=STEP;
         const int cyc=static_cast<int>(a.cycle_frac>>16);
         a.cycle_frac&=0xFFFFu;
@@ -395,14 +453,14 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp) {
         *dst++=sl> 32767.f? 32767:sl<-32767.f?-32767:static_cast<int16_t>(sl);
         *dst++=sr> 32767.f? 32767:sr<-32767.f?-32767:static_cast<int16_t>(sr);
     }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SPSC event queue
-// ─────────────────────────────────────────────────────────────────────────────
-struct RegEvent { uint8_t addr, val; };
-static constexpr uint32_t EVT_CAP  = 512u;
-static constexpr uint32_t EVT_MASK = EVT_CAP - 1u;
+    // Drain any events that integer division mapped past the last sample
+    // (only occurs when n_evts > n_samp, i.e. extremely event-dense frames).
+    while (evt_idx < n_evts) {
+        apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
+        ++evt_idx;
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared control block
@@ -575,20 +633,24 @@ static void gb_audio_thread_fn(void*) {
 
         } else {
             // ── Active path ───────────────────────────────────────────────────
-            // Drain SPSC event queue up to frame-end sentinel (addr=0xFF).
+            // Collect this frame's events into s_local_evts (flat array owned
+            // by the audio thread), stopping at the frame-end sentinel (0xFF).
+            // Then hand them to generate_samples for proportional distribution.
+            uint32_t n_evts = 0;
             {
-                uint32_t r=s_ctrl.evt_r.load(std::memory_order_relaxed);
-                const uint32_t w=s_ctrl.evt_w.load(std::memory_order_acquire);
-                while(r!=w){
-                    const RegEvent ev=s_ctrl.events[r];
-                    r=(r+1u)&EVT_MASK;
-                    if(ev.addr==0xFF) break;
-                    apply_reg(local,ev.addr,ev.val);
+                uint32_t r = s_ctrl.evt_r.load(std::memory_order_relaxed);
+                const uint32_t w = s_ctrl.evt_w.load(std::memory_order_acquire);
+                while (r != w) {
+                    const RegEvent ev = s_ctrl.events[r];
+                    r = (r + 1u) & EVT_MASK;
+                    if (ev.addr == 0xFF) break;              // sentinel: end of frame
+                    if (n_evts < LOC_CAP) s_local_evts[n_evts++] = ev; // guard overflow
                 }
-                s_ctrl.evt_r.store(r,std::memory_order_release);
+                s_ctrl.evt_r.store(r, std::memory_order_release);
             }
 
-            generate_samples(local,s_ctrl.dma[s_ctrl.cur],n_samp);
+            generate_samples(local, s_ctrl.dma[s_ctrl.cur], n_samp,
+                             s_local_evts, n_evts);
         }
 
         // ── Submit ────────────────────────────────────────────────────────────

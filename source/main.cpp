@@ -70,8 +70,15 @@ static void load_config() {
     // volume — master GB audio volume (0–100), default 100
     const std::string vol_val = ult::parseValueFromIniSection(path, "config", "volume");
     if (!vol_val.empty()) {
-        const int v = std::stoi(vol_val);
-        gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100)));
+        // Validate before converting: skip if any character is not a digit.
+        // Avoids std::stoi which throws on malformed input (-fexceptions disabled).
+        bool vol_valid = true;
+        for (char c : vol_val) if (c < '0' || c > '9') { vol_valid = false; break; }
+        if (vol_valid) {
+            int v = 0;
+            for (char c : vol_val) v = v * 10 + (c - '0');
+            gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100)));
+        }
     }
 
     // pixel_perfect — 0 = 2.5× (default), 1 = 2× pixel-perfect
@@ -492,10 +499,12 @@ bool gb_load_rom(const char* path) {
     static constexpr size_t ROM_4MB = 4u << 20;
     static constexpr size_t ROM_6MB = 6u << 20;
 
-    // Limited (4 MB heap): reject any ROM >= 2 MB — only ROMs strictly below 2 MB fit.
-    // A ROM exactly 2 MB passes check 2 below (which is strictly >), so it runs
-    // fine on the 6 MB heap — "Requires at least 6MB" is the correct message here.
-    if (ult::limitedMemory && sz >= ROM_2MB && sz < ROM_4MB) {
+    // Limited (4 MB heap): reject any ROM >= 2 MB.
+    // rom_is_playable uses the same >= ROM_2MB threshold; keep them in sync.
+    // The old guard (sz >= ROM_2MB && sz < ROM_4MB) would let a 4 MB ROM slip
+    // past this branch and rely on the !expandedMemory check below — safe only
+    // if limitedMemory always implies !expandedMemory, which is not enforced here.
+    if (ult::limitedMemory && sz >= ROM_2MB) {
         if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 6MB.");
         fclose(f); return false;
     }
@@ -1523,7 +1532,7 @@ public:
         auto* list = new tsl::elm::List();
 
         list->addItem(new tsl::elm::CategoryHeader(
-            "Volume " + ult::DIVIDER_SYMBOL + "  Toggle Mute"));
+            "Volume " + ult::DIVIDER_SYMBOL + " \uE0E3 Toggle Mute"));
 
         m_vol        = gb_audio_get_volume();
         m_vol_backup = (m_vol > 0) ? m_vol : static_cast<u8>(100);
@@ -1636,7 +1645,7 @@ public:
         // ── ROM list ─────────────────────────────────────────────────────
         auto* list = new tsl::elm::List();
         list->addItem(new tsl::elm::CategoryHeader(
-            "ROMs " + ult::DIVIDER_SYMBOL + "  Configure"));
+            "ROMs " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure"));
 
         const std::vector<std::string> roms = scan_roms(g_rom_dir);
 
