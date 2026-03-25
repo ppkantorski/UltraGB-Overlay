@@ -178,6 +178,121 @@ inline void toggle_vp_scale() {
     s_coord_ready = false;
 }
 
+// -- LCD ghosting (frame blend) -----------------------------------------------
+// Simulates GBC LCD phosphor persistence: pixels that toggle on/off at 30 Hz
+// appear semi-transparent instead of flickering.  Games like Link's Awakening
+// deliberately use this — Chain Chomp's chain alternates every frame expecting
+// the LCD to average it into a translucent ghost.
+//
+// Problem with naïve 50/50 blend: it blurs moving characters and causes
+// sprite "doubling" — a 1-bit flicker flag triggers on the frame a sprite
+// LEAVES a pixel (change #2), blending old position with new background.
+//
+// Solution — saturating-counter blend:
+//   s_flicker_mask[i] is a uint8_t counter, not a flag.
+//     • Increments (saturating at 255) each frame the pixel changes.
+//     • Resets to 0 each frame the pixel stays the same.
+//   Blend fires only when counter_prev >= FLICKER_THRESHOLD (3).
+//
+//   A sprite passing through pixel A causes EXACTLY 2 changes:
+//     arrive (counter→1), leave (counter→2).  2 < 3 → NEVER blended.
+//
+//   Chain Chomp chain (alternates every frame indefinitely):
+//     change→1, change→2, change→3, change≥3 → BLEND on frame 4+ (≈50ms warm-up).
+//
+//   Result: sustained per-pixel flicker is ghosted; moving sprites and
+//   walking animations are written raw with zero blur and zero doubling.
+//
+// Memory (heap, freed on ROM unload):
+//   s_prev_fb      — raw pixels from last frame              45,056 bytes
+//   s_flicker_mask — 1 byte per pixel: saturating change count  23,040 bytes
+//   BSS cost: two pointers = 16 bytes.
+//   On limitedMemory devices both allocations are skipped entirely.
+static uint16_t* s_prev_fb      = nullptr;  // 45 KB, raw previous frame
+static uint8_t*  s_flicker_mask = nullptr;  // 23 KB, per-pixel alternation flag
+static bool      s_prev_fb_valid = false;   // false until first frame is seeded
+
+// Called after every gb_run_one_frame() when ghosting may be active.
+inline void apply_lcd_ghosting() {
+    if (!g_lcd_ghosting) return;
+    if (ult::limitedMemory) return;
+
+    if (!s_prev_fb) {
+        s_prev_fb = static_cast<uint16_t*>(malloc(GB_W * GB_H * sizeof(uint16_t)));
+        if (!s_prev_fb) return;
+    }
+    if (!s_flicker_mask) {
+        s_flicker_mask = static_cast<uint8_t*>(calloc(GB_W * GB_H, 1));
+        if (!s_flicker_mask) return;
+    }
+
+    if (!s_prev_fb_valid) {
+        // Seed on the first frame — no blend yet, just capture state.
+        memcpy(s_prev_fb, g_gb_fb, GB_W * GB_H * sizeof(uint16_t));
+        memset(s_flicker_mask, 0, GB_W * GB_H);
+        s_prev_fb_valid = true;
+        return;
+    }
+
+    static constexpr uint8_t FLICKER_THRESHOLD = 3u;
+    const int total = GB_W * GB_H;
+
+    if (g_fb_is_rgb565) {
+        // CGB: raw RGB565.
+        for (int i = 0; i < total; i++) {
+            const uint16_t prev = s_prev_fb[i];
+            const uint16_t curr = g_gb_fb[i];
+            const bool changed_now = (curr != prev);
+
+            if (changed_now & (s_flicker_mask[i] >= FLICKER_THRESHOLD)) {
+                // Pixel has been changing for FLICKER_THRESHOLD+ consecutive frames
+                // → genuine sustained flicker (e.g. Chain Chomp chain at 30 Hz).
+                // 50/50 blend produces stable mid-brightness — no flicker.
+                const uint8_t r = (uint8_t)(((curr >> 11 & 0x1Fu) + (prev >> 11 & 0x1Fu)) >> 1);
+                const uint8_t g = (uint8_t)(((curr >>  5 & 0x3Fu) + (prev >>  5 & 0x3Fu)) >> 1);
+                const uint8_t b = (uint8_t)(((curr       & 0x1Fu) + (prev       & 0x1Fu)) >> 1);
+                g_gb_fb[i] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+            // else: write raw (g_gb_fb[i] already holds curr from draw_line)
+
+            // Saturating increment on change; reset to 0 on stable.
+            s_flicker_mask[i] = changed_now ? (s_flicker_mask[i] < 255u ? s_flicker_mask[i] + 1u : 255u) : 0u;
+            s_prev_fb[i]      = curr;   // always store raw for next frame
+        }
+    } else {
+        // DMG: pre-packed RGBA4444; alpha is always 0xF, blend only RGB nibbles.
+        for (int i = 0; i < total; i++) {
+            const uint16_t prev = s_prev_fb[i];
+            const uint16_t curr = g_gb_fb[i];
+            const bool changed_now = (curr != prev);
+
+            if (changed_now & (s_flicker_mask[i] >= FLICKER_THRESHOLD)) {
+                const uint8_t r = (uint8_t)(((curr       & 0xFu) + (prev       & 0xFu)) >> 1);
+                const uint8_t g = (uint8_t)(((curr >>  4 & 0xFu) + (prev >>  4 & 0xFu)) >> 1);
+                const uint8_t b = (uint8_t)(((curr >>  8 & 0xFu) + (prev >>  8 & 0xFu)) >> 1);
+                g_gb_fb[i] = (uint16_t)(r | (g << 4) | (b << 8) | 0xF000u);
+            }
+
+            s_flicker_mask[i] = changed_now ? (s_flicker_mask[i] < 255u ? s_flicker_mask[i] + 1u : 255u) : 0u;
+            s_prev_fb[i]      = curr;
+        }
+    }
+}
+
+// Invalidate ghosting state — next apply_lcd_ghosting() call re-seeds instead
+// of blending.  Does NOT free allocations; keeps them live for reuse on ROM switch.
+inline void reset_lcd_ghosting() {
+    s_prev_fb_valid = false;
+}
+
+// Release all ghosting heap memory.  Call from gb_unload_rom() so the ~68 KB
+// returns to the heap when no game is running.
+inline void free_lcd_ghosting() {
+    free(s_prev_fb);      s_prev_fb      = nullptr;
+    free(s_flicker_mask); s_flicker_mask = nullptr;
+    s_prev_fb_valid = false;
+}
+
 // -- GB screen render ---------------------------------------------------------
 // Hot path summary per frame:
 //   - Outer loop: 144 GB source rows

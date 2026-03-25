@@ -100,145 +100,637 @@ static constexpr uint16_t GBC_WARM[4] = {
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// GBC built-in DMG colorisation system
+// GBC / SGB title-based DMG colorisation
 // ──────────────────────────────────────────────────────────────────────────────
-// When a DMG game runs on a real Game Boy Color the boot ROM picks one of ~12
-// preset colour palettes keyed by a checksum of the ROM title bytes (0x134-0x143).
-// This replicates that behaviour so Pokémon Blue looks blue, Red looks red, etc.
+// Both GBC and SGB modes use the same per-title palette database.
 //
-// Palette encoding: RGB555 — color = R | (G<<5) | (B<<10), channels 0-31.
-// Three sub-palettes per entry: bg (background tiles), obj0 (sprite pal 0),
-// obj1 (sprite pal 1).  Most games look fine with identical bg/obj palettes;
-// notable exceptions can be added as separate entries later.
+//   GBC mode: colorisation applied only to Nintendo-licensed games
+//             (rom[0x014B]==0x01, or ==0x33 with new licensee code "01").
+//             This matches what the real GBC boot ROM does.
 //
-// How to add a new game:
-//   1. Compute checksum: sum rom[0x134..0x143], keep low 8 bits.
-//   2. Read title[3] = rom[0x137] (use 0xFF to match any).
-//   3. Pick or add a palette index below.
-//   4. Append a GbcTitleEntry to GBC_TITLE_TABLE.
+//   SGB mode: licensee gate is skipped; all games in the database are
+//             colorised.  A real SGB2 reads in-game PAL command packets
+//             that we do not emulate; the GBC hardware palette database is
+//             the best static approximation available, and is accurate for
+//             the majority of games.
+//
+//   DMG / NATIVE modes: this system is bypassed entirely (GBC_GREEN /
+//                        DMG_GREY are used respectively).
+//
+// Palette data is derived from Gambatte (Sindre Aamås, GPL-2.0+),
+// which was reverse-engineered from real GBC hardware captures.
+// Title strings match ROM bytes 0x134..0x143 exactly (null/space-trimmed).
+// Unknown games in GBC or SGB mode fall back to plain grayscale.
+//
+// Color encoding: BGR555 = R | (G<<5) | (B<<10), each channel 0..31.
+// The compile-time C() helper converts 0xRRGGBB literals to BGR555 with
+// proper 8-to-5 bit rounding — zero runtime cost.
 // ══════════════════════════════════════════════════════════════════════════════
 
 struct GbcDmgPal {
-    uint16_t bg[4];    // BG tile palette
+    uint16_t bg[4];    // BG tile palette (BGR555)
     uint16_t obj0[4];  // Sprite palette 0
-    uint16_t obj1[4];  // Sprite palette 1 (often same as obj0)
+    uint16_t obj1[4];  // Sprite palette 1
 };
 
-// Palette index constants — use these names when building GBC_TITLE_TABLE.
-static constexpr int GBCPAL_GREY   = 0;  // grayscale (GBC fallback for unknown games)
-static constexpr int GBCPAL_BLUE   = 1;  // Pokémon Blue, Dr. Mario…
-static constexpr int GBCPAL_RED    = 2;  // Pokémon Red, Mega Man…
-static constexpr int GBCPAL_GREEN  = 3;  // Zelda, Tetris…
-static constexpr int GBCPAL_YELLOW = 4;  // Super Mario Land, Wario Land…
-static constexpr int GBCPAL_PURPLE = 5;  // Kirby's Dream Land…
-static constexpr int GBCPAL_TEAL   = 6;  // Metroid II, Kid Dracula…
-static constexpr int GBCPAL_BROWN  = 7;  // Final Fantasy Adventure, RPGs…
+// Compile-time RGB24 (0xRRGGBB) → BGR555.
+// TO5B: rounds an 8-bit channel to 5 bits.
+static constexpr uint16_t TO5B(uint32_t c) {
+    return (uint16_t)((c * 31u * 2u + 255u) / (255u * 2u));
+}
+static constexpr uint16_t C(uint32_t rgb) {
+    return (uint16_t)(  TO5B((rgb >> 16) & 0xFFu)
+                      | (TO5B((rgb >>  8) & 0xFFu) << 5u)
+                      | (TO5B( rgb        & 0xFFu) << 10u) );
+}
+// 4-color sub-palette in RGB24 notation (evaluated at compile time).
+#define _C4(a,b,c,d)  { C(a), C(b), C(c), C(d) }
 
-static constexpr GbcDmgPal GBC_DMG_PALETTES[] = {
-    // ── 0: Grayscale — default for unrecognised games in GBC mode ─────────
-    { {0x7FFF, 0x5294, 0x294A, 0x0000},
-      {0x7FFF, 0x5294, 0x294A, 0x0000},
-      {0x7FFF, 0x5294, 0x294A, 0x0000} },
-
-    // ── 1: Blue — Pokémon Blue, Dr. Mario ─────────────────────────────────
-    // white → light blue (R=17,G=24,B=31) → medium blue (R=12,G=16,B=28) → dark blue (R=4,G=8,B=20)
-    { {0x7FFF, 0x7F11, 0x720C, 0x5104},
-      {0x7FFF, 0x7F11, 0x720C, 0x5104},
-      {0x7FFF, 0x7F11, 0x720C, 0x5104} },
-
-    // ── 2: Red — Pokémon Red, Mega Man ────────────────────────────────────
-    // white → light pink (R=31,G=20,B=16) → medium red (R=24,G=8,B=8) → dark maroon (R=12,G=2,B=2)
-    { {0x7FFF, 0x429F, 0x2118, 0x084C},
-      {0x7FFF, 0x429F, 0x2118, 0x084C},
-      {0x7FFF, 0x429F, 0x2118, 0x084C} },
-
-    // ── 3: Green — Zelda: Link's Awakening, Tetris ────────────────────────
-    // white → light green (R=16,G=31,B=12) → forest green (R=8,G=20,B=4) → dark green (R=2,G=10,B=2)
-    { {0x7FFF, 0x33F0, 0x1288, 0x0942},
-      {0x7FFF, 0x33F0, 0x1288, 0x0942},
-      {0x7FFF, 0x33F0, 0x1288, 0x0942} },
-
-    // ── 4: Yellow — Super Mario Land, Wario Land ──────────────────────────
-    // white → light yellow (R=31,G=31,B=10) → gold (R=24,G=20,B=4) → dark brown (R=12,G=8,B=2)
-    { {0x7FFF, 0x2BFF, 0x1298, 0x090C},
-      {0x7FFF, 0x2BFF, 0x1298, 0x090C},
-      {0x7FFF, 0x2BFF, 0x1298, 0x090C} },
-
-    // ── 5: Purple — Kirby's Dream Land ────────────────────────────────────
-    // white → light lavender (R=28,G=18,B=31) → medium purple (R=16,G=6,B=24) → dark purple (R=8,G=2,B=14)
-    { {0x7FFF, 0x7E5C, 0x60D0, 0x3848},
-      {0x7FFF, 0x7E5C, 0x60D0, 0x3848},
-      {0x7FFF, 0x7E5C, 0x60D0, 0x3848} },
-
-    // ── 6: Teal — Metroid II, Kid Dracula ─────────────────────────────────
-    // white → light cyan (R=12,G=31,B=28) → medium teal (R=4,G=20,B=18) → dark teal (R=2,G=10,B=8)
-    { {0x7FFF, 0x771C, 0x4904, 0x2882},
-      {0x7FFF, 0x771C, 0x4904, 0x2882},
-      {0x7FFF, 0x771C, 0x4904, 0x2882} },
-
-    // ── 7: Brown/Sepia — RPGs, Final Fantasy Adventure ────────────────────
-    // white → warm sand (R=28,G=24,B=16) → medium brown (R=18,G=12,B=6) → dark brown (R=8,G=4,B=2)
-    { {0x7FFF, 0x431C, 0x218A, 0x1088},
-      {0x7FFF, 0x431C, 0x218A, 0x1088},
-      {0x7FFF, 0x431C, 0x218A, 0x1088} },
+// Fallback: plain grayscale for unlicensed / unrecognised games.
+static constexpr GbcDmgPal GBC_PAL_GREY = {
+    _C4(0xFFFFFF, 0xA5A5A5, 0x525252, 0x000000),
+    _C4(0xFFFFFF, 0xA5A5A5, 0x525252, 0x000000),
+    _C4(0xFFFFFF, 0xA5A5A5, 0x525252, 0x000000)
 };
-static constexpr int GBC_DMG_PAL_COUNT =
-    (int)(sizeof(GBC_DMG_PALETTES) / sizeof(GBC_DMG_PALETTES[0]));
 
-// ── Title checksum lookup table ───────────────────────────────────────────────
-// checksum = (sum of rom[0x134..0x143]) & 0xFF
-// title3   = rom[0x137]; 0xFF = match any (use when checksum is unique)
+// ── Per-game palette table ────────────────────────────────────────────────────
+// Source: Gambatte gbcpalettes.h (Sindre Aamås, GPL-2.0+), hardware-verified.
+// bg / obj0 / obj1 are often different per game — do NOT collapse them.
 struct GbcTitleEntry {
-    uint8_t checksum;
-    uint8_t title3;    // 0xFF = don't care
-    uint8_t pal_idx;   // index into GBC_DMG_PALETTES
+    char      title[17];   // ROM title 0x134..0x143, null-terminated, trimmed
+    GbcDmgPal pal;         // bg, obj0, obj1 in BGR555
 };
 
 static constexpr GbcTitleEntry GBC_TITLE_TABLE[] = {
-    // ── Pokémon ─────────────────────────────────────────────────────────────
-    // "POKEMON RED\0\0\0\0\0" sum=788 → 0x14, title[3]='E'
-    { 0x14, 0xFF, GBCPAL_RED  },
-    // "POKEMON BLUE\0\0\0\0"  sum=865 → 0x61, title[3]='E'
-    { 0x61, 0xFF, GBCPAL_BLUE },
 
-    // ── Zelda ───────────────────────────────────────────────────────────────
-    // "ZELDA\0…"              sum=368 → 0x70, title[3]='D'
-    { 0x70, 0xFF, GBCPAL_GREEN },
+    { "ALLEY WAY",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xA59CFF,0xFFFF00,0x006300,0x000000) } },
 
-    // ── Super Mario Land ────────────────────────────────────────────────────
-    // "SUPER MARIO LAND"      sum=1126 → 0x66, title[3]='E'
-    { 0x66, 0xFF, GBCPAL_YELLOW },
+    { "ASTEROIDS/MISCMD",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
 
-    // ── Tetris ──────────────────────────────────────────────────────────────
-    // "TETRIS\0…"             sum=475 → 0xDB, title[3]='R'
-    { 0xDB, 'R',  GBCPAL_GREEN },
+    { "ATOMIC PUNK",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
 
-    // ── Kirby ───────────────────────────────────────────────────────────────
-    // "KIRBYDREAMLAND\0\0"    sum→verify, title[3]='B'
-    // (checksum 0x27 based on community research; update if incorrect)
-    { 0x27, 'B',  GBCPAL_PURPLE },
+    { "BA.TOSHINDEN",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
 
-    // ── Dr. Mario ───────────────────────────────────────────────────────────
-    // "DR.MARIO\0…"           sum=572 → 0x3C, title[3]='M'
-    { 0x3C, 0xFF, GBCPAL_BLUE },
+    { "BALLOON KID",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000) } },
 
-    // ── Metroid II ──────────────────────────────────────────────────────────
-    // "METROID2\0…"           sum=584 → 0x48, title[3]='R'
-    { 0x48, 0xFF, GBCPAL_TEAL },
+    { "BASEBALL",
+      { _C4(0x52DE00,0xFF8400,0xFFFF00,0xFFFFFF),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
 
-    // ── Super Mario Land 2 ──────────────────────────────────────────────────
-    // "MARIOLAND2\0…"         sum=617 → 0x69 (verify), title[3]='I'
-    { 0x69, 0xFF, GBCPAL_YELLOW },
+    { "BOMBERMAN GB",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
 
-    // ── Wario Land ──────────────────────────────────────────────────────────
-    // "WARIOLAND\0…"          sum=586 → 0x4A, title[3]='R'
-    { 0x4A, 0xFF, GBCPAL_YELLOW },
+    { "BOY AND BLOB GB1",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
 
-    // ── Final Fantasy Adventure ─────────────────────────────────────────────
-    // Japanese: "SEIKEN DENSETSU" → different checksum; NA "MYSTIC QUEST\0\0"
-    // "MYSTIC QUEST\0\0\0\0"  sum=818 → 0x32, title[3]='T'
-    { 0x32, 'T',  GBCPAL_BROWN },
+    { "BOY AND BLOB GB2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "BT2RAGNAROKWORLD",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "DEFENDER/JOUST",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "DMG FOOTBALL",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "DONKEY KONG",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "DONKEYKONGLAND",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "DONKEYKONGLAND 2",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "DONKEYKONGLAND 3",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "DONKEYKONGLAND95",
+      { _C4(0xFFFF9C,0x94B5FF,0x639473,0x003A3A),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    // Dr. Mario: bg=obj0=blue, obj1=red — the pill colours.
+    { "DR.MARIO",
+      { _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "DYNABLASTER",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "F1RACE",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "FOOTBALL INT'L",
+      { _C4(0x6BFF00,0xFFFFFF,0xFF524A,0x000000),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "G&W GALLERY",
+      { _C4(0xFFFFFF,0x7BFF00,0xB57300,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "GALAGA&GALAXIAN",
+      { _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF) } },
+
+    { "GAME&WATCH",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "GAMEBOY GALLERY",
+      { _C4(0xFFFFFF,0x7BFF00,0xB57300,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "GAMEBOY GALLERY2",
+      { _C4(0xFFFFFF,0x7BFF00,0xB57300,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "GBWARS",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "GBWARST",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "GOLF",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "Game and Watch 2",
+      { _C4(0xFFFFFF,0x7BFF00,0xB57300,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    // Japanese title of Kirby's Dream Land
+    { "HOSHINOKA-BI",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000),
+        _C4(0x0000FF,0xFFFFFF,0xFFFF7B,0x0084FF) } },
+
+    { "JAMES  BOND  007",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000) } },
+
+    { "KAERUNOTAMENI",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000) } },
+
+    { "KEN GRIFFEY JR",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "KID ICARUS",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "KILLERINSTINCT95",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "KINGOFTHEZOO",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "KIRAKIRA KIDS",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "KIRBY BLOCKBALL",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000),
+        _C4(0x0000FF,0xFFFFFF,0xFFFF7B,0x0084FF) } },
+
+    // Kirby's Dream Land: purple BG, red-orange sprites, blue-yellow-lit obj1
+    { "KIRBY DREAM LAND",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000),
+        _C4(0x0000FF,0xFFFFFF,0xFFFF7B,0x0084FF) } },
+
+    { "KIRBY'S PINBALL",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000) } },
+
+    { "KIRBY2",
+      { _C4(0xA59CFF,0xFFFF00,0x006300,0x000000),
+        _C4(0xFF6352,0xD60000,0x630000,0x000000),
+        _C4(0x0000FF,0xFFFFFF,0xFFFF7B,0x0084FF) } },
+
+    { "LOLO2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "MAGNETIC SOCCER",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "MANSELL",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "MARIO & YOSHI",
+      { _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "MARIO'S PICROSS",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    // Mario Land 2: teal BG, warm orange sprites, blue obj1
+    { "MARIOLAND2",
+      { _C4(0xFFFFCE,0x63EFEF,0x9C8431,0x5A5A5A),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "MEGA MAN 2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "MEGAMAN",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "MEGAMAN3",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    // Metroid II: blue BG, yellow-red sprite (Samus suit), green obj1
+    { "METROID2",
+      { _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFF00,0xFF0000,0x630000,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "MILLI/CENTI/PEDE",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "MOGURANYA",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000) } },
+
+    // Mystic Quest / Seiken Densetsu: green BG, red sprites, blue obj1
+    { "MYSTIC QUEST",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "NETTOU KOF 95",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "NEW CHESSMASTER",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "OTHELLO",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "PAC-IN-TIME",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "PENGUIN WARS",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "PENGUINKUNWARSVS",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "PICROSS 2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "PINOCCHIO",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000) } },
+
+    { "POKEBOM",
+      { _C4(0xFFFFFF,0x8C8CDE,0x52528C,0x000000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000) } },
+
+    // Pokémon Blue: blue BG+obj1, red-pink sprites (obj0)
+    { "POKEMON BLUE",
+      { _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "POKEMON GREEN",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000) } },
+
+    // Pokémon Red: red/pink BG+obj1, bright green sprites (obj0)
+    { "POKEMON RED",
+      { _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "POKEMON YELLOW",
+      { _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000) } },
+
+    { "QIX",
+      { _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "RADARMISSION",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000) } },
+
+    { "ROCKMAN WORLD",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "ROCKMAN WORLD2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "ROCKMANWORLD3",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    // Seiken Densetsu (JP title of Final Fantasy Adventure / Secret of Mana GB)
+    { "SEIKEN DENSETSU",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "SOCCER",
+      { _C4(0x6BFF00,0xFFFFFF,0xFF524A,0x000000),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "SOLARSTRIKER",
+      { _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF) } },
+
+    { "SPACE INVADERS",
+      { _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF),
+        _C4(0x000000,0x008484,0xFFDE00,0xFFFFFF) } },
+
+    { "STAR STACKER",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "STAR WARS",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "STAR WARS-NOA",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "STREET FIGHTER 2",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    // Note: ROM title is "SUPER BOMBLISS  " (two trailing spaces); our trim strips them → key is no trailing space.
+    { "SUPER BOMBLISS",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000) } },
+
+    // Super Mario Land: periwinkle BG, inverted sprite palette (black base)
+    { "SUPER MARIOLAND",
+      { _C4(0xB5B5FF,0xFFFF94,0xAD5A42,0x000000),
+        _C4(0x000000,0xFFFFFF,0xFF8484,0x943A3A),
+        _C4(0x000000,0xFFFFFF,0xFF8484,0x943A3A) } },
+
+    { "SUPER RC PRO-AM",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000) } },
+
+    { "SUPERDONKEYKONG",
+      { _C4(0xFFFF9C,0x94B5FF,0x639473,0x003A3A),
+        _C4(0xFFC542,0xFFD600,0x943A00,0x4A0000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    // Wario Land: tan/teal BG, orange sprites, cyan-red obj1
+    { "SUPERMARIOLAND3",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFF7300,0x944200,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    // Tamagotchi (USA/Europe, SGB Enhanced) — ROM title is "GB TAMAGOTCHI".
+    // Bandai licensee (0x33/B2), not Nintendo, so the licensee gate must run
+    // AFTER the table lookup (see step 3 comment below).
+    { "GB TAMAGOTCHI",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "TENNIS",
+      { _C4(0x6BFF00,0xFFFFFF,0xFF524A,0x000000),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "TETRIS",
+      { _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000) } },
+
+    { "TETRIS ATTACK",
+      { _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "TETRIS BLAST",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000) } },
+
+    { "TETRIS FLASH",
+      { _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "TETRIS PLUS",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "TETRIS2",
+      { _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFFFF00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "THE CHESSMASTER",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "TOPRANKINGTENNIS",
+      { _C4(0x6BFF00,0xFFFFFF,0xFF524A,0x000000),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "TOPRANKTENNIS",
+      { _C4(0x6BFF00,0xFFFFFF,0xFF524A,0x000000),
+        _C4(0xFFFFFF,0xFFFFFF,0x63A5FF,0x0000FF),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "TOY STORY",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "VEGAS STAKES",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "WARIO BLAST",
+      { _C4(0xFFFFFF,0x7BFF31,0x0063C5,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "WARIOLAND2",
+      { _C4(0xFFFFFF,0xADAD84,0x42737B,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
+
+    { "WAVERACE",
+      { _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFFFF7B,0x0084FF,0xFF0000) } },
+
+    { "WORLD CUP",
+      { _C4(0xFFFFFF,0x7BFF31,0x008400,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    { "X",
+      { _C4(0xFFFFFF,0xA5A5A5,0x525252,0x000000),
+        _C4(0xFFFFFF,0xA5A5A5,0x525252,0x000000),
+        _C4(0xFFFFFF,0xA5A5A5,0x525252,0x000000) } },
+
+    { "YAKUMAN",
+      { _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000),
+        _C4(0xFFFFFF,0xFFAD63,0x843100,0x000000) } },
+
+    { "YOSHI'S COOKIE",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "YOSSY NO COOKIE",
+      { _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0xFF9C00,0xFF0000,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "YOSSY NO PANEPON",
+      { _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0x5ABDFF,0xFF0000,0x0000FF) } },
+
+    { "YOSSY NO TAMAGO",
+      { _C4(0xFFFFFF,0x52FF00,0xFF4200,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000) } },
+
+    // Zelda: Link's Awakening — red/pink BG, bright-green Link sprites, blue obj1
+    { "ZELDA",
+      { _C4(0xFFFFFF,0xFF8484,0x943A3A,0x000000),
+        _C4(0xFFFFFF,0x00FF00,0x318400,0x004A00),
+        _C4(0xFFFFFF,0x63A5FF,0x0000FF,0x000000) } },
 };
+#undef _C4
+
 static constexpr int GBC_TITLE_TABLE_SIZE =
     (int)(sizeof(GBC_TITLE_TABLE) / sizeof(GBC_TITLE_TABLE[0]));
 
@@ -258,8 +750,17 @@ static constexpr int GBC_TITLE_TABLE_SIZE =
 // Written once per ROM load; read 160× per scanline × 144 lines × 60 fps.
 // Declared extern; defined in main.cpp.
 extern uint16_t g_dmg_flat_pal[64];  // 128 bytes — replaces 3×4-entry arrays
-extern int      g_gbc_pal_idx;        // index of the matched entry (-1 = not found)
+extern int      g_gbc_pal_idx;        // index into GBC_TITLE_TABLE (-1 = not found)
 extern bool     g_gbc_pal_found;      // true if game was found in GBC_TITLE_TABLE
+
+// ── LCD ghosting (frame blending) ─────────────────────────────────────────────
+// When true, each rendered frame is blended 50/50 with the previous raw frame,
+// simulating the GBC LCD's physical phosphor persistence.  Games that flicker
+// sprites on/off at 30Hz (e.g. Chain Chomp's chain in Link's Awakening) were
+// designed for this hardware characteristic — the blend produces the intended
+// semi-transparent ghost rather than a harsh flicker.
+// The blend is applied by apply_lcd_ghosting() in gb_renderer.h after each frame.
+extern bool g_lcd_ghosting;
 
 // ── Palette mode ──────────────────────────────────────────────────────────────
 // Per-DMG-game setting stored in sdmc:/config/ultragb/configure/<rom>.ini
@@ -309,32 +810,60 @@ static inline uint16_t gb_pack_rgb555(const uint16_t c) {
 
 // ── gb_select_dmg_palette ─────────────────────────────────────────────────────
 // Call once after a ROM loads (and whenever g_palette_mode changes live).
-// Reads ROM header, looks up the title checksum table, and populates
-// g_dmg_flat_pal that gb_lcd_draw_line uses every scanline.
+// Reads the ROM title string, performs a Nintendo licensee check (GBC mode
+// only), looks up the per-game palette from GBC_TITLE_TABLE, and pre-bakes
+// g_dmg_flat_pal so that gb_lcd_draw_line is a branchless table lookup.
 static inline void gb_select_dmg_palette() {
-    // Step 1: compute title checksum from header bytes 0x134-0x143.
-    uint32_t sum = 0;
-    if (g_gb.rom && g_gb.romSize > 0x143) {
-        for (int i = 0x134; i <= 0x143; ++i)
-            sum += g_gb.rom[i];
-    }
-    const uint8_t checksum = (uint8_t)(sum & 0xFF);
-    const uint8_t title3   = (g_gb.rom && g_gb.romSize > 0x137) ? g_gb.rom[0x137] : 0;
+    // Step 1: extract and trim the ROM title from 0x134..0x143 (16 bytes).
+    // Null-terminate at the first embedded 0x00, then strip trailing spaces.
+    char title[17] = {};
+    if (g_gb.rom && g_gb.romSize > 0x143)
+        memcpy(title, g_gb.rom + 0x134, 16);
+    title[16] = '\0';
+    int len = 0;
+    while (len < 16 && title[len] != '\0') ++len;
+    while (len > 0 && title[len - 1] == ' ') --len;
+    title[len] = '\0';
 
-    // Step 2: search title table.
+    // Step 2: title string lookup — always run first, regardless of licensee.
+    // If the game is in our table we know its correct palette and always apply
+    // it, even for non-Nintendo publishers (e.g. Bandai, Konami).
+    // The licensee gate (step 3) only affects games NOT in the table.
     g_gbc_pal_found = false;
-    g_gbc_pal_idx   = GBCPAL_GREY;
+    g_gbc_pal_idx   = -1;
+    const GbcDmgPal* found_pal = nullptr;
     for (int i = 0; i < GBC_TITLE_TABLE_SIZE; ++i) {
-        const GbcTitleEntry& e = GBC_TITLE_TABLE[i];
-        if (e.checksum == checksum &&
-            (e.title3 == 0xFF || e.title3 == title3)) {
-            g_gbc_pal_idx   = e.pal_idx;
+        if (strcmp(GBC_TITLE_TABLE[i].title, title) == 0) {
+            found_pal       = &GBC_TITLE_TABLE[i].pal;
+            g_gbc_pal_idx   = i;
             g_gbc_pal_found = true;
             break;
         }
     }
 
-    // Step 3: pick source palette arrays based on mode.
+    // Step 3: Nintendo licensee gate (GBC mode, unknown games only).
+    // The real GBC boot ROM only colourises Nintendo-licensed games it doesn't
+    // recognise.  If we already have an explicit entry we bypass this entirely.
+    // SGB mode has no licensee restriction at all.
+    bool allow_color = g_gbc_pal_found
+                    || (g_palette_mode == PaletteMode::SGB);
+    if (!allow_color && g_gb.rom && g_gb.romSize > 0x145) {
+        const uint8_t old_lic = g_gb.rom[0x014B];
+        if (old_lic == 0x01) {
+            allow_color = true;   // old licensee code: Nintendo
+        } else if (old_lic == 0x33 &&
+                   g_gb.rom[0x0144] == '0' &&
+                   g_gb.rom[0x0145] == '1') {
+            allow_color = true;   // new licensee code "01": Nintendo
+        }
+    }
+    if (!allow_color) {
+        found_pal       = nullptr;
+        g_gbc_pal_found = false;
+        g_gbc_pal_idx   = -1;
+    }
+
+    // Step 4: choose the source sub-palette arrays based on mode and match.
     const uint16_t* bg_src;
     const uint16_t* ob0_src;
     const uint16_t* ob1_src;
@@ -348,33 +877,23 @@ static inline void gb_select_dmg_palette() {
             bg_src = ob0_src = ob1_src = DMG_GREY;
             break;
 
+        case PaletteMode::GBC:
         case PaletteMode::SGB:
-            if (g_gbc_pal_found) {
-                const GbcDmgPal& p = GBC_DMG_PALETTES[g_gbc_pal_idx];
-                bg_src  = p.bg;
-                ob0_src = p.obj0;
-                ob1_src = p.obj1;
+        default:
+            if (found_pal) {
+                bg_src  = found_pal->bg;
+                ob0_src = found_pal->obj0;
+                ob1_src = found_pal->obj1;
             } else {
-                bg_src = ob0_src = ob1_src = GBC_WARM;
-            }
-            break;
-
-        default:  // PaletteMode::GBC
-            if (g_gbc_pal_found) {
-                const GbcDmgPal& p = GBC_DMG_PALETTES[g_gbc_pal_idx];
-                bg_src  = p.bg;
-                ob0_src = p.obj0;
-                ob1_src = p.obj1;
-            } else {
-                bg_src = ob0_src = ob1_src = DMG_GREY;
+                // Unknown / unlicensed game: plain grayscale.
+                bg_src = ob0_src = ob1_src = GBC_PAL_GREY.bg;
             }
             break;
     }
 
-    // Step 4: fill the flat lookup table with pre-packed RGBA4444 values.
-    // Layout: 0x00-0x03 = OBJ0, 0x10-0x13 = OBJ1, 0x20-0x23 = BG.
-    // Pre-packing here means gb_lcd_draw_line writes ready-to-display RGBA4444
-    // directly into g_gb_fb, so render_gb_screen_chunk skips conversion entirely.
+    // Step 5: pre-pack into the flat lookup table (RGBA4444, ready for the
+    // renderer).  Layout mirrors Walnut pixel encoding:
+    //   0x00-0x03 = OBJ0,  0x10-0x13 = OBJ1,  0x20-0x23 = BG.
     for (int c = 0; c < 4; ++c) {
         g_dmg_flat_pal[0x00 + c] = gb_pack_rgb555(ob0_src[c]);
         g_dmg_flat_pal[0x10 + c] = gb_pack_rgb555(ob1_src[c]);
@@ -433,6 +952,10 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
 //     WALNUT_GB_12_COLOUR=1: bits[1:0]=colour index, bits[5:4]=source
 //       (LCD_PALETTE_BG=0x20=BG, else sprite).  We only need bits[1:0].
 //     We select palette based on g_palette_mode (GBC/DMG/NATIVE) per-pixel.
+//
+// LCD ghosting is applied as a post-frame pass by apply_lcd_ghosting()
+// in gb_renderer.h, which blends g_gb_fb (raw current frame) against
+// s_prev_fb (raw previous frame).  See gb_renderer.h for details.
 static void gb_lcd_draw_line(struct gb_s* gb,
                               const uint8_t* pixels,
                               const uint_fast8_t line)
@@ -456,7 +979,6 @@ static void gb_lcd_draw_line(struct gb_s* gb,
     //   bits[1:0] select colour within that palette
     // Values are pre-packed RGBA4444 (set by gb_select_dmg_palette), so the
     // renderer can use them directly without any per-run conversion.
-    // No conditional pointer selection; the compiler can vectorise this loop.
     for (int x = 0; x < GB_W; x++)
         row[x] = g_dmg_flat_pal[pixels[x] & 0x33];
 }

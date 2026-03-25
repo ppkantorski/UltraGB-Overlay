@@ -877,7 +877,15 @@ static void gb_audio_shutdown() {
         }
     }
 
-    for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;s_ctrl.ab[i]={};}
+    // DMA buffers are intentionally kept live across shutdown/init cycles.
+    // Freeing and re-allocating 4× aligned_alloc(4096) on every game switch
+    // creates heap holes that resist coalescing, degrading the 4MB heap over
+    // successive loads until malloc(romSz) silently fails inside a Tesla 'new'.
+    // Since the overlay always needs these buffers, keeping them avoids that
+    // fragmentation at zero practical cost.  ab[] ring metadata is cleared so
+    // gb_audio_init's pre-queue re-builds AudioOutBuffer descriptors cleanly.
+    for(int i=0;i<4;++i){ s_ctrl.ab[i]={}; }
+    // Buffers are released once via gb_audio_free_dma() in exitServices.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -913,6 +921,18 @@ static bool gb_audio_preinit_dma() {
         }
     }
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_free_dma — release DMA buffers on overlay exit.
+//
+// DMA buffers are kept live across all game sessions (see gb_audio_shutdown)
+// to eliminate aligned_alloc/free fragmentation on the 4MB heap.  This is
+// the one place they are explicitly freed: from Overlay::exitServices(), after
+// gb_unload_rom() has stopped the audio thread and called audoutStopAudioOut.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_free_dma() {
+    for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;s_ctrl.ab[i]={};}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

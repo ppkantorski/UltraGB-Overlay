@@ -15,9 +15,9 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
-APP_TITLE   := UltraGBC
+APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.2.0
+APP_VERSION := 0.4.0
 TARGET      := gbemu
 BUILD       := build
 SOURCES     := source
@@ -36,17 +36,19 @@ PEANUT_DEFINES := -DENABLE_LCD=1 \
 #---------------------------------------------------------------------------------
 ARCH := -march=armv8-a+simd+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS := -g -Wall -O3 \
+CFLAGS := -Wall -O2 \
           -ffunction-sections -fdata-sections -flto \
           -fuse-linker-plugin -fomit-frame-pointer \
           -fno-strict-aliasing -frename-registers \
           -falign-functions=16 \
+          -fvisibility=hidden \
+          -fmerge-all-constants \
           $(ARCH) $(DEFINES) $(PEANUT_DEFINES)
 
 CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2
 
 # Overlay UI config path
-UI_OVERRIDE_PATH := /config/gbemu/
+UI_OVERRIDE_PATH := /config/ultragb/
 CFLAGS += -DUI_OVERRIDE_PATH="\"$(UI_OVERRIDE_PATH)\""
 
 # Enable Widget
