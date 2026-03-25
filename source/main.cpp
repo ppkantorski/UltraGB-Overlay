@@ -98,21 +98,19 @@ static void load_config() {
         g_lcd_ghosting = (ghost_val != "0");
 }
 
+// Write a config key with its default value only when the key is absent.
+// Collapses the four-repetition parseValueFromIniSection → empty() → setIniFileValue
+// sequence in write_default_config_if_missing into one shared body.
+static void set_if_missing(const char* key, const char* def) {
+    if (ult::parseValueFromIniSection(kConfigFile, "config", key).empty())
+        ult::setIniFileValue(kConfigFile, "config", key, def);
+}
+
 static void write_default_config_if_missing() {
-    const std::string& path = kConfigFile;
-    // Write keys only if they don't already exist
-    const std::string existing_dir = ult::parseValueFromIniSection(path, "config", "rom_dir");
-    if (existing_dir.empty())
-        ult::setIniFileValue(path, "config", "rom_dir", g_rom_dir);
-    const std::string existing_vol = ult::parseValueFromIniSection(path, "config", "volume");
-    if (existing_vol.empty())
-        ult::setIniFileValue(path, "config", "volume", "100");
-    const std::string existing_pp = ult::parseValueFromIniSection(path, "config", "pixel_perfect");
-    if (existing_pp.empty())
-        ult::setIniFileValue(path, "config", "pixel_perfect", "0");
-    const std::string existing_ghost = ult::parseValueFromIniSection(path, "config", "lcd_ghosting");
-    if (existing_ghost.empty())
-        ult::setIniFileValue(path, "config", "lcd_ghosting", "1");
+    set_if_missing("rom_dir",       g_rom_dir);
+    set_if_missing("volume",        "100");
+    set_if_missing("pixel_perfect", "0");
+    set_if_missing("lcd_ghosting",  "1");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -1568,6 +1566,22 @@ class SettingsGui : public tsl::Gui {
     u8              m_vol        = 100;
     u8              m_vol_backup = 100;
 
+    // Toggle mute on/off and persist the new volume level.
+    // Called by the speaker-icon tap callback on the volume slider.
+    void do_vol_toggle() {
+        if (m_vol > 0) {
+            m_vol_backup = m_vol;
+            m_vol = 0;
+        } else {
+            m_vol = (m_vol_backup > 0) ? m_vol_backup : static_cast<u8>(100);
+        }
+        m_vol_slider->setProgress(m_vol);
+        gb_audio_set_volume(m_vol);
+        char vbuf[4];
+        ult::setIniFileValue(kConfigFile, "config", "volume",
+                             vol_to_str(m_vol, vbuf), "");
+    }
+
 public:
     // No destructor needed: Tesla deletes m_topElement (frame) →
     // ~UltraGBOverlayFrame deletes m_contentElement (list) →
@@ -1576,6 +1590,7 @@ public:
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
 
+        // ── Volume ────────────────────────────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader(
             "Volume " + ult::DIVIDER_SYMBOL + " \uE0E3 Toggle Mute"));
 
@@ -1593,39 +1608,48 @@ public:
                                  vol_to_str(value, vbuf), "");
         });
         m_vol_slider = vol_slider;
-        vol_slider->setIconTapCallback([this]() {
-            if (m_vol > 0) {
-                m_vol_backup = m_vol;
-                m_vol = 0;
-            } else {
-                m_vol = (m_vol_backup > 0) ? m_vol_backup : static_cast<u8>(100);
-            }
-            m_vol_slider->setProgress(m_vol);
-            gb_audio_set_volume(m_vol);
-            char vbuf[4];
-            ult::setIniFileValue(kConfigFile, "config", "volume",
-                                 vol_to_str(m_vol, vbuf), "");
-        });
+        vol_slider->setIconTapCallback([this]() { do_vol_toggle(); });
         list->addItem(vol_slider);
 
-        // ── LCD ghosting toggle ───────────────────────────────────────────────
-        list->addItem(new tsl::elm::CategoryHeader(
-            "Display " + ult::DIVIDER_SYMBOL + " \uE0E3 Toggle Ghosting"));
+        // ── Display ───────────────────────────────────────────────────────────
+        list->addItem(new tsl::elm::CategoryHeader("Display"));
 
-        auto* ghost_item = new tsl::elm::MiniListItem(
-            "LCD Ghosting",
-            g_lcd_ghosting ? ult::CHECKMARK_SYMBOL : "");
-        ghost_item->setClickListener([ghost_item](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            g_lcd_ghosting = !g_lcd_ghosting;
-            reset_lcd_ghosting();  // flush prev-frame buffer on toggle
-            ghost_item->setValue(g_lcd_ghosting ? ult::CHECKMARK_SYMBOL : "");
-            ult::setIniFileValue(kConfigFile, "config", "lcd_ghosting",
-                                 g_lcd_ghosting ? "1" : "0", "");
-            triggerNavigationFeedback();
-            return true;
+        // LCD Ghosting — disabled with a warning on the 4 MB memory tier.
+        if (ult::limitedMemory) {
+            auto* ghost_item = new tsl::elm::MiniListItem("LCD Ghosting", ult::OFF);
+            ghost_item->setTextColor(tsl::warningTextColor);
+            ghost_item->setClickListener([](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                show_notify("Requires at least 6MB.");
+                triggerNavigationFeedback();
+                return true;
+            });
+            list->addItem(ghost_item);
+        } else {
+            auto* ghost_item = new tsl::elm::MiniToggleListItem("LCD Ghosting", g_lcd_ghosting);
+            ghost_item->setStateChangedListener([](bool state) {
+                g_lcd_ghosting = state;
+                reset_lcd_ghosting();  // flush prev-frame buffer on toggle
+                ult::setIniFileValue(kConfigFile, "config", "lcd_ghosting",
+                                     state ? "1" : "0", "");
+            });
+            list->addItem(ghost_item);
+        }
+
+        // Pixel Perfect — mirrors the in-game screen-tap / RS-click toggle,
+        // but accessible from the settings page as a persistent global choice.
+        // Uses set_vp_scale() rather than assigning g_vp_2x directly so that
+        // the swizzle and coordinate LUTs are invalidated together with the flag.
+        // toggle_vp_scale() must NOT be used here — the framework already flipped
+        // the toggle item's internal state before calling this listener, so calling
+        // toggle_vp_scale() would double-flip g_vp_2x back to its original value
+        // while the LUTs rebuild at the wrong scale.
+        auto* pp_item = new tsl::elm::MiniToggleListItem("Pixel Perfect", g_vp_2x);
+        pp_item->setStateChangedListener([](bool state) {
+            set_vp_scale(state);
+            save_pixel_perfect();
         });
-        list->addItem(ghost_item);
+        list->addItem(pp_item);
 
         // Footer: left-arrow "ROMs" button.
         // frame takes ownership of list; Tesla takes ownership of frame.
@@ -1654,22 +1678,6 @@ public:
             return true;
         }
 
-        // Y — mute / unmute toggle
-        if ((keysDown & KEY_Y) && m_vol_slider) {
-            if (m_vol > 0) {
-                m_vol_backup = m_vol;
-                m_vol = 0;
-            } else {
-                m_vol = (m_vol_backup > 0) ? m_vol_backup : static_cast<u8>(100);
-            }
-            m_vol_slider->setProgress(m_vol);
-            gb_audio_set_volume(m_vol);
-            char vbuf[4];
-            ult::setIniFileValue(kConfigFile, "config", "volume",
-                                 vol_to_str(m_vol, vbuf), "");
-            triggerNavigationFeedback();
-            return true;
-        }
         // B — close the overlay
         if (keysDown & KEY_B) {
             tsl::Overlay::get()->close();

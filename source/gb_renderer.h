@@ -178,6 +178,18 @@ inline void toggle_vp_scale() {
     s_coord_ready = false;
 }
 
+// Set the viewport scale to an explicit value and invalidate the LUTs.
+// Use this instead of toggle_vp_scale() when the caller already knows the
+// desired state (e.g. a MiniToggleListItem listener, where the framework
+// has already flipped its own internal state before calling the listener).
+// Calling toggle_vp_scale() there would double-flip g_vp_2x and leave the
+// LUTs rebuilt at the WRONG scale — the exact bug the Settings toggle had.
+inline void set_vp_scale(const bool want_2x) {
+    g_vp_2x       = want_2x;
+    s_lut_ready   = false;
+    s_coord_ready = false;
+}
+
 // -- LCD ghosting (frame blend) -----------------------------------------------
 // Simulates GBC LCD phosphor persistence: pixels that toggle on/off at 30 Hz
 // appear semi-transparent instead of flickering.  Games like Link's Awakening
@@ -203,6 +215,27 @@ inline void toggle_vp_scale() {
 //   Result: sustained per-pixel flicker is ghosted; moving sprites and
 //   walking animations are written raw with zero blur and zero doubling.
 //
+// TRANSITION GUARD (bulk-change detection):
+//   During a room/map transition the scroll causes a large fraction of the
+//   screen to change on every scroll frame, building flicker counters up to
+//   ≥ FLICKER_THRESHOLD.  On the first stable frame of the new map those
+//   stale counters would fire a blend against transition data, producing a
+//   one-frame smear/artifact around the character's path and edge tiles.
+//
+//   Fix: a single pre-pass counts changed pixels.  If the count exceeds
+//   BULK_CHANGE_LIMIT (30% of the screen), the frame is classified as a
+//   transition frame and any changed pixel has its counter reset to 0 rather
+//   than incremented — no blend fires, no counter pollution carries forward.
+//
+//   Chain chomp chain: ~20–40 pixels change per frame → never triggers.
+//   Normal heavy sprite frame: ~1,000–2,500 pixels → never triggers.
+//   Room transition scroll frame: ~10,000–23,040 pixels → always triggers.
+//   The 30% threshold (~6,912 px) gives a wide safety margin between the two.
+//
+//   Performance: one extra pass through 23,040 uint16_t comparisons whose
+//   cache lines are already hot from the draw pass — negligible overhead.
+//   Memory: one stack int (changed_count). Zero additional heap or BSS.
+//
 // Memory (heap, freed on ROM unload):
 //   s_prev_fb      — raw pixels from last frame              45,056 bytes
 //   s_flicker_mask — 1 byte per pixel: saturating change count  23,040 bytes
@@ -211,6 +244,15 @@ inline void toggle_vp_scale() {
 static uint16_t* s_prev_fb      = nullptr;  // 45 KB, raw previous frame
 static uint8_t*  s_flicker_mask = nullptr;  // 23 KB, per-pixel alternation flag
 static bool      s_prev_fb_valid = false;   // false until first frame is seeded
+
+// Fraction of total pixels that must change in one frame for it to be
+// classified as a bulk transition (room scroll / map cut) rather than
+// normal per-pixel flicker.  30% → 6,912 pixels out of 23,040 total.
+// Chain chomp flicker: ~20–40 px.  Heavy sprite frame: ~1,000–2,500 px.
+// Room transition scroll frame: ~10,000–23,040 px.  Wide safety margin.
+static constexpr float BULK_CHANGE_FRAC  = 0.30f;
+static constexpr int   BULK_CHANGE_LIMIT =
+    static_cast<int>(GB_W * GB_H * BULK_CHANGE_FRAC);  // 6,912
 
 // Called after every gb_run_one_frame() when ghosting may be active.
 inline void apply_lcd_ghosting() {
@@ -237,6 +279,19 @@ inline void apply_lcd_ghosting() {
     static constexpr uint8_t FLICKER_THRESHOLD = 3u;
     const int total = GB_W * GB_H;
 
+    // ── Pre-pass: bulk-transition detection ──────────────────────────────────
+    // Count how many pixels changed this frame.  The pixel array (~45 KB) is
+    // already hot in L2 cache from the draw pass so the extra traversal is
+    // negligible.  If the count exceeds BULK_CHANGE_LIMIT we are in a scroll
+    // or map-cut frame: reset counters for changed pixels instead of
+    // incrementing them, preventing stale counts from ghosting the first
+    // stable frame of the new map.
+    int changed_count = 0;
+    for (int i = 0; i < total; i++)
+        changed_count += (g_gb_fb[i] != s_prev_fb[i]);
+
+    const bool bulk_transition = (changed_count > BULK_CHANGE_LIMIT);
+
     if (g_fb_is_rgb565) {
         // CGB: raw RGB565.
         for (int i = 0; i < total; i++) {
@@ -244,7 +299,14 @@ inline void apply_lcd_ghosting() {
             const uint16_t curr = g_gb_fb[i];
             const bool changed_now = (curr != prev);
 
-            if (changed_now & (s_flicker_mask[i] >= FLICKER_THRESHOLD)) {
+            uint8_t mask = s_flicker_mask[i];
+
+            if (bulk_transition & changed_now) {
+                // Transition frame: suppress counter build-up for changed pixels.
+                // No blend, no increment — reset so scroll accumulation does not
+                // carry into the first stable frame of the new map.
+                mask = 0u;
+            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
                 // Pixel has been changing for FLICKER_THRESHOLD+ consecutive frames
                 // → genuine sustained flicker (e.g. Chain Chomp chain at 30 Hz).
                 // 50/50 blend produces stable mid-brightness — no flicker.
@@ -255,9 +317,11 @@ inline void apply_lcd_ghosting() {
             }
             // else: write raw (g_gb_fb[i] already holds curr from draw_line)
 
-            // Saturating increment on change; reset to 0 on stable.
-            s_flicker_mask[i] = changed_now ? (s_flicker_mask[i] < 255u ? s_flicker_mask[i] + 1u : 255u) : 0u;
-            s_prev_fb[i]      = curr;   // always store raw for next frame
+            // Saturating increment on change; reset to 0 on stable or transition.
+            s_flicker_mask[i] = (bulk_transition & changed_now)
+                ? 0u
+                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
+            s_prev_fb[i] = curr;   // always store raw for next frame
         }
     } else {
         // DMG: pre-packed RGBA4444; alpha is always 0xF, blend only RGB nibbles.
@@ -266,15 +330,21 @@ inline void apply_lcd_ghosting() {
             const uint16_t curr = g_gb_fb[i];
             const bool changed_now = (curr != prev);
 
-            if (changed_now & (s_flicker_mask[i] >= FLICKER_THRESHOLD)) {
+            uint8_t mask = s_flicker_mask[i];
+
+            if (bulk_transition & changed_now) {
+                mask = 0u;
+            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
                 const uint8_t r = (uint8_t)(((curr       & 0xFu) + (prev       & 0xFu)) >> 1);
                 const uint8_t g = (uint8_t)(((curr >>  4 & 0xFu) + (prev >>  4 & 0xFu)) >> 1);
                 const uint8_t b = (uint8_t)(((curr >>  8 & 0xFu) + (prev >>  8 & 0xFu)) >> 1);
                 g_gb_fb[i] = (uint16_t)(r | (g << 4) | (b << 8) | 0xF000u);
             }
 
-            s_flicker_mask[i] = changed_now ? (s_flicker_mask[i] < 255u ? s_flicker_mask[i] + 1u : 255u) : 0u;
-            s_prev_fb[i]      = curr;
+            s_flicker_mask[i] = (bulk_transition & changed_now)
+                ? 0u
+                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
+            s_prev_fb[i] = curr;
         }
     }
 }
