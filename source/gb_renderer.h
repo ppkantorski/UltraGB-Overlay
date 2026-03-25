@@ -438,13 +438,16 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
     static u32  w_prefix = 0, wC = 0, wO = 0, wL = 0, wO2 = 0, wR = 0;
 
     if (!measured) {
-        static const auto [wp,  hp]  = renderer->getTextDimensions("GAME BOY ", false, LOGO_SIZE);
-        static const auto [wc,  hc]  = renderer->getTextDimensions("C", false, LOGO_SIZE);
-        static const auto [wo,  ho]  = renderer->getTextDimensions("O", false, LOGO_SIZE);
-        static const auto [wl,  hl]  = renderer->getTextDimensions("L", false, LOGO_SIZE);
-        static const auto [wo2, ho2] = renderer->getTextDimensions("O", false, LOGO_SIZE);
-        static const auto [wr,  hr]  = renderer->getTextDimensions("R", false, LOGO_SIZE);
-        w_prefix = wp; wC = wc; wO = wo; wL = wl; wO2 = wo2; wR = wr;
+        // No 'static' needed — the outer 'measured' flag already guarantees this
+        // block runs exactly once.  Removing 'static' eliminates six hidden guard
+        // variables and their __cxa_guard_acquire/release call sequences from .text.
+        // wO2 measures the same glyph ("O") at the same size as wO — reuse it.
+        w_prefix = renderer->getTextDimensions("GAME BOY ", false, LOGO_SIZE).first;
+        wC       = renderer->getTextDimensions("C",         false, LOGO_SIZE).first;
+        wO       = renderer->getTextDimensions("O",         false, LOGO_SIZE).first;
+        wL       = renderer->getTextDimensions("L",         false, LOGO_SIZE).first;
+        wO2      = wO;  // same glyph, same size — no second call needed
+        wR       = renderer->getTextDimensions("R",         false, LOGO_SIZE).first;
         measured = true;
     }
 

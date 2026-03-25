@@ -298,6 +298,8 @@ static int g_select_hx = SELECT_DRAW_X + SELECT_SIZE / 2;
 static int g_select_hy = SELECT_DRAW_Y - SELECT_SIZE / 2;
 static bool g_btns_measured = false;
 static int  g_div_half_w   = 0;  // half-width of DIVIDER_SYMBOL at START_SIZE, set on first draw
+static float g_dpad_glyph_w = 0.f; // measured width  of "\uE115" at DPAD_SIZE (set with g_btns_measured)
+static float g_dpad_glyph_h = 0.f; // measured height of "\uE115" at DPAD_SIZE (set with g_btns_measured)
 
 // Virtual key bitmask accumulated each frame from touch input.
 static u64 g_touch_keys = 0;
@@ -313,14 +315,20 @@ static int64_t g_gb_frame_next_ns = 0;
 // =============================================================================
 // Save helpers
 // =============================================================================
-static void build_save_path(const char* romPath, char* out, size_t outSz) {
+
+// Derives a per-ROM path of the form <dir><basename_no_ext><ext>.
+// Replaces the former build_save_path / build_state_path pair — both did
+// the identical strrchr/strncpy/strip-ext/snprintf sequence; only the
+// directory constant and extension string differed.
+static void build_rom_data_path(const char* romPath, char* out, size_t outSz,
+                                const char* dir, const char* ext) {
     const char* slash = strrchr(romPath, '/');
     const char* base  = slash ? slash + 1 : romPath;
     char bn[256] = {};
-    strncpy(bn, base, sizeof(bn)-1);
+    strncpy(bn, base, sizeof(bn) - 1);
     char* dot = strrchr(bn, '.');
     if (dot) *dot = '\0';
-    snprintf(out, outSz, "%s%s.sav", SAVE_DIR, bn);
+    snprintf(out, outSz, "%s%s%s", dir, bn, ext);
 }
 static void load_save(GBState& s) {
     if (!s.cartRam || !s.cartRamSz) return;
@@ -358,15 +366,6 @@ static void write_save(GBState& s) {
 static constexpr uint32_t STATE_MAGIC   = 0x47425354u; // 'GBST'
 static constexpr uint32_t STATE_VERSION = 4u;
 
-static void build_state_path(const char* romPath, char* out, size_t outSz) {
-    const char* slash = strrchr(romPath, '/');
-    const char* base  = slash ? slash + 1 : romPath;
-    char bn[256] = {};
-    strncpy(bn, base, sizeof(bn)-1);
-    char* dot = strrchr(bn, '.');
-    if (dot) *dot = '\0';
-    snprintf(out, outSz, "%s%s.state", STATE_DIR, bn);
-}
 
 static void save_state(GBState& s) {
     // Only romPath is needed to derive the state file path.
@@ -378,7 +377,7 @@ static void save_state(GBState& s) {
     mkdir(STATE_DIR, 0777);
 
     char statePath[256] = {};
-    build_state_path(s.romPath, statePath, sizeof(statePath));
+    build_rom_data_path(s.romPath, statePath, sizeof(statePath), STATE_DIR, ".state");
 
     FILE* f = fopen(statePath, "wb");
     if (!f) return;
@@ -428,7 +427,7 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     if (!s.romPath[0]) return false;
 
     char statePath[256] = {};
-    build_state_path(s.romPath, statePath, sizeof(statePath));
+    build_rom_data_path(s.romPath, statePath, sizeof(statePath), STATE_DIR, ".state");
 
     FILE* f = fopen(statePath, "rb");
     if (!f) return false;
@@ -493,6 +492,41 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
 }
 
 // =============================================================================
+// Load-path helpers (used by gb_load_rom and gb_unload_rom)
+// =============================================================================
+
+// Post a notification banner.  The null-check and string concatenation is
+// duplicated at every call site — one helper eliminates five copies of the
+// ult::NOTIFY_HEADER + "literal" temporary construction.
+static void show_notify(const char* msg) {
+    if (tsl::notification)
+        tsl::notification->showNow(ult::NOTIFY_HEADER + msg);
+}
+
+// Reload the wallpaper that was evicted to make room for a large ROM,
+// but only if we actually evicted it.  Clears the flag on success.
+// Appears verbatim at five sites in gb_load_rom and one in gb_unload_rom.
+static void maybe_reload_wallpaper() {
+    if (g_wallpaper_evicted) {
+        g_wallpaper_evicted = false;
+        ult::reloadWallpaper();
+    }
+}
+
+// Tear down a partially-initialised load: free the just-allocated ROM
+// buffer, clear the four path/size fields, and roll back the wallpaper
+// eviction.  Called on gb_init failure and on cartRam alloc failure —
+// both paths did the identical five-statement sequence.
+static void gb_cancel_load() {
+    free(g_gb.rom);
+    g_gb.rom         = nullptr;
+    g_gb.romSize     = 0;
+    g_gb.romPath[0]  = '\0';
+    g_gb.savePath[0] = '\0';
+    maybe_reload_wallpaper();
+}
+
+// =============================================================================
 // gb_load_rom — if same ROM is already in memory, just resume
 // =============================================================================
 bool gb_load_rom(const char* path) {
@@ -530,16 +564,16 @@ bool gb_load_rom(const char* path) {
     // past this branch and rely on the !expandedMemory check below — safe only
     // if limitedMemory always implies !expandedMemory, which is not enforced here.
     if (ult::limitedMemory && sz >= ROM_2MB) {
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 6MB.");
+        show_notify("Requires at least 6MB.");
         fclose(f); return false;
     }
     // Default (6 MB heap): reject ROMs > 2 MB.
     if (!ult::expandedMemory && sz >= ROM_4MB && sz < ROM_6MB) {
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 8MB.");
+        show_notify("Requires at least 8MB.");
         fclose(f); return false;
     }
     if (!ult::furtherExpandedMemory && sz >= ROM_6MB) {
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Requires at least 10MB.");
+        show_notify("Requires at least 10MB.");
         fclose(f); return false;
     }
 
@@ -625,8 +659,8 @@ bool gb_load_rom(const char* path) {
     // detects non-null dma[] pointers and skips re-allocation.
     if (!gb_audio_preinit_dma()) {
         fclose(f);
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Not enough memory.");
-        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        show_notify("Not enough memory.");
+        maybe_reload_wallpaper();
         return false;
     }
 
@@ -636,14 +670,14 @@ bool gb_load_rom(const char* path) {
     uint8_t* rom_buf = static_cast<uint8_t*>(malloc(sz));
     if (!rom_buf) {
         fclose(f);
-        if (tsl::notification) tsl::notification->showNow(ult::NOTIFY_HEADER + "Not enough memory.");
-        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        show_notify("Not enough memory.");
+        maybe_reload_wallpaper();
         return false;
     }
     if (fread(rom_buf, 1, sz, f) != sz) {
         free(rom_buf);
         fclose(f);
-        if (g_wallpaper_evicted) { g_wallpaper_evicted = false; ult::reloadWallpaper(); }
+        maybe_reload_wallpaper();
         return false;
     }
     fclose(f);
@@ -651,7 +685,7 @@ bool gb_load_rom(const char* path) {
     g_gb.rom     = rom_buf;
     g_gb.romSize = sz;
     strncpy(g_gb.romPath, path, sizeof(g_gb.romPath)-1);
-    build_save_path(path, g_gb.savePath, sizeof(g_gb.savePath));
+    build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), SAVE_DIR, ".sav");
 
     const enum gb_init_error_e err =
         gb_init(&g_gb.gb,
@@ -660,16 +694,7 @@ bool gb_load_rom(const char* path) {
                 gb_error, nullptr);
     if (err != GB_INIT_NO_ERROR) {
         // g_gb.rom is the freshly-allocated rom_buf — free it now.
-        free(g_gb.rom);
-        g_gb.rom         = nullptr;
-        g_gb.romSize     = 0;
-        g_gb.romPath[0]  = '\0';
-        g_gb.savePath[0] = '\0';
-        // Restore wallpaper if we evicted it for this load attempt.
-        if (g_wallpaper_evicted) {
-            g_wallpaper_evicted = false;
-            ult::reloadWallpaper();
-        }
+        gb_cancel_load();
         return false;
     }
 
@@ -708,16 +733,7 @@ bool gb_load_rom(const char* path) {
         if (!g_gb.cartRam) {
             // Can't allocate cart RAM — running without it would silently corrupt
             // any game that uses SRAM. Clean up and fail.
-            free(g_gb.rom);  // free the ROM buffer we just allocated
-            g_gb.rom         = nullptr;
-            g_gb.romSize     = 0;
-            g_gb.romPath[0]  = '\0';
-            g_gb.savePath[0] = '\0';
-            // Restore wallpaper if we evicted it for this load attempt.
-            if (g_wallpaper_evicted) {
-                g_wallpaper_evicted = false;
-                ult::reloadWallpaper();
-            }
+            gb_cancel_load();
             return false;
         }
         g_gb.cartRamSz = ramSz;
@@ -809,10 +825,7 @@ void gb_unload_rom() {
     // Only reload if we actually evicted the wallpaper for this ROM.
     // reloadWallpaper() waits for inPlot=false, repopulates wallpaperData, and
     // clears refreshWallpaper — the full safe sequence.
-    if (g_wallpaper_evicted) {
-        g_wallpaper_evicted = false;
-        ult::reloadWallpaper();
-    }
+    maybe_reload_wallpaper();
 }
 
 // =============================================================================
@@ -1060,27 +1073,34 @@ public:
         // the font's internal bearing/ascender so the hit region tracks the
         // glyph exactly rather than a hand-guessed geometric centre.
         if (!g_btns_measured) {
-            static const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
+            // No 'static' needed — the outer flag guarantees single execution.
+            // Removing 'static' from all six bindings eliminates six guard variables
+            // and their __cxa_guard_acquire/release sequences from .text.
+            // dw/dh are also saved to g_dpad_glyph_w/h so the scissor block below
+            // can read them as plain floats rather than carrying its own static guard.
+            const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
             g_dpad_hx  = DPAD_DRAW_X  + dw / 2;
             g_dpad_hy  = (DPAD_DRAW_Y - 10) - dh / 2 + 10;
+            g_dpad_glyph_w = dw;
+            g_dpad_glyph_h = dh;
 
-            static const auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
+            const auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
             g_abtn_hx  = ABTN_DRAW_X  + aw / 2;
             g_abtn_hy  = ABTN_DRAW_Y  - ah / 2;
 
-            static const auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
+            const auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
             g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
             g_bbtn_hy  = BBTN_DRAW_Y  - bh / 2;
 
-            static const auto [sw, sh] = renderer->getTextDimensions("\uE0EF", false, START_SIZE);
+            const auto [sw, sh] = renderer->getTextDimensions("\uE0EF", false, START_SIZE);
             g_start_hx = START_DRAW_X + sw / 2;
             g_start_hy = START_DRAW_Y - sh / 2;
 
-            static const auto [selw, selh] = renderer->getTextDimensions("\uE0F0", false, SELECT_SIZE);
+            const auto [selw, selh] = renderer->getTextDimensions("\uE0F0", false, SELECT_SIZE);
             g_select_hx = SELECT_DRAW_X + selw / 2;
             g_select_hy = SELECT_DRAW_Y - selh / 2;
 
-            static const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
+            const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
             g_div_half_w = static_cast<int>(divw) / 2;
 
             g_btns_measured = true;
@@ -1136,7 +1156,12 @@ public:
         // to hide the diagonal corners of the overlapping glyph.
         {
             const s32 baseline  = DPAD_DRAW_Y - 10;
-            static const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
+            // g_dpad_glyph_w/h are populated by the g_btns_measured block above on the
+            // first draw — guaranteed before this point because g_btns_measured runs
+            // first in every draw() call.  Reading them here eliminates the static
+            // guard that was the only remaining one in this function's hot path.
+            const float dw = g_dpad_glyph_w;
+            const float dh = g_dpad_glyph_h;
             const s32 left      = DPAD_DRAW_X;
             const s32 top       = baseline - static_cast<s32>(dh);
             const s32 thirdH    = static_cast<s32>(dh) / 3;
