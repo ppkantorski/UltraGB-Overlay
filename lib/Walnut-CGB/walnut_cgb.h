@@ -5471,9 +5471,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
@@ -7459,9 +7464,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
@@ -10041,9 +10051,14 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
