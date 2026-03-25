@@ -1900,6 +1900,10 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			/* Only bits 5 and 4 are R/W.
 			 * The lower bits are overwritten later, and the two most
 			 * significant bits are unused. */
+			/* ── SGB ADD ── observe FF00 writes for SGB palette packets.
+			 * Guard on IO_BOOT != 0 so the boot ROM's own init packets
+			 * (which carry zeroed WRAM data) are silently ignored. */
+			if (s_sgb_active && gb->hram_io[IO_BOOT]) sgb_observe_joyp(val);
 			gb->hram_io[IO_JOYP] = val;
 
 			/* Direction keys selected */
@@ -1908,6 +1912,27 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			/* Button keys selected */
 			else
 				gb->hram_io[IO_JOYP] |= (gb->direct.joypad & 0x0F);
+
+			/* ── SGB ADD ── SGB hardware detection.
+			 * Many SGB games (e.g. Pokémon Red/Blue) detect SGB by writing
+			 * 0x00 to FF00 (both P14 and P15 LOW), reading back the lower
+			 * nibble, then writing 0x30 and reading again.  On real SGB/SGB2
+			 * hardware the SFC drives P10-P13 when both select lines are LOW,
+			 * giving a lower nibble that differs from the normal 0x0F returned
+			 * after a 0x30 write.  In our emulator both reads return 0x0F
+			 * (no physical buttons pressed), so the comparison always matches
+			 * and the game concludes it is running on a plain DMG -- it then
+			 * never sends any PAL commands and we see GBC-table colours forever.
+			 *
+			 * Fix: when SGB mode is active and the game writes 0x00 (both
+			 * select lines pulled LOW -- not a normal joypad read), clear the
+			 * lower nibble of IO_JOYP to simulate the SFC driving those lines.
+			 * The game reads 0x00 instead of 0x0F, the comparison fails, SGB
+			 * is detected, and PAL command packets start flowing normally.
+			 * This write value (0x00) is also the SGB packet reset pulse, but
+			 * the packet sender never reads back after it, so no conflict. */
+			if (s_sgb_active && gb->hram_io[IO_BOOT] && (val & 0x30u) == 0x00u)
+				gb->hram_io[IO_JOYP] &= 0xF0u;
 
 			return;
 
