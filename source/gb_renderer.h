@@ -33,6 +33,10 @@
 
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
 extern bool g_fb_is_rgb565;
+// true when g_gb_fb stores pre-packed RGBA4444 values (DMG games only).
+// gb_select_dmg_palette bakes the conversion into g_dmg_flat_pal so
+// gb_lcd_draw_line can write RGBA4444 directly, skipping runtime conversion.
+extern bool g_fb_is_prepacked;
 // PaletteMode defined in gb_core.h (included above)
 
 // ── Runtime viewport scale toggle ─────────────────────────────────────────────
@@ -178,19 +182,22 @@ inline void toggle_vp_scale() {
 // Hot path summary per frame:
 //   - Outer loop: 144 GB source rows
 //   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
-//   - Per run: one colour conversion (rgb555/565 -> packed uint16)
-//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset,
-//     which is: framebuffer[offset] = color  (direct write, no blend, no swizzle math)
-//   - No drawRect, no per-pixel getPixelOffset, no blend math (a=0xF).
+//   - Per run: colour conversion fires exactly once (or zero times if IS_PREPACKED)
+//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset
+//
+// Template parameters (both resolved at compile time, zero runtime overhead):
+//   IS565       — true for CGB games (Walnut emits RGB565 via fixPalette)
+//   IS_PREPACKED— true for DMG games: g_gb_fb already holds RGBA4444 values
+//                 pre-baked by gb_select_dmg_palette(); conversion is skipped
+//                 entirely, making the hot loop a pure lookup + scatter-write.
 //
 // When ult::expandedMemory is true, the 144 source rows are split evenly across
-// ult::renderThreads (same global thread pool used by drawBitmapRGBA4444).
-// Each source row maps to a disjoint set of output rows so there are zero
-// shared writes — no locks needed.
+// ult::renderThreads.  Each source row maps to a disjoint set of output rows so
+// there are zero shared writes — no locks needed.
 
-static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
-                                   const bool is565,
-                                   const int sy_start, const int sy_end) {
+template <bool IS565, bool IS_PREPACKED>
+static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
+                                        const int sy_start, const int sy_end) {
     for (int sy = sy_start; sy < sy_end; ++sy) {
         const int oy0 = s_dy0[sy];
         const int oy1 = s_dy1[sy];
@@ -208,10 +215,15 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
             const int ox1   = s_dx1[sx - 1];
             const int run_w = ox1 - ox0;
 
-            // Colour conversion: once per run
-            const uint16_t packed = is565
-                ? rgb565_to_packed(run_pix)
-                : rgb555_to_packed(run_pix);
+            // Colour conversion: once per run — dead code per unused branch
+            uint16_t packed;
+            if constexpr (IS_PREPACKED) {
+                packed = run_pix;                   // already RGBA4444 from draw_line
+            } else if constexpr (IS565) {
+                packed = rgb565_to_packed(run_pix); // CGB: fixPalette → RGB565 → pack
+            } else {
+                packed = rgb555_to_packed(run_pix); // DMG non-prepacked fallback
+            }
             const tsl::Color color = *reinterpret_cast<const tsl::Color*>(&packed);
 
             for (int oy = oy0; oy < oy1; ++oy) {
@@ -238,6 +250,20 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
             run_pix = pix;
         }
     }
+}
+
+// Thin wrapper with the original signature so std::thread(render_gb_screen_chunk, ...)
+// works without changes.  The dispatch is one branch per thread launch — entirely
+// outside the pixel loop — so the cost is negligible.
+static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
+                                   const bool is565,
+                                   const int sy_start, const int sy_end) {
+    if (g_fb_is_prepacked)
+        render_gb_screen_chunk_impl<false, true>(renderer, sy_start, sy_end);
+    else if (is565)
+        render_gb_screen_chunk_impl<true,  false>(renderer, sy_start, sy_end);
+    else
+        render_gb_screen_chunk_impl<false, false>(renderer, sy_start, sy_end);
 }
 
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {

@@ -113,8 +113,9 @@ static void save_pixel_perfect() {
 // Each ROM gets its own ini at: CONFIGURE_DIR/<filename>.ini
 // e.g.  sdmc:/config/ultragb/configure/pokered.gb.ini
 //
-// Key: palette_mode = "GBC" | "DMG" | "Native"   (default absent = "GBC")
-//   GBC    – warm amber tones (default; closest to GBC colour-compat look)
+// Key: palette_mode = "GBC" | "SGB" | "DMG" | "Native"   (default absent = "GBC")
+//   GBC    – GBC title-checksum lookup; greyscale for unknown games (default)
+//   SGB    – same lookup; warm amber for unknown games (approximates SGB feel)
 //   DMG    – classic green Game Boy LCD tint
 //   Native – true greyscale, no colour tint at all
 //
@@ -142,6 +143,7 @@ static void build_game_config_path(const char* romPath, char* out, size_t outSz)
 
 static const char* palette_mode_to_str(PaletteMode m) {
     switch (m) {
+        case PaletteMode::SGB:    return "SGB";
         case PaletteMode::DMG:    return "DMG";
         case PaletteMode::NATIVE: return "Native";
         default:                  return "GBC";
@@ -149,6 +151,7 @@ static const char* palette_mode_to_str(PaletteMode m) {
 }
 
 static PaletteMode str_to_palette_mode(const std::string& s) {
+    if (s == "SGB")    return PaletteMode::SGB;
     if (s == "DMG")    return PaletteMode::DMG;
     if (s == "Native") return PaletteMode::NATIVE;
     return PaletteMode::GBC;  // default (empty or "GBC")
@@ -177,9 +180,15 @@ GBState  g_gb;
 uint16_t g_gb_fb[GB_W * GB_H] = {};
 static bool g_emu_active = false;
 static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
-PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC warm-tint by default
+PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC title-lookup by default
 bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
+bool g_fb_is_prepacked        = false;  // true when g_gb_fb stores RGBA4444 (DMG games)
 bool g_vp_2x                  = false;  // false=2.5× (default), true=2× pixel-perfect
+
+// Active DMG palette sub-arrays — written by gb_select_dmg_palette(), read every scanline.
+uint16_t g_dmg_flat_pal[64]  = {};   // filled by gb_select_dmg_palette()
+int  g_gbc_pal_idx   = GBCPAL_GREY;  // index of matched GBC_DMG_PALETTES entry
+bool g_gbc_pal_found = false;        // true if ROM was recognised in GBC_TITLE_TABLE
 // On a CGB cold boot, counts frames until the bounce reload fires.
 // -1 = inactive.  Set to 0 on cold boot, incremented each frame,
 // reload triggered when it reaches 60 (~1 second of game time).
@@ -302,20 +311,20 @@ static void write_save(GBState& s) {
 //
 // Format (all fields little-endian):
 //   [0]  uint32  magic        = 0x47425354 ('GBST')
-//   [4]  uint32  version      = 3
+//   [4]  uint32  version      = 4
 //   [8]  uint32  cart_ram_sz  cart RAM size in bytes (0 if none)
 //   [12] uint32  fb_bytes     framebuffer size = GB_W*GB_H*2
-//   [16] gb_s    core         full emulator struct (function pointers re-patched on load)
+//   [16] uint32  fb_flags     framebuffer format: 0=RGB565 (CGB), 1=RGBA4444 prepacked (DMG)
+//   [20] gb_s    core         full emulator struct (function pointers re-patched on load)
 //   [+]  uint8[] cart_ram     cart RAM contents (cart_ram_sz bytes)
 //   [+]  uint16[] framebuffer last rendered frame (fb_bytes bytes)
-//   [+]  GBAPU   apu_snapshot full APU runtime state (v3+)
+//   [+]  GBAPU   apu_snapshot full APU runtime state
 //
-// v3 adds the GBAPU snapshot so audio resumes correctly without any silence
-// gap.  v1 files are still accepted; APU state is not restored from them
-// (gb_audio_reset_regs() is called to get a safe starting point instead).
+// Only STATE_VERSION (4) files are accepted; anything older is rejected and the
+// emulator cold-boots cleanly rather than resuming with missing APU state.
 // =============================================================================
 static constexpr uint32_t STATE_MAGIC   = 0x47425354u; // 'GBST'
-static constexpr uint32_t STATE_VERSION = 3u;
+static constexpr uint32_t STATE_VERSION = 4u;
 
 static void build_state_path(const char* romPath, char* out, size_t outSz) {
     const char* slash = strrchr(romPath, '/');
@@ -346,11 +355,16 @@ static void save_state(GBState& s) {
     const uint32_t version = STATE_VERSION;
     const uint32_t ramSz   = static_cast<uint32_t>(s.cartRamSz);
     const uint32_t fbBytes = static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t));
+    // fb_flags encodes the pixel format stored in g_gb_fb:
+    //   0 = native RGB555 (DMG before prepacked opt) or RGB565 (CGB)
+    //   1 = RGBA4444 pre-packed (DMG with g_fb_is_prepacked=true)
+    const uint32_t fbFlags = g_fb_is_prepacked ? 1u : 0u;
 
     fwrite(&magic,   sizeof(magic),   1, f);
     fwrite(&version, sizeof(version), 1, f);
     fwrite(&ramSz,   sizeof(ramSz),   1, f);
     fwrite(&fbBytes, sizeof(fbBytes), 1, f);
+    fwrite(&fbFlags, sizeof(fbFlags), 1, f);
     fwrite(&s.gb,    sizeof(s.gb),    1, f);  // includes CPU regs, WRAM, VRAM, OAM, HRAM
     if (s.cartRam && s.cartRamSz)
         fwrite(s.cartRam, 1, s.cartRamSz, f);
@@ -375,9 +389,8 @@ static void save_state(GBState& s) {
 
 // Returns true if a valid state was loaded and the emulator is ready to run.
 // On failure, leaves the emulator in cold-boot state (gb_init already called).
-// *apu_restored is set true only when a v3 save successfully restored the full
-// GBAPU snapshot via gb_audio_restore_state().  When false, the caller must
-// call gb_audio_reset_regs() before gb_audio_init().
+// *apu_restored is set true when the GBAPU snapshot was successfully restored.
+// When false, the caller must call gb_audio_reset_regs() before gb_audio_init().
 static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     if (apu_restored) *apu_restored = false;
     if (!s.romPath[0]) return false;
@@ -390,9 +403,12 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
 
     uint32_t magic = 0, version = 0, ramSz = 0, fbBytes = 0;
     if (fread(&magic,   sizeof(magic),   1, f) != 1 || magic != STATE_MAGIC) { fclose(f); return false; }
-    if (fread(&version, sizeof(version), 1, f) != 1 || version < 1u || version > 3u) { fclose(f); return false; }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version != STATE_VERSION) { fclose(f); return false; }
     if (fread(&ramSz,   sizeof(ramSz),   1, f) != 1) { fclose(f); return false; }
     if (fread(&fbBytes, sizeof(fbBytes), 1, f) != 1) { fclose(f); return false; }
+
+    uint32_t fbFlags = 0u;
+    if (fread(&fbFlags, sizeof(fbFlags), 1, f) != 1) { fclose(f); return false; }
 
     // Sanity checks
     if (ramSz   != static_cast<uint32_t>(s.cartRamSz))  { fclose(f); return false; }
@@ -422,17 +438,22 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     // Restore framebuffer so the last frame shows instantly
     if (fread(g_gb_fb, 1, fbBytes, f) != fbBytes) { fclose(f); return false; }
 
-    // v3: restore full GBAPU snapshot.
-    // This includes ch.enabled, timer, duty_pos, current vol, seq_step, lfsr,
-    // hp_ch, and every other computed field.  Without it the audio thread starts
-    // with all channels disabled (enabled=false) because apply_reg() never sets
-    // that flag (it masks trigger bits), causing silence for the entire session.
-    if (version >= 3u) {
-        GBAPU apu_snap{};
-        if (fread(&apu_snap, sizeof(apu_snap), 1, f) == 1) {
-            gb_audio_restore_state(&apu_snap);
-            if (apu_restored) *apu_restored = true;
-        }
+    // Format fixup: the current session may be prepacked (DMG game, RGBA4444 in
+    // g_gb_fb) while the state file was saved in the old RGB555 format (fb_flags=0).
+    // Convert each pixel in-place so the first rendered frame has correct colours.
+    if (g_fb_is_prepacked && fbFlags == 0u) {
+        for (int i = 0; i < GB_W * GB_H; ++i)
+            g_gb_fb[i] = gb_pack_rgb555(g_gb_fb[i]);
+    }
+
+    // Restore full GBAPU snapshot — channels enabled/disabled, timers, duty
+    // positions, volume envelopes, LFSR, DC-blocker state, and everything else
+    // computed outside gb_s.  Without it every channel starts disabled and the
+    // session is silent until the game re-runs its APU init sequence.
+    GBAPU apu_snap{};
+    if (fread(&apu_snap, sizeof(apu_snap), 1, f) == 1) {
+        gb_audio_restore_state(&apu_snap);
+        if (apu_restored) *apu_restored = true;
     }
 
     fclose(f);
@@ -625,10 +646,19 @@ bool gb_load_rom(const char* path) {
 #else
     g_fb_is_rgb565 = false;
 #endif
+    // DMG games use the pre-packed path: gb_select_dmg_palette bakes RGBA4444
+    // values into g_dmg_flat_pal so gb_lcd_draw_line writes display-ready pixels
+    // directly into g_gb_fb, eliminating the per-run conversion in the renderer.
+    // CGB games always use fixPalette (RGB565), so the CGB path is never prepacked.
+    g_fb_is_prepacked = !g_fb_is_rgb565;
     // Apply per-game palette for DMG games. CGB games always use hardware colour
     // so palette_mode has no effect on them, but we still load/store it so
     // GameConfigGui can show the correct current value.
     g_palette_mode = g_fb_is_rgb565 ? PaletteMode::GBC : load_game_palette_mode(path);
+    // Compute title-checksum lookup and populate g_dmg_*_pal for the draw callback.
+    // For CGB games this is a no-op in the renderer (fixPalette path is used instead),
+    // but calling it is harmless and keeps g_gbc_pal_found/idx accurate for the UI.
+    gb_select_dmg_palette();
 
     size_t ramSz = 0;
     gb_get_save_size_s(&g_gb.gb, &ramSz);
@@ -1131,7 +1161,7 @@ public:
         if (g_pending_rom_path[0] != '\0') {
             tsl::gfx::FontManager::clearCache(); // ensure glyphs are gone
 
-            char path[512];
+            char path[256];
             strncpy(path, g_pending_rom_path, sizeof(path) - 1);
             path[sizeof(path) - 1] = '\0';
             g_pending_rom_path[0] = '\0'; // consume before the load attempt
@@ -1389,9 +1419,13 @@ static bool rom_is_playable(const std::string& path) {
 // Settings are stored in: sdmc:/config/ultragb/configure/<filename>.ini
 //
 // Palette Mode (DMG .gb games only — cycles on each A press):
-//   GBC    → warm amber tones; closest to how a Game Boy Color would show it
-//   DMG    → classic green LCD tint of the original Game Boy
-//   Native → true greyscale, no colour tint
+//   GBC    → GBC built-in title-checksum lookup; greyscale for unrecognised games.
+//            This is how a real Game Boy Color colourised DMG games.
+//   SGB    → Same lookup for recognised games; warm amber for unrecognised games.
+//            Approximates the Super Game Boy feel (true SGB ROM-packet parsing
+//            would require a full SGB protocol implementation).
+//   DMG    → Classic Game Boy green LCD tint
+//   Native → True greyscale, no colour tint
 //
 // CGB ROMs (.gbc / header flag 0x80) always use hardware colour — the palette
 // item is replaced with an informational note.
@@ -1410,44 +1444,69 @@ public:
 
         // ROM filename as section header
         list->addItem(new tsl::elm::CategoryHeader(m_romLabel));
-        //list->addItem(new tsl::elm::CategoryHeader("Display"));
 
         const bool isCgb = rom_has_cgb_flag(m_romPath.c_str());
 
         if (!isCgb) {
-            // Cycling Palette Mode item: A cycles GBC → DMG → Native → GBC…
-            // Value label updates in-place so the current selection is always visible.
+            // Check whether this game is recognised in the GBC title table.
+            // We do a quick scan here just for the UI hint — the real work is
+            // done by gb_select_dmg_palette() when the ROM is actually loaded.
+            const bool isLoaded = g_gb.rom &&
+                strncmp(g_gb.romPath, m_romPath.c_str(), sizeof(g_gb.romPath)) == 0;
+            const bool knownGame = isLoaded && g_gbc_pal_found;
+
+            // Cycling Palette Mode item: A cycles GBC → SGB → DMG → Native → GBC…
             PaletteMode cur = load_game_palette_mode(m_romPath.c_str());
 
             auto* modeItem = new tsl::elm::ListItem("Palette Mode");
             modeItem->setValue(palette_mode_to_str(cur));
 
-            modeItem->setClickListener([this, modeItem, cur](u64 keys) mutable -> bool {
+            modeItem->setClickListener([this, modeItem, cur, isLoaded](u64 keys) mutable -> bool {
                 if (!(keys & KEY_A)) return false;
-                // Advance through the three modes in order
-                cur = static_cast<PaletteMode>((static_cast<int>(cur) + 1) % 3);
+                // Advance through the four modes in order: GBC → SGB → DMG → Native → GBC…
+                cur = static_cast<PaletteMode>((static_cast<int>(cur) + 1) % 4);
                 modeItem->setValue(palette_mode_to_str(cur));
                 save_game_palette_mode(m_romPath.c_str(), cur);
-                // Apply live if the ROM is currently the loaded one
-                if (g_gb.rom &&
-                    strncmp(g_gb.romPath, m_romPath.c_str(), sizeof(g_gb.romPath)) == 0)
+                // Apply live if this ROM is currently loaded — repopulate draw palettes.
+                if (isLoaded) {
                     g_palette_mode = cur;
+                    gb_select_dmg_palette();
+                }
                 triggerRumbleClick.store(true, std::memory_order_release);
                 return true;
             });
             list->addItem(modeItem);
 
-            // Short legend so the user knows what each value means
+            // Show detected palette name when the game is loaded and recognised.
+            if (isLoaded && knownGame) {
+                static const char* pal_names[] = {
+                    "Greyscale", "Blue", "Red", "Green", "Yellow", "Purple", "Teal", "Brown"
+                };
+                const int idx = g_gbc_pal_idx;
+                const char* detected = (idx >= 0 && idx < GBC_DMG_PAL_COUNT)
+                                       ? pal_names[idx] : "Custom";
+                static char hint_buf[96];
+                snprintf(hint_buf, sizeof(hint_buf), "Auto-detected: %s palette", detected);
+                auto* hint = new tsl::elm::CustomDrawer(
+                    [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
+                        r->drawString(hint_buf, false, x + 16, y + 14, 13,
+                                      tsl::Color{0x6, 0xA, 0x6, 0xF});
+                    });
+                list->addItem(hint, 32);
+            }
+
+            // Legend
             auto* legend = new tsl::elm::CustomDrawer(
                 [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
                     r->drawString(
-                        "GBC    \u2014 warm tones (default)\n"
+                        "GBC    \u2014 title-based colors (default)\n"
+                        "SGB    \u2014 same + warm tint fallback\n"
                         "DMG    \u2014 classic green tint\n"
                         "Native \u2014 true greyscale",
                         false, x + 16, y + 18, 14,
                         tsl::Color{0x8, 0x8, 0x8, 0xF});
                 });
-            list->addItem(legend, 72);
+            list->addItem(legend, 90);
         } else {
             // .gbc / CGB-flagged ROM — palette setting has no effect
             auto* note = new tsl::elm::CustomDrawer(
@@ -1471,8 +1530,6 @@ public:
                              HidAnalogStickState rightJoy) override {
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & (KEY_B | KEY_X)) {
-            // Write g_last_rom_path so RomSelectorGui::createUI jumpToItem scrolls
-            // back to exactly this ROM when the list is rebuilt.
             save_last_rom(m_romPath.c_str());
             triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>();
@@ -1506,9 +1563,10 @@ public:
         // m_frame is owned by Tesla — do NOT delete.
         // Both lists are owned by us; Tesla never sees them directly
         // (it only holds m_frame, which carries a non-owning pointer).
-        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE lists are freed
+        
         delete m_rom_list;
         delete m_settings_list;
+        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE lists are freed
     }
 
     virtual tsl::elm::Element* createUI() override {
@@ -1542,12 +1600,12 @@ public:
                 const char* sl = strrchr(path.c_str(), '/');
                 std::string label = sl ? std::string(sl + 1) : path;
 
-                const bool isLive = g_gb.rom && g_gb.romPath[0] &&
-                    strncmp(g_gb.romPath, path.c_str(), sizeof(g_gb.romPath)) == 0;
-                const bool isLast = !isLive && !g_gb.rom && g_last_rom_path[0] &&
+                // g_gb.rom is always null here — gb_unload_rom() was called before
+                // swapTo<RomSelectorGui>, so there is no live ROM to fast-resume.
+                const bool isLast = g_last_rom_path[0] &&
                     strcmp(label.c_str(), g_last_rom_path) == 0;
                 // Only show in-progress state if the ROM is playable on this memory tier.
-                const bool inProgress = (isLive || isLast) && rom_is_playable(path);
+                const bool inProgress = isLast && rom_is_playable(path);
 
                 if (inProgress && jumpLabel.empty())
                     jumpLabel = label;
@@ -1557,20 +1615,23 @@ public:
                 if (!rom_is_playable(path))
                     item->setTextColor(tsl::warningTextColor);
 
-                // Only isLive can use the fast-resume path; isLast still needs loading.
                 // Capture m_page by pointer so KEY_Y is ignored when the Settings
                 // page is active -- onClick fires before Gui::handleInput so the
                 // lambda must gate this itself.
-                item->setClickListener([path, label, isLive, page = &m_page](u64 keys) -> bool {
+                // label is NOT captured: it is derived from path inside the lambda
+                // at click time (called at most once per user action) so each
+                // MiniListItem saves one std::string heap allocation.
+                item->setClickListener([path, page = &m_page](u64 keys) -> bool {
                     // Y -> open per-game configuration screen (ROMs page only)
                     if ((keys & KEY_Y) && *page == Page::ROMs) {
                         save_last_rom(path.c_str());
                         triggerNavigationFeedback();
-                        tsl::swapTo<GameConfigGui>(path, label);
+                        const char* _sl = strrchr(path.c_str(), '/');
+                        tsl::swapTo<GameConfigGui>(path, _sl ? std::string(_sl + 1) : path);
                         return true;
                     }
                     if (!(keys & KEY_A)) return false;
-                    if (!isLive && !rom_is_playable(path)) {
+                    if (!rom_is_playable(path)) {
                         gb_load_rom(path.c_str());
                         return false;
                     }
@@ -1578,21 +1639,13 @@ public:
                     // Audio::initialize() is called by createUI() when user returns.
                     if (ult::useSoundEffects && !ult::limitedMemory)
                         ult::Audio::exit();
-                    if (isLive) {
-                        gb_audio_init(&g_gb.gb);
-                        g_gb_frame_next_ns = 0;
-                        g_gb.running = true;
-                        save_last_rom(path.c_str());
-                        tsl::swapTo<GBEmulatorGui>();
-                    } else {
-                        // Deferred load: store path, let GBEmulatorGui::createUI() call
-                        // gb_load_rom() AFTER ~RomSelectorGui() has freed all list items.
-                        save_last_rom(path.c_str());
-                        strncpy(g_pending_rom_path, path.c_str(),
-                                sizeof(g_pending_rom_path) - 1);
-                        g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-                        tsl::swapTo<GBEmulatorGui>();
-                    }
+                    // Deferred load: store path, let GBEmulatorGui::createUI() call
+                    // gb_load_rom() AFTER ~RomSelectorGui() has freed all list items.
+                    save_last_rom(path.c_str());
+                    strncpy(g_pending_rom_path, path.c_str(),
+                            sizeof(g_pending_rom_path) - 1);
+                    g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+                    tsl::swapTo<GBEmulatorGui>();
                     return true;
                 });
                 m_rom_list->addItem(item);
