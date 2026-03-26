@@ -26,7 +26,6 @@
 #include "elm_ultraframe.hpp" // ← UltraGBOverlayFrame (two-page frame)
 
 #include <dirent.h>
-#include <sys/stat.h>
 #include <ctime>
 #include <vector>
 #include <string>
@@ -43,6 +42,7 @@ static constexpr const char* SAVE_DIR          = "sdmc:/config/ultragb/saves/";
 static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* INTERNAL_STATE_DIR = "sdmc:/config/ultragb/states/internal/";
 static constexpr const char* STATE_DIR         = INTERNAL_STATE_DIR; // alias — internal quick-resume
+static constexpr const char* INTERNAL_SAVE_DIR  = "sdmc:/config/ultragb/saves/internal/";  // live .sav files
 static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
 static char g_rom_dir[256]       = "sdmc:/roms/gb/";
 static char g_last_rom_path[256]    = {};   // basename of last-played ROM, persisted to config.ini
@@ -183,15 +183,32 @@ static void save_pixel_perfect() {
 // =============================================================================
 
 // Peek at ROM header byte 0x143 to determine CGB support without loading the ROM.
-// 0x80 = CGB compatible, 0xC0 = CGB only.
-static bool rom_has_cgb_flag(const char* romPath) {
+//   0x80 = CGB compatible (also runs in DMG mode — palette selection allowed)
+//   0xC0 = CGB only       (requires CGB hardware — palette locked to GBC)
+// Both have bit7 set; only CGB-only also has bit6 set.
+static uint8_t rom_cgb_flag(const char* romPath) {
     FILE* f = fopen(romPath, "rb");
-    if (!f) return false;
+    if (!f) return 0;
     uint8_t flag = 0;
     if (fseek(f, 0x143, SEEK_SET) == 0)
         fread(&flag, 1, 1, f);
     fclose(f);
-    return (flag & 0x80) != 0;
+    return flag;
+}
+// Returns true for any ROM that declares CGB support (0x80 or 0xC0).
+static bool rom_has_cgb_flag(const char* romPath) {
+    return (rom_cgb_flag(romPath) & 0x80) != 0;
+}
+// Returns true only for ROMs that REQUIRE CGB hardware (0xC0, bit6 set).
+// CGB-only games cannot run in DMG mode; their palette is always "GBC".
+static bool rom_is_cgb_only(const char* romPath) {
+    return (rom_cgb_flag(romPath) & 0xC0) == 0xC0;
+}
+// Returns true for ROMs that support CGB but can also run in DMG mode (0x80, bit6 clear).
+// These games may use a user-selected DMG palette.
+static bool rom_is_cgb_compat(const char* romPath) {
+    const uint8_t f = rom_cgb_flag(romPath);
+    return (f & 0x80) != 0 && (f & 0x40) == 0;
 }
 
 static void build_game_config_path(const char* romPath, char* out, size_t outSz) {
@@ -410,7 +427,7 @@ static void load_save(GBState& s) {
 }
 static void write_save(GBState& s) {
     if (!s.cartRam || !s.cartRamSz) return;
-    mkdir(SAVE_DIR, 0777);
+    ult::createDirectory(INTERNAL_SAVE_DIR);
     FILE* f = fopen(s.savePath, "wb");
     if (!f) return;
     fwrite(s.cartRam, 1, s.cartRamSz, f);
@@ -445,7 +462,7 @@ static void save_state(GBState& s) {
     // calling save_state() to reduce peak heap pressure.
     if (!s.romPath[0]) return;
 
-    mkdir(STATE_DIR, 0777);
+    ult::createDirectory(STATE_DIR);
 
     char statePath[256] = {};
     build_rom_data_path(s.romPath, statePath, sizeof(statePath), STATE_DIR, ".state");
@@ -540,12 +557,24 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     // Restore framebuffer so the last frame shows instantly
     if (fread(g_gb_fb, 1, fbBytes, f) != fbBytes) { fclose(f); return false; }
 
-    // Format fixup: the current session may be prepacked (DMG game, RGBA4444 in
-    // g_gb_fb) while the state file was saved in the old RGB555 format (fb_flags=0).
-    // Convert each pixel in-place so the first rendered frame has correct colours.
+    // Framebuffer format fixup: reconcile the saved pixel format (fbFlags) with
+    // what the current session expects (g_fb_is_prepacked).
+    //
+    // Case 1: state saved as RGB565/RGB555 (fbFlags=0), session wants RGBA4444
+    //   Happens when a CGB-compat game switches from GBC→DMG palette between
+    //   sessions, OR a pure DMG game was saved before the prepacked optimisation.
+    //   gb_pack_rgb555 works on RGB565 too (loses the lowest green bit — fine
+    //   for one frame before draw_line overwrites it).
     if (g_fb_is_prepacked && fbFlags == 0u) {
         for (int i = 0; i < GB_W * GB_H; ++i)
             g_gb_fb[i] = gb_pack_rgb555(g_gb_fb[i]);
+    }
+    // Case 2: state saved as RGBA4444 (fbFlags=1), session wants RGB565
+    //   Happens when a CGB-compat game switches from DMG→GBC palette between
+    //   sessions.  A lossy RGBA4444→RGB565 expansion would look wrong, so just
+    //   clear — the real frame arrives from the core within 16 ms.
+    else if (!g_fb_is_prepacked && fbFlags == 1u) {
+        memset(g_gb_fb, 0, sizeof(g_gb_fb));
     }
 
     // Restore full GBAPU snapshot — channels enabled/disabled, timers, duty
@@ -599,24 +628,31 @@ static void build_user_slot_ts_path(const char* romPath, int slot, char* out, si
     snprintf(out, outSz, "%sslot_%d.ts", dir, slot);
 }
 
-// Write current wall-clock time to the slot's .ts file.
-static void write_slot_timestamp(const char* romPath, int slot) {
-    char tsPath[640] = {};
-    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+// =============================================================================
+// Generic backup timestamp helpers
+// Shared by both save-state slots and save-data backup slots so the
+// date/time formatting logic lives in exactly one place.
+// =============================================================================
+
+// Write current wall-clock time to an arbitrary .ts file path.
+static void write_timestamp_to(const char* tsPath) {
     FILE* f = fopen(tsPath, "w");
     if (!f) return;
     time_t t = time(nullptr);
-    struct tm* ti = localtime(&t);
-    char buf[32] = {};
-    strftime(buf, sizeof(buf), "%Y-%m-%d  %H:%M", ti);
+    struct tm ti{};
+    localtime_r(&t, &ti);
+    char buf[64] = {};
+    size_t len = strftime(buf, sizeof(buf), "%Y-%m-%d", &ti);
+    if (len < sizeof(buf))
+        len += snprintf(buf + len, sizeof(buf) - len, "%s", ult::DIVIDER_SYMBOL.c_str());
+    if (len < sizeof(buf))
+        strftime(buf + len, sizeof(buf) - len, "%H:%M:%S", &ti);
     fwrite(buf, 1, strlen(buf), f);
     fclose(f);
 }
 
-// Read the .ts file into out; fills ult::OPTION_SYMBOL.c_str() if absent or empty.
-static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
-    char tsPath[640] = {};
-    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+// Read a .ts file into out; fills ult::OPTION_SYMBOL if absent or empty.
+static void read_timestamp_from(const char* tsPath, char* out, size_t outSz) {
     FILE* f = fopen(tsPath, "r");
     if (!f) { strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1); out[outSz - 1] = '\0'; return; }
     size_t n = fread(out, 1, outSz - 1, f);
@@ -625,18 +661,112 @@ static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t
     if (!out[0]) strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1);
 }
 
-// Copy a file from src_path to dst_path.  Returns true on success.
-static bool copy_file(const char* srcPath, const char* dstPath) {
-    FILE* src = fopen(srcPath, "rb");
-    if (!src) return false;
-    FILE* dst = fopen(dstPath, "wb");
-    if (!dst) { fclose(src); return false; }
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-        fwrite(buf, 1, n, dst);
-    fclose(src);
-    fclose(dst);
+// Thin wrappers for save-state slots — unchanged call signature.
+static void write_slot_timestamp(const char* romPath, int slot) {
+    char tsPath[640] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    write_timestamp_to(tsPath);
+}
+static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
+    char tsPath[640] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    read_timestamp_from(tsPath, out, outSz);
+}
+
+// =============================================================================
+// Save-data backup helpers  (10 named slots per game)
+//
+// Layout on SD card:
+//   Internal (live .sav):   sdmc:/config/ultragb/saves/internal/<n>.sav
+//   Backup slots:           sdmc:/config/ultragb/saves/<n>/slot_N.sav
+//                           sdmc:/config/ultragb/saves/<n>/slot_N.ts
+//
+// Mirrors the save-state slot system exactly; only the base dir and file
+// extension differ.  All path-building and timestamp logic delegates to the
+// generic helpers above — no duplicated code.
+// =============================================================================
+
+// Per-game backup directory: <SAVE_DIR><gamename>/
+static void build_save_backup_dir(const char* romPath, char* out, size_t outSz) {
+    const char* sl   = strrchr(romPath, '/');
+    const char* base = sl ? sl + 1 : romPath;
+    char bn[256] = {};
+    strncpy(bn, base, sizeof(bn) - 1);
+    char* dot = strrchr(bn, '.');
+    if (dot) *dot = '\0';
+    snprintf(out, outSz, "%s%s/", SAVE_DIR, bn);
+}
+
+// Full path to a save-data backup slot file.
+static void build_save_backup_slot_path(const char* romPath, int slot, char* out, size_t outSz) {
+    char dir[512] = {};
+    build_save_backup_dir(romPath, dir, sizeof(dir));
+    snprintf(out, outSz, "%sslot_%d.sav", dir, slot);
+}
+
+// Full path to a save-data backup slot timestamp file.
+static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz) {
+    char dir[512] = {};
+    build_save_backup_dir(romPath, dir, sizeof(dir));
+    snprintf(out, outSz, "%sslot_%d.ts", dir, slot);
+}
+
+// Wrappers using the generic timestamp core.
+static void write_save_backup_timestamp(const char* romPath, int slot) {
+    char tsPath[640] = {};
+    build_save_backup_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    write_timestamp_to(tsPath);
+}
+static void read_save_backup_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
+    char tsPath[640] = {};
+    build_save_backup_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    read_timestamp_from(tsPath, out, outSz);
+}
+
+// Back up the live .sav to slot N.  Returns false if the internal .sav is absent
+// (game has no save data yet).
+static bool backup_save_data_slot(const char* romPath, int slot) {
+    char internalPath[256] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_SAVE_DIR, ".sav");
+    if (!ult::isFile(std::string(internalPath))) return false;
+
+    char dir[512] = {};
+    build_save_backup_dir(romPath, dir, sizeof(dir));
+    ult::createDirectory(std::string(dir));
+
+    char slotPath[640] = {};
+    build_save_backup_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+
+    ult::copyFileOrDirectory(std::string(internalPath), std::string(slotPath));
+    if (!ult::isFile(std::string(slotPath))) return false;
+    write_save_backup_timestamp(romPath, slot);
+    return true;
+}
+
+// Restore slot N into the live .sav file and — if the ROM is currently loaded
+// in memory — patch g_gb.cartRam directly so the change takes effect without
+// requiring a relaunch.  Returns false if the slot file doesn't exist.
+static bool restore_save_data_slot(const char* romPath, int slot) {
+    char slotPath[640] = {};
+    build_save_backup_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+    if (!ult::isFile(std::string(slotPath))) return false;
+
+    char internalPath[256] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_SAVE_DIR, ".sav");
+
+    ult::copyFileOrDirectory(std::string(slotPath), std::string(internalPath));
+    if (!ult::isFile(std::string(internalPath))) return false;
+
+    // Live-patch RAM if this ROM is currently loaded and has cart RAM.
+    if (g_gb.rom &&
+        strncmp(g_gb.romPath, romPath, sizeof(g_gb.romPath)) == 0 &&
+        g_gb.cartRam && g_gb.cartRamSz) {
+        FILE* f = fopen(slotPath, "rb");
+        if (f) {
+            fread(g_gb.cartRam, 1, g_gb.cartRamSz, f);
+            fclose(f);
+        }
+    }
     return true;
 }
 
@@ -645,16 +775,18 @@ static bool copy_file(const char* srcPath, const char* dstPath) {
 static bool save_user_slot(const char* romPath, int slot) {
     char internalPath[256] = {};
     build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
+    if (!ult::isFile(std::string(internalPath))) return false;
 
     // Ensure per-game directory exists before writing
     char dir[512] = {};
     build_user_state_dir(romPath, dir, sizeof(dir));
-    mkdir(dir, 0777);
+    ult::createDirectory(std::string(dir));
 
     char slotPath[640] = {};
     build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
 
-    if (!copy_file(internalPath, slotPath)) return false;
+    ult::copyFileOrDirectory(std::string(internalPath), std::string(slotPath));
+    if (!ult::isFile(std::string(slotPath))) return false;
     write_slot_timestamp(romPath, slot);
     return true;
 }
@@ -665,11 +797,13 @@ static bool save_user_slot(const char* romPath, int slot) {
 static bool load_user_slot(const char* romPath, int slot) {
     char slotPath[640] = {};
     build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+    if (!ult::isFile(std::string(slotPath))) return false;
 
     char internalPath[256] = {};
     build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
 
-    return copy_file(slotPath, internalPath);
+    ult::copyFileOrDirectory(std::string(slotPath), std::string(internalPath));
+    return ult::isFile(std::string(internalPath));
 }
 
 
@@ -865,7 +999,7 @@ bool gb_load_rom(const char* path) {
     g_gb.rom     = rom_buf;
     g_gb.romSize = sz;
     strncpy(g_gb.romPath, path, sizeof(g_gb.romPath)-1);
-    build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), SAVE_DIR, ".sav");
+    build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), INTERNAL_SAVE_DIR, ".sav");
 
     const enum gb_init_error_e err =
         gb_init(&g_gb.gb,
@@ -885,15 +1019,48 @@ bool gb_load_rom(const char* path) {
 #else
     g_fb_is_rgb565 = false;
 #endif
+
+    // Any CGB game (0x80 CGB-compat OR 0xC0 CGB-only) may use a user-selected
+    // DMG palette.  We intentionally leave cgbMode=1 so the game's full GBC
+    // init path runs correctly — double speed, VRAM banking, CGB palettes, and
+    // all other CGB hardware continue to work normally inside the core.
+    //
+    // Instead of downgrading cgbMode, we simply redirect the display output:
+    //   g_fb_is_rgb565 = false   → renderer treats g_gb_fb as RGBA4444 (prepacked)
+    //   g_fb_is_prepacked = true → gb_lcd_draw_line reads fixPalette[px] to get
+    //                              the true RGB565 color, computes luminance, and
+    //                              maps to shade 0–3 through g_dmg_flat_pal.
+    //
+    // This produces a correct monochrome look — no inverted glyphs, no wrong
+    // colors — while keeping the emulator core and save states fully intact.
+    // cgbMode is still 1 in any saved state, which is exactly right on reload.
+#if WALNUT_FULL_GBC_SUPPORT
+    if (g_fb_is_rgb565 && rom_has_cgb_flag(path)) {
+        const PaletteMode savedMode = load_game_palette_mode(path);
+        if (savedMode != PaletteMode::GBC) {
+            g_fb_is_rgb565 = false;   // renderer uses prepacked (RGBA4444) path
+            // g_fb_is_prepacked is set from g_fb_is_rgb565 on the next line
+        }
+    }
+#endif
+
     // DMG games use the pre-packed path: gb_select_dmg_palette bakes RGBA4444
     // values into g_dmg_flat_pal so gb_lcd_draw_line writes display-ready pixels
     // directly into g_gb_fb, eliminating the per-run conversion in the renderer.
     // CGB games always use fixPalette (RGB565), so the CGB path is never prepacked.
     g_fb_is_prepacked = !g_fb_is_rgb565;
-    // Apply per-game palette for DMG games. CGB games always use hardware colour
-    // so palette_mode has no effect on them, but we still load/store it so
-    // GameConfigGui can show the correct current value.
-    g_palette_mode = g_fb_is_rgb565 ? PaletteMode::GBC : load_game_palette_mode(path);
+    // Apply per-game palette for DMG games and CGB-compat games in DMG-palette
+    // mode.  For CGB-only games (cgbMode=1 and g_fb_is_rgb565=true), the palette
+    // is always GBC — hardware colour, no user palette applies.
+    // We check g_gb.gb.cgb.cgbMode directly rather than g_fb_is_rgb565 because
+    // CGB-compat games in DMG-palette mode have cgbMode=1 but g_fb_is_rgb565=false.
+#if WALNUT_FULL_GBC_SUPPORT
+    g_palette_mode = (g_gb.gb.cgb.cgbMode && g_fb_is_rgb565)
+                     ? PaletteMode::GBC
+                     : load_game_palette_mode(path);
+#else
+    g_palette_mode = load_game_palette_mode(path);
+#endif
     // Compute title-checksum lookup and populate g_dmg_*_pal for the draw callback.
     // For CGB games this is a no-op in the renderer (fixPalette path is used instead),
     // but calling it is harmless and keeps g_gbc_pal_found/idx accurate for the UI.
@@ -975,8 +1142,10 @@ bool gb_load_rom(const char* path) {
     // On a CGB cold boot (no existing state file), start the bounce counter.
     // After 60 frames (~1 s) the draw loop does a full gb_unload_rom + gb_load_rom,
     // replicating "exit at the Nintendo/Capcom logo + re-enter" which fixes
-    // Oracle of Seasons' intro freeze.  CGB only; DMG and resumed states stay -1.
-    g_cgb_bounce_frames = (!resumed && g_fb_is_rgb565) ? 0 : -1;
+    // Oracle of Seasons' intro freeze.  Applies whenever cgbMode=1 (regardless of
+    // whether the display is in CGB-colour or DMG-palette mode); DMG cold boots
+    // and all resumed states stay -1.
+    g_cgb_bounce_frames = (!resumed && g_gb.gb.cgb.cgbMode) ? 0 : -1;
 
     g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     reset_lcd_ghosting();    // don't bleed prev-game pixels into first frame
@@ -1426,11 +1595,13 @@ public:
     }
 };
 
-class RomSelectorGui; // forward declare
-class GameConfigGui;  // forward declare
-class SettingsGui;    // forward declare
-class SaveStatesGui;  // forward declare
-class SlotActionGui;  // forward declare
+class RomSelectorGui;       // forward declare
+class GameConfigGui;        // forward declare
+class SettingsGui;          // forward declare
+class SaveStatesGui;        // forward declare
+class SlotActionGui;        // forward declare
+class SaveDataGui;          // forward declare
+class SaveDataSlotActionGui; // forward declare
 // =============================================================================
 // GBEmulatorGui — input handled at the Gui level (same pattern as TetrisGui)
 // =============================================================================
@@ -1793,12 +1964,10 @@ public:
             // Check if slot file exists first
             char slotPath[640] = {};
             build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            FILE* chk = fopen(slotPath, "rb");
-            if (!chk) {
+            if (!ult::isFile(std::string(slotPath))) {
                 show_notify("Slot is empty.");
                 return true;
             }
-            fclose(chk);
             // Copy slot → internal state
             if (!load_user_slot(romPath.c_str(), slot)) {
                 show_notify("Load failed.");
@@ -1822,17 +1991,15 @@ public:
             // Check if the slot file exists first
             char slotPath[640] = {};
             build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            FILE* chk = fopen(slotPath, "rb");
-            if (!chk) {
+            if (!ult::isFile(std::string(slotPath))) {
                 show_notify("Slot is empty.");
                 return true;
             }
-            fclose(chk);
             // Delete the state file and its timestamp
-            remove(slotPath);
+            ult::deleteFileOrDirectory(std::string(slotPath));
             char tsPath[640] = {};
             build_user_slot_ts_path(romPath.c_str(), slot, tsPath, sizeof(tsPath));
-            remove(tsPath);
+            ult::deleteFileOrDirectory(std::string(tsPath));
             show_notify("Slot deleted.");
             // Return to SaveStatesGui, scrolling back to this slot
             char label[16];
@@ -1856,6 +2023,179 @@ public:
             triggerExitFeedback();
             // Return to SaveStatesGui, jumping back to the correct slot item
             tsl::swapTo<SaveStatesGui>(m_rom_path, m_display_name);
+            return true;
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// SaveDataSlotActionGui — Backup / Restore / Delete for one save-data slot
+//
+// Mirrors SlotActionGui exactly but operates on .sav files instead of .state
+// files.  "Backup" copies the live internal .sav to the slot; "Restore" does
+// the reverse (and live-patches g_gb.cartRam if the game is running);
+// "Delete" removes the slot .sav and its .ts.
+// =============================================================================
+class SaveDataSlotActionGui : public tsl::Gui {
+    std::string m_rom_path;
+    std::string m_display_name;
+    int         m_slot;
+public:
+    SaveDataSlotActionGui(std::string romPath, std::string displayName, int slot)
+        : m_rom_path(std::move(romPath))
+        , m_display_name(std::move(displayName))
+        , m_slot(slot)
+    {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        const std::string slotLabel =
+            "Slot " + std::to_string(m_slot) + " " + ult::DIVIDER_SYMBOL + " " + m_display_name;
+        list->addItem(new tsl::elm::CategoryHeader(slotLabel));
+
+        const std::string& romPath     = m_rom_path;
+        const std::string& displayName = m_display_name;
+        const int slot = m_slot;
+
+        // ── Backup ────────────────────────────────────────────────────────────
+        auto* backupItem = new tsl::elm::ListItem("Backup");
+        backupItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerNavigationFeedback();
+            if (backup_save_data_slot(romPath.c_str(), slot)) {
+                show_notify("Save data backed up.");
+                char label[16];
+                snprintf(label, sizeof(label), "Slot %d", slot);
+                tsl::swapTo<SaveDataGui>(romPath, displayName, std::string(label));
+            } else {
+                show_notify("No save data found.");
+            }
+            return true;
+        });
+        list->addItem(backupItem);
+
+        // ── Restore ───────────────────────────────────────────────────────────
+        auto* restoreItem = new tsl::elm::ListItem("Restore");
+        restoreItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerNavigationFeedback();
+            // Verify the slot exists first.
+            char slotPath[640] = {};
+            build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            if (!ult::isFile(std::string(slotPath))) { show_notify("Slot is empty."); return true; }
+            if (!restore_save_data_slot(romPath.c_str(), slot)) {
+                show_notify("Restore failed.");
+                return true;
+            }
+            show_notify("Save data restored.");
+            char label[16];
+            snprintf(label, sizeof(label), "Slot %d", slot);
+            tsl::swapTo<SaveDataGui>(romPath, displayName, std::string(label));
+            return true;
+        });
+        list->addItem(restoreItem);
+
+        // ── Delete ────────────────────────────────────────────────────────────
+        auto* deleteItem = new tsl::elm::ListItem("Delete");
+        deleteItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerNavigationFeedback();
+            char slotPath[640] = {};
+            build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            if (!ult::isFile(std::string(slotPath))) { show_notify("Slot is empty."); return true; }
+            ult::deleteFileOrDirectory(std::string(slotPath));
+            char tsPath[640] = {};
+            build_save_backup_slot_ts_path(romPath.c_str(), slot, tsPath, sizeof(tsPath));
+            ult::deleteFileOrDirectory(std::string(tsPath));
+            show_notify("Slot deleted.");
+            char label[16];
+            snprintf(label, sizeof(label), "Slot %d", slot);
+            tsl::swapTo<SaveDataGui>(romPath, displayName, std::string(label));
+            return true;
+        });
+        list->addItem(deleteItem);
+
+        auto* frame = new UltraGBOverlayFrame("", "");
+        frame->setContent(list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            triggerExitFeedback();
+            tsl::swapTo<SaveDataGui>(m_rom_path, m_display_name);
+            return true;
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// SaveDataGui — 10 save-data backup slots
+//
+// Each slot shows a timestamp footer (ult::OPTION_SYMBOL if empty).
+// Clicking a slot opens SaveDataSlotActionGui.
+// B returns to GameConfigGui, jumping to "Save Data".
+// =============================================================================
+class SaveDataGui : public tsl::Gui {
+    std::string m_rom_path;
+    std::string m_display_name;
+    std::string m_jump_to;
+public:
+    SaveDataGui(std::string romPath, std::string displayName, std::string jumpTo = "")
+        : m_rom_path(std::move(romPath))
+        , m_display_name(std::move(displayName))
+        , m_jump_to(std::move(jumpTo))
+    {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        list->addItem(new tsl::elm::CategoryHeader(
+            "Save Data " + ult::DIVIDER_SYMBOL + " " + m_display_name));
+
+        const std::string romPath     = m_rom_path;
+        const std::string displayName = m_display_name;
+
+        for (int i = 0; i < 10; ++i) {
+            char ts[48] = {};
+            read_save_backup_timestamp(romPath.c_str(), i, ts, sizeof(ts));
+
+            char label[16];
+            snprintf(label, sizeof(label), "Slot %d", i);
+
+            auto* item = new tsl::elm::MiniListItem(label, ts);
+            const int slot = i;
+            item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                tsl::swapTo<SaveDataSlotActionGui>(romPath, displayName, slot);
+                return true;
+            });
+            list->addItem(item);
+        }
+
+        if (!m_jump_to.empty())
+            list->jumpToItem(m_jump_to, "", true);
+
+        auto* frame = new UltraGBOverlayFrame("", "");
+        frame->setContent(list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            triggerExitFeedback();
+            tsl::swapTo<GameConfigGui>(m_rom_path, m_display_name, std::string("Save Data"));
             return true;
         }
         return false;
@@ -1934,7 +2274,8 @@ public:
 // Opened by pressing Y on a ROM entry in RomSelectorGui.
 //
 // Items shown:
-//   • "Pallet Mode" — cycling (GBC → DMG → Native) for DMG games; read-only "GBC" for GBC games
+//   • "Pallet Mode" — cycling (GBC → DMG → Native) for DMG and CGB-compatible games;
+//                    read-only "GBC" for CGB-only games (0xC0 header flag)
 //   • "Save States" — opens SaveStatesGui with 10 named slots
 //   • "Reset"       — cold-boots the game (deletes internal state first)
 //
@@ -1958,7 +2299,6 @@ public:
         // Header: "GAMENAME"
         list->addItem(new tsl::elm::CategoryHeader(m_display_name));
 
-        const bool isCgb = rom_has_cgb_flag(m_rom_path.c_str());
         const std::string romPath     = m_rom_path;
         const std::string displayName = m_display_name;
 
@@ -1973,6 +2313,17 @@ public:
         });
         list->addItem(statesItem);
 
+        // ── Save Data ─────────────────────────────────────────────────────
+        auto* saveDataItem = new tsl::elm::ListItem("Save Data");
+        saveDataItem->setValue(ult::DROPDOWN_SYMBOL);
+        saveDataItem->setClickListener([romPath, displayName](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerEnterFeedback();
+            tsl::swapTo<SaveDataGui>(romPath, displayName);
+            return true;
+        });
+        list->addItem(saveDataItem);
+
         // ── Reset (cold boot) ─────────────────────────────────────────────
         auto* resetItem = new tsl::elm::ListItem("Reset");
         resetItem->setClickListener([romPath](u64 keys) -> bool {
@@ -1982,7 +2333,7 @@ public:
             char internalPath[256] = {};
             build_rom_data_path(romPath.c_str(), internalPath, sizeof(internalPath),
                                 INTERNAL_STATE_DIR, ".state");
-            remove(internalPath);
+            ult::deleteFileOrDirectory(std::string(internalPath));
             // Launch the game — no state file means cold boot
             if (ult::useSoundEffects && !ult::limitedMemory)
                 ult::Audio::exit();
@@ -1998,21 +2349,15 @@ public:
         list->addItem(new tsl::elm::CategoryHeader("Display"));
 
 
+        // isCgbOnly is no longer needed — all CGB games (0x80 and 0xC0) support
+        // user-selected palettes via luminance-mapped output. Removed.
+
         // ── Pallet Mode ───────────────────────────────────────────────────
-        // Always shown so the user can see which palette is active.
-        // GBC games are locked to "GBC" hardware colour — clicking does nothing.
-        // DMG games cycle through GBC → DMG → Native on each A press.
-        if (isCgb) {
-            auto* palItem = new tsl::elm::ListItem("Pallet Mode", "GBC");
-            palItem->setValueColor(tsl::offTextColor);
-            palItem->setClickListener([](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                // GBC games always use hardware colour; mode is not configurable.
-                show_notify("Only supports GBC pallet.");
-                return true;
-            });
-            list->addItem(palItem);
-        } else {
+        // All games cycle GBC → DMG → Native on each A press and apply live.
+        // Pure DMG games use the flat-palette path (cgbMode=0, always prepacked).
+        // CGB games (both 0x80 compat and 0xC0 only) stay in cgbMode=1; the
+        // renderer reads fixPalette[px], computes luminance, and maps to shade.
+        {
             const PaletteMode current = load_game_palette_mode(romPath.c_str());
             const char* modeLabel = palette_mode_label(current);
 
@@ -2021,17 +2366,28 @@ public:
                 if (!(keys & KEY_A)) return false;
                 // Cycle to the next mode, save, then update the item value in-place.
                 // No swapTo needed — setValue() redraws the label immediately.
-                const PaletteMode cur  = load_game_palette_mode(romPath.c_str());
-                const PaletteMode next = next_palette_mode(cur);
+                const PaletteMode next = next_palette_mode(
+                    load_game_palette_mode(romPath.c_str()));
                 save_game_palette_mode(romPath.c_str(), next);
-                // Apply live if this ROM is currently loaded
+                // Live-apply if this ROM is currently loaded (paused in background).
+                // All palette transitions are safe without a restart:
+                //   • Pure DMG games:  cgbMode=0, always prepacked. Just rebake palette.
+                //   • All CGB games:   cgbMode=1. Renderer flags follow the palette
+                //                      (GBC → rgb565=true/prepacked=false;
+                //                       DMG/Native → rgb565=false/prepacked=true).
+                //                      gb_lcd_draw_line picks the correct branch on
+                //                      the very next scanline — no restart needed.
                 if (g_gb.rom &&
-                    strncmp(g_gb.romPath, romPath.c_str(), sizeof(g_gb.romPath)) == 0 &&
-                    !g_fb_is_rgb565) {
-                    g_palette_mode = next;
-                    gb_select_dmg_palette();
+                    strncmp(g_gb.romPath, romPath.c_str(), sizeof(g_gb.romPath)) == 0) {
+                    g_palette_mode    = next;
+                    // Recalculate renderer flags. cgbMode stays 1 for all CGB games;
+                    // we redirect between the rgb565 and prepacked output paths only.
+                    const bool cgbCore = (g_gb.gb.cgb.cgbMode != 0);
+                    g_fb_is_rgb565    = cgbCore && (next == PaletteMode::GBC);
+                    g_fb_is_prepacked = !g_fb_is_rgb565;
+                    gb_select_dmg_palette();  // rebakes g_dmg_flat_pal for new mode
+                    reset_lcd_ghosting();     // flush ghosting buffer on format switch
                 }
-                //triggerNavigationFeedback();
                 palItem->setValue(palette_mode_label(next));
                 return true;
             });
@@ -2479,12 +2835,19 @@ public:
         tsl::overrideBackButton = true;
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_DIR);
+        ult::createDirectory(INTERNAL_SAVE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
         ult::createDirectory(INTERNAL_STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
         load_config();
         write_default_config_if_missing();
         ult::createDirectory(g_rom_dir);
+
+        // Migrate legacy .sav files from saves/ root → saves/internal/
+        // Runs once after the first update; files that already exist in the
+        // destination are skipped automatically by moveFilesOrDirectoriesByPattern.
+        //ult::moveFilesOrDirectoriesByPattern(std::string(SAVE_DIR) + "*.sav",
+        //                                     INTERNAL_SAVE_DIR);
     }
 
     virtual void exitServices() override {
