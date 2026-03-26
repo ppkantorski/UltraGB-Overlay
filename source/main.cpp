@@ -27,6 +27,7 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <ctime>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -38,9 +39,11 @@ using namespace ult;
 // =============================================================================
 static constexpr const char* CONFIG_DIR  = "sdmc:/config/ultragb/";
 static constexpr const char* CONFIG_FILE = "sdmc:/config/ultragb/config.ini";
-static constexpr const char* SAVE_DIR    = "sdmc:/config/ultragb/saves/";
-static constexpr const char* STATE_DIR    = "sdmc:/config/ultragb/states/";
-static constexpr const char* CONFIGURE_DIR = "sdmc:/config/ultragb/configure/";
+static constexpr const char* SAVE_DIR          = "sdmc:/config/ultragb/saves/";
+static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
+static constexpr const char* INTERNAL_STATE_DIR = "sdmc:/config/ultragb/states/internal/";
+static constexpr const char* STATE_DIR         = INTERNAL_STATE_DIR; // alias — internal quick-resume
+static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
 static char g_rom_dir[256]       = "sdmc:/roms/gb/";
 static char g_last_rom_path[256]    = {};   // basename of last-played ROM, persisted to config.ini
 static char g_pending_rom_path[256] = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
@@ -148,8 +151,8 @@ static const char* vol_to_str(u8 v, char (&buf)[4]) {
 //   DMG    – classic green Game Boy LCD tint
 //   Native – true greyscale, no colour tint at all
 //
-// Only meaningful for true DMG ROMs (header byte 0x143 bit7 clear).
-// CGB ROMs always use hardware colour regardless of this setting.
+// Only meaningful for true DMG Games (header byte 0x143 bit7 clear).
+// CGB Games always use hardware colour regardless of this setting.
 // =============================================================================
 
 // Peek at ROM header byte 0x143 to determine CGB support without loading the ROM.
@@ -180,10 +183,10 @@ static const char* palette_mode_to_str(PaletteMode m) {
 }
 
 static PaletteMode str_to_palette_mode(const std::string& s) {
-    if (s == "SGB")    return PaletteMode::SGB;
     if (s == "DMG")    return PaletteMode::DMG;
     if (s == "Native") return PaletteMode::NATIVE;
-    return PaletteMode::GBC;  // default (empty or "GBC")
+    // SGB is no longer exposed in the UI; treat legacy configs as GBC
+    return PaletteMode::GBC;  // default (empty, "GBC", or legacy "SGB")
 }
 
 static PaletteMode load_game_palette_mode(const char* romPath) {
@@ -198,6 +201,26 @@ static void save_game_palette_mode(const char* romPath, PaletteMode m) {
     build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
     ult::createDirectory(CONFIGURE_DIR);
     ult::setIniFileValue(cfgPath, "config", "palette_mode", palette_mode_to_str(m), "");
+}
+
+// ── Palette cycling helpers ───────────────────────────────────────────────────
+// Cycles through the three UI-exposed modes (SGB intentionally excluded).
+static PaletteMode next_palette_mode(PaletteMode current) {
+    switch (current) {
+        case PaletteMode::GBC:    return PaletteMode::DMG;
+        case PaletteMode::DMG:    return PaletteMode::NATIVE;
+        case PaletteMode::NATIVE: return PaletteMode::GBC;
+        default:                  return PaletteMode::GBC;
+    }
+}
+
+// Short user-facing label for the three exposed modes.
+static const char* palette_mode_label(PaletteMode m) {
+    switch (m) {
+        case PaletteMode::DMG:    return "DMG";
+        case PaletteMode::NATIVE: return "Native";
+        default:                  return "GBC";
+    }
 }
 
 
@@ -490,8 +513,116 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
 }
 
 // =============================================================================
-// Load-path helpers (used by gb_load_rom and gb_unload_rom)
+// User save-state helpers  (10 named slots per game)
+//
+// Layout on SD card:
+//   Internal (quick-resume):  sdmc:/config/ultragb/states/internal/<name>.state
+//   User slots:               sdmc:/config/ultragb/states/<name>/slot_N.state
+//                             sdmc:/config/ultragb/states/<name>/slot_N.ts
+//
+// The .ts file stores a human-readable timestamp written when the slot is saved.
+// If absent the slot is considered empty and the footer shows ult::OPTION_SYMBOL.c_str().
 // =============================================================================
+
+// Build the per-game user-state directory: <STATE_BASE_DIR><gamename>/
+static void build_user_state_dir(const char* romPath, char* out, size_t outSz) {
+    const char* sl   = strrchr(romPath, '/');
+    const char* base = sl ? sl + 1 : romPath;
+    char bn[256] = {};
+    strncpy(bn, base, sizeof(bn) - 1);
+    char* dot = strrchr(bn, '.');
+    if (dot) *dot = '\0';
+    snprintf(out, outSz, "%s%s/", STATE_BASE_DIR, bn);
+}
+
+// Full path to a user slot state file.
+static void build_user_slot_path(const char* romPath, int slot, char* out, size_t outSz) {
+    char dir[512] = {};
+    build_user_state_dir(romPath, dir, sizeof(dir));
+    snprintf(out, outSz, "%sslot_%d.state", dir, slot);
+}
+
+// Full path to a user slot timestamp file.
+static void build_user_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz) {
+    char dir[512] = {};
+    build_user_state_dir(romPath, dir, sizeof(dir));
+    snprintf(out, outSz, "%sslot_%d.ts", dir, slot);
+}
+
+// Write current wall-clock time to the slot's .ts file.
+static void write_slot_timestamp(const char* romPath, int slot) {
+    char tsPath[640] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    FILE* f = fopen(tsPath, "w");
+    if (!f) return;
+    time_t t = time(nullptr);
+    struct tm* ti = localtime(&t);
+    char buf[32] = {};
+    strftime(buf, sizeof(buf), "%Y-%m-%d  %H:%M", ti);
+    fwrite(buf, 1, strlen(buf), f);
+    fclose(f);
+}
+
+// Read the .ts file into out; fills ult::OPTION_SYMBOL.c_str() if absent or empty.
+static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
+    char tsPath[640] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    FILE* f = fopen(tsPath, "r");
+    if (!f) { strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1); out[outSz - 1] = '\0'; return; }
+    size_t n = fread(out, 1, outSz - 1, f);
+    out[n] = '\0';
+    fclose(f);
+    if (!out[0]) strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1);
+}
+
+// Copy a file from src_path to dst_path.  Returns true on success.
+static bool copy_file(const char* srcPath, const char* dstPath) {
+    FILE* src = fopen(srcPath, "rb");
+    if (!src) return false;
+    FILE* dst = fopen(dstPath, "wb");
+    if (!dst) { fclose(src); return false; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+        fwrite(buf, 1, n, dst);
+    fclose(src);
+    fclose(dst);
+    return true;
+}
+
+// Save the current internal quick-resume state to user slot N.
+// Returns false if the internal state file doesn't exist (game not yet played).
+static bool save_user_slot(const char* romPath, int slot) {
+    char internalPath[256] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
+
+    // Ensure per-game directory exists before writing
+    char dir[512] = {};
+    build_user_state_dir(romPath, dir, sizeof(dir));
+    mkdir(dir, 0777);
+
+    char slotPath[640] = {};
+    build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+
+    if (!copy_file(internalPath, slotPath)) return false;
+    write_slot_timestamp(romPath, slot);
+    return true;
+}
+
+// Load user slot N into the internal quick-resume state file.
+// Returns false if the slot file doesn't exist.
+// Caller is responsible for launching the game after a successful load.
+static bool load_user_slot(const char* romPath, int slot) {
+    char slotPath[640] = {};
+    build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+
+    char internalPath[256] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
+
+    return copy_file(slotPath, internalPath);
+}
+
+
 
 // Post a notification banner.  The null-check and string concatenation is
 // duplicated at every call site — one helper eliminates five copies of the
@@ -1210,6 +1341,8 @@ public:
 class RomSelectorGui; // forward declare
 class GameConfigGui;  // forward declare
 class SettingsGui;    // forward declare
+class SaveStatesGui;  // forward declare
+class SlotActionGui;  // forward declare
 // =============================================================================
 // GBEmulatorGui — input handled at the Gui level (same pattern as TetrisGui)
 // =============================================================================
@@ -1456,76 +1589,81 @@ public:
 };
 
 // =============================================================================
-// GameConfigGui — per-game palette mode selector
+// SlotActionGui — Save / Load for a single user save-state slot
 //
-// Opened by pressing Y on a ROM entry in RomSelectorGui.  The user picks the
-// DMG palette emulation style; the choice is persisted to:
-//   sdmc:/config/ultragb/configure/<filename>.ini
-//
-// Selecting a mode or pressing B immediately swaps back to RomSelectorGui.
-// No state is held after the swap — the old Gui (frame + list) is deleted by
-// swapTo before the new one is constructed.
-//
-// Only meaningful for true DMG ROMs.  CGB ROMs (header byte 0x143 bit7 set)
-// always use hardware colour; we show an informational note in that case.
+// Opened by clicking a slot in SaveStatesGui.
+// Save  — copies internal quick-resume state → slot file + writes timestamp.
+// Load  — copies slot file → internal state, then cold-boots into the game
+//         (gb_load_rom will find the state and resume from it).
+// B     — returns to SaveStatesGui, jumping back to the clicked slot item.
 // =============================================================================
-class GameConfigGui : public tsl::Gui {
+class SlotActionGui : public tsl::Gui {
     std::string m_rom_path;
     std::string m_display_name;
+    int         m_slot;
 public:
-    GameConfigGui(std::string romPath, std::string displayName)
+    SlotActionGui(std::string romPath, std::string displayName, int slot)
         : m_rom_path(std::move(romPath))
         , m_display_name(std::move(displayName))
+        , m_slot(slot)
     {}
-
-    // No destructor needed: Tesla deletes m_topElement (frame) →
-    // ~UltraGBOverlayFrame deletes m_contentElement (list) → ~List deletes items.
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
 
-        list->addItem(new tsl::elm::CategoryHeader(
-            m_display_name + " " + ult::DIVIDER_SYMBOL + "  Palette"));
+        // Slot sub-header
+        const std::string slotLabel = "Slot " + std::to_string(m_slot) + " " + ult::DIVIDER_SYMBOL + " " + m_display_name;
+        list->addItem(new tsl::elm::CategoryHeader(slotLabel));
 
-        const bool isCgb = rom_has_cgb_flag(m_rom_path.c_str());
-        const PaletteMode current = isCgb ? PaletteMode::GBC
-                                           : load_game_palette_mode(m_rom_path.c_str());
+        const std::string& romPath = m_rom_path;
+        const std::string& displayName = m_display_name;
+        const int slot = m_slot;
 
-        if (isCgb) {
-            // CGB ROMs use hardware colour — palette mode has no effect.
-            static char kCgbMsg[] =
-                "CGB ROM — hardware colour\nalways used.";
-            auto* info = new tsl::elm::CustomDrawer(
-                [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
-                    r->drawString(kCgbMsg, false, x + 16, y + 30, 16,
-                                  tsl::Color{0x8, 0x8, 0x8, 0xF});
-                });
-            list->addItem(info, 80);
-        } else {
-            static const struct { const char* label; PaletteMode mode; } kModes[] = {
-                { "GBC",    PaletteMode::GBC    },
-                { "SGB",    PaletteMode::SGB    },
-                { "DMG",    PaletteMode::DMG    },
-                { "Native", PaletteMode::NATIVE },
-            };
-            for (const auto& entry : kModes) {
-                const bool selected = (entry.mode == current);
-                auto* item = new tsl::elm::MiniListItem(
-                    entry.label, selected ? ult::CHECKMARK_SYMBOL : "");
-                const std::string romPath = m_rom_path;
-                const PaletteMode mode   = entry.mode;
-                item->setClickListener([romPath, mode](u64 keys) -> bool {
-                    if (!(keys & KEY_A)) return false;
-                    save_game_palette_mode(romPath.c_str(), mode);
-                    triggerNavigationFeedback();
-                    tsl::swapTo<RomSelectorGui>();
-                    return true;
-                });
-                list->addItem(item);
+        // ── Save ──────────────────────────────────────────────────────────────
+        auto* saveItem = new tsl::elm::ListItem("Save");
+        saveItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerNavigationFeedback();
+            if (save_user_slot(romPath.c_str(), slot)) {
+                show_notify("State saved.");
+                // Return to SaveStatesGui, jumping back to the correct slot item
+                tsl::swapTo<SaveStatesGui>(romPath, displayName);
+            } else {
+                show_notify("No state to save yet.");
             }
-        }
+            return true;
+        });
+        list->addItem(saveItem);
 
-        // No page navigation: this is a sub-screen, not a left/right page.
+        // ── Load ──────────────────────────────────────────────────────────────
+        auto* loadItem = new tsl::elm::ListItem("Load");
+        loadItem->setClickListener([romPath, slot](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerNavigationFeedback();
+            // Check if slot file exists first
+            char slotPath[640] = {};
+            build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            FILE* chk = fopen(slotPath, "rb");
+            if (!chk) {
+                show_notify("Slot is empty.");
+                return true;
+            }
+            fclose(chk);
+            // Copy slot → internal state
+            if (!load_user_slot(romPath.c_str(), slot)) {
+                show_notify("Load failed.");
+                return true;
+            }
+            // Launch the game — gb_load_rom will find the internal state and resume
+            if (ult::useSoundEffects && !ult::limitedMemory)
+                ult::Audio::exit();
+            strncpy(g_pending_rom_path, romPath.c_str(), sizeof(g_pending_rom_path) - 1);
+            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+            tsl::swapTo<GBEmulatorGui>();
+            return true;
+        });
+        list->addItem(loadItem);
+
         auto* frame = new UltraGBOverlayFrame("", "");
         frame->setContent(list);
         return frame;
@@ -1537,7 +1675,191 @@ public:
                              HidAnalogStickState rightJoy) override {
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
-            triggerNavigationFeedback();
+            triggerExitFeedback();
+            // Return to SaveStatesGui, jumping back to the correct slot item
+            tsl::swapTo<SaveStatesGui>(m_rom_path, m_display_name);
+            return true;
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// SaveStatesGui — 10 user save-state slots
+//
+// Each slot shows a timestamp footer (ult::OPTION_SYMBOL.c_str() if empty).
+// Clicking a slot opens SlotActionGui.
+// B returns to GameConfigGui, jumping to "Save States".
+// =============================================================================
+class SaveStatesGui : public tsl::Gui {
+    std::string m_rom_path;
+    std::string m_display_name;
+    std::string m_jump_to;   // item label to restore scroll position on re-entry
+public:
+    SaveStatesGui(std::string romPath, std::string displayName, std::string jumpTo = "")
+        : m_rom_path(std::move(romPath))
+        , m_display_name(std::move(displayName))
+        , m_jump_to(std::move(jumpTo))
+    {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        list->addItem(new tsl::elm::CategoryHeader("Save States "+ ult::DIVIDER_SYMBOL + " " + m_display_name));
+
+        const std::string romPath      = m_rom_path;
+        const std::string displayName  = m_display_name;
+
+        for (int i = 0; i < 10; ++i) {
+            char ts[48] = {};
+            read_slot_timestamp(romPath.c_str(), i, ts, sizeof(ts));
+
+            char label[16];
+            snprintf(label, sizeof(label), "Slot %d", i);
+
+            auto* item = new tsl::elm::MiniListItem(label, ts);
+            const int slot = i;
+            item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                tsl::swapTo<SlotActionGui>(romPath, displayName, slot);
+                return true;
+            });
+            list->addItem(item);
+        }
+
+        // Restore scroll position when returning from SlotActionGui
+        if (!m_jump_to.empty())
+            list->jumpToItem(m_jump_to, "", true);
+
+        auto* frame = new UltraGBOverlayFrame("", "");
+        frame->setContent(list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            triggerExitFeedback();
+            tsl::swapTo<GameConfigGui>(m_rom_path, m_display_name, std::string("Save States"));
+            return true;
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// GameConfigGui — per-game configuration screen
+//
+// Opened by pressing Y on a ROM entry in RomSelectorGui.
+//
+// Items shown:
+//   • "Color Pallet" (DMG Games only) — single cycling item (GBC → DMG → Native)
+//   • "Save States" — opens SaveStatesGui with 10 named slots
+//   • "Reset"       — cold-boots the game (deletes internal state first)
+//
+// Header: "Configure ◆ <GAMENAME>"
+// B returns to RomSelectorGui.
+// =============================================================================
+class GameConfigGui : public tsl::Gui {
+    std::string m_rom_path;
+    std::string m_display_name;
+    std::string m_jump_to;   // item label to restore scroll on re-entry
+public:
+    GameConfigGui(std::string romPath, std::string displayName, std::string jumpTo = "")
+        : m_rom_path(std::move(romPath))
+        , m_display_name(std::move(displayName))
+        , m_jump_to(std::move(jumpTo))
+    {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        // Header: "Configure ◆ GAMENAME"
+        list->addItem(new tsl::elm::CategoryHeader(
+            "Configure " + ult::DIVIDER_SYMBOL + " " + m_display_name));
+
+        const bool isCgb = rom_has_cgb_flag(m_rom_path.c_str());
+        const std::string romPath     = m_rom_path;
+        const std::string displayName = m_display_name;
+
+        // ── Color Pallet (DMG only) ─────────────────────────────────────────
+        if (!isCgb) {
+            const PaletteMode current = load_game_palette_mode(romPath.c_str());
+            const char* modeLabel = palette_mode_label(current);
+
+            auto* palItem = new tsl::elm::ListItem("Color Pallet", modeLabel);
+            palItem->setClickListener([romPath, displayName](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                // Cycle to the next mode, save, then re-open GameConfigGui
+                // so the footer label updates immediately.
+                const PaletteMode cur  = load_game_palette_mode(romPath.c_str());
+                const PaletteMode next = next_palette_mode(cur);
+                save_game_palette_mode(romPath.c_str(), next);
+                // Apply live if this ROM is currently loaded
+                if (g_gb.rom &&
+                    strncmp(g_gb.romPath, romPath.c_str(), sizeof(g_gb.romPath)) == 0 &&
+                    !g_fb_is_rgb565) {
+                    g_palette_mode = next;
+                    gb_select_dmg_palette();
+                }
+                //triggerEnterFeedback();
+                tsl::swapTo<GameConfigGui>(romPath, displayName, std::string("Color Pallet"));
+                return true;
+            });
+            list->addItem(palItem);
+        }
+
+        // ── Save States ───────────────────────────────────────────────────
+        auto* statesItem = new tsl::elm::ListItem("Save States");
+        statesItem->setValue(ult::DROPDOWN_SYMBOL);
+        statesItem->setClickListener([romPath, displayName](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            triggerEnterFeedback();
+            tsl::swapTo<SaveStatesGui>(romPath, displayName);
+            return true;
+        });
+        list->addItem(statesItem);
+
+        // ── Reset (cold boot) ─────────────────────────────────────────────
+        auto* resetItem = new tsl::elm::ListItem("Reset");
+        resetItem->setClickListener([romPath](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            
+            // Delete the internal quick-resume state so gb_load_rom cold-boots
+            char internalPath[256] = {};
+            build_rom_data_path(romPath.c_str(), internalPath, sizeof(internalPath),
+                                INTERNAL_STATE_DIR, ".state");
+            remove(internalPath);
+            // Launch the game — no state file means cold boot
+            if (ult::useSoundEffects && !ult::limitedMemory)
+                ult::Audio::exit();
+            strncpy(g_pending_rom_path, romPath.c_str(), sizeof(g_pending_rom_path) - 1);
+            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+            triggerEnterFeedback();
+            tsl::swapTo<GBEmulatorGui>();
+            return true;
+        });
+        list->addItem(resetItem);
+
+        // Restore scroll position when returning from a sub-screen
+        if (!m_jump_to.empty())
+            list->jumpToItem(m_jump_to, "", true);
+
+        auto* frame = new UltraGBOverlayFrame("", "");
+        frame->setContent(list);
+        return frame;
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>();
             return true;
         }
@@ -1614,27 +1936,6 @@ public:
         // ── Display ───────────────────────────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader("Display"));
 
-        // LCD Ghosting — disabled with a warning on the 4 MB memory tier.
-        if (ult::limitedMemory) {
-            auto* ghost_item = new tsl::elm::MiniListItem("LCD Ghosting", ult::OFF);
-            ghost_item->setTextColor(tsl::warningTextColor);
-            ghost_item->setClickListener([](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                show_notify("Requires at least 6MB.");
-                triggerNavigationFeedback();
-                return true;
-            });
-            list->addItem(ghost_item);
-        } else {
-            auto* ghost_item = new tsl::elm::MiniToggleListItem("LCD Ghosting", g_lcd_ghosting);
-            ghost_item->setStateChangedListener([](bool state) {
-                g_lcd_ghosting = state;
-                reset_lcd_ghosting();  // flush prev-frame buffer on toggle
-                ult::setIniFileValue(kConfigFile, "config", "lcd_ghosting",
-                                     state ? "1" : "0", "");
-            });
-            list->addItem(ghost_item);
-        }
 
         // Pixel Perfect — mirrors the in-game screen-tap / RS-click toggle,
         // but accessible from the settings page as a persistent global choice.
@@ -1644,16 +1945,40 @@ public:
         // the toggle item's internal state before calling this listener, so calling
         // toggle_vp_scale() would double-flip g_vp_2x back to its original value
         // while the LUTs rebuild at the wrong scale.
-        auto* pp_item = new tsl::elm::MiniToggleListItem("Pixel Perfect", g_vp_2x);
+        auto* pp_item = new tsl::elm::ToggleListItem("Pixel Perfect", g_vp_2x);
         pp_item->setStateChangedListener([](bool state) {
             set_vp_scale(state);
             save_pixel_perfect();
         });
         list->addItem(pp_item);
 
-        // Footer: left-arrow "ROMs" button.
+
+        // LCD Ghosting — disabled with a warning on the 4 MB memory tier.
+        if (ult::limitedMemory) {
+            auto* ghost_item = new tsl::elm::ListItem("LCD Ghosting", ult::OFF);
+            ghost_item->setTextColor(tsl::warningTextColor);
+            ghost_item->setValueColor(tsl::offTextColor);
+            ghost_item->setClickListener([](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                show_notify("Requires at least 6MB.");
+                triggerNavigationFeedback();
+                return true;
+            });
+            list->addItem(ghost_item);
+        } else {
+            auto* ghost_item = new tsl::elm::ToggleListItem("LCD Ghosting", g_lcd_ghosting);
+            ghost_item->setStateChangedListener([](bool state) {
+                g_lcd_ghosting = state;
+                reset_lcd_ghosting();  // flush prev-frame buffer on toggle
+                ult::setIniFileValue(kConfigFile, "config", "lcd_ghosting",
+                                     state ? "1" : "0", "");
+            });
+            list->addItem(ghost_item);
+        }
+
+        // Footer: left-arrow "Games" button.
         // frame takes ownership of list; Tesla takes ownership of frame.
-        auto* frame = new UltraGBOverlayFrame("ROMs", "");
+        auto* frame = new UltraGBOverlayFrame("Games", "");
         frame->setContent(list);
         return frame;
     }
@@ -1665,7 +1990,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
 
         // simulatedNextPage fires when the user taps the footer page button.
-        // On the Settings page the footer shows left-arrow "ROMs", so treat
+        // On the Settings page the footer shows left-arrow "Games", so treat
         // simulatedNext as "go left" — same as KEY_DLEFT.
         const bool simulatedNext = ult::simulatedNextPage.exchange(
             false, std::memory_order_acq_rel);
@@ -1719,7 +2044,7 @@ public:
         // ── ROM list ─────────────────────────────────────────────────────
         auto* list = new tsl::elm::List();
         list->addItem(new tsl::elm::CategoryHeader(
-            "ROMs " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure"));
+            "GB/GBC Games " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure"));
 
         // ── ROM list via scandir — no std::vector, no full-path string per entry ──
         // scandir returns a sorted dirent**; each entry is freed immediately after use.
@@ -1827,7 +2152,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
 
         // simulatedNextPage fires when the user taps the footer page button.
-        // On the ROMs page the footer shows right-arrow "Settings".
+        // On the Games page the footer shows right-arrow "Settings".
         const bool simulatedNext = ult::simulatedNextPage.exchange(
             false, std::memory_order_acq_rel);
         const bool sliderActive = ult::allowSlide.load(std::memory_order_acquire);
@@ -1859,7 +2184,8 @@ public:
         tsl::overrideBackButton = true;
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_DIR);
-        ult::createDirectory(STATE_DIR);
+        ult::createDirectory(STATE_BASE_DIR);
+        ult::createDirectory(INTERNAL_STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
         load_config();
         write_default_config_if_missing();
