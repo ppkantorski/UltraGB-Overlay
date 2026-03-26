@@ -56,17 +56,21 @@ inline int vp_h() { return g_vp_2x ? 288 : VP_H; }
 // Both converters produce a=0xF (fully opaque).
 
 inline uint16_t rgb555_to_packed(const uint16_t c) {
-    const uint8_t r = ( c        & 0x1F) >> 1;
-    const uint8_t g = ((c >>  5) & 0x1F) >> 1;
-    const uint8_t b = ((c >> 10) & 0x1F) >> 1;
-    return static_cast<uint16_t>(r | (g << 4) | (b << 8) | 0xF000u);
+    return static_cast<uint16_t>(
+        ((c >> 1) & 0x000F) |
+        ((c >> 2) & 0x00F0) |
+        ((c >> 3) & 0x0F00) |
+        0xF000u
+    );
 }
 
 inline uint16_t rgb565_to_packed(const uint16_t c) {
-    const uint8_t r = (c >> 12) & 0xF;
-    const uint8_t g = (c >>  7) & 0xF;
-    const uint8_t b = (c >>  1) & 0xF;
-    return static_cast<uint16_t>(r | (g << 4) | (b << 8) | 0xF000u);
+    return static_cast<uint16_t>(
+        ((c >> 12) & 0x000F) |  // R: bits 15..12 -> 3..0
+        ((c >>  3) & 0x00F0) |  // G: bits 10..7  -> 7..4
+        ((c <<  7) & 0x0F00) |  // B: bits 4..1   -> 11..8
+        0xF000u
+    );
 }
 
 // tsl::Color versions retained for border drawing
@@ -458,27 +462,23 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
     const bool is565 = g_fb_is_rgb565;
 
     if (!ult::expandedMemory) {
-        // Single-threaded path (low-memory devices)
         render_gb_screen_chunk(renderer, is565, 0, GB_H);
         return;
     }
 
-    // Multi-threaded path: divide GB source rows across the global thread pool.
-    // GB_H=144 rows, each thread gets an equal slice.  The last thread absorbs
-    // any remainder so every row is covered with no overlap.
-    const int numThreads  = static_cast<int>(ult::numThreads);
-    const int chunkSize   = std::max(1, GB_H / numThreads);
+    const int numThreads = static_cast<int>(ult::numThreads); // should be 4
+    const int chunkSize  = (GB_H + numThreads - 1) / numThreads; // ceil divide
 
     for (int i = 0; i < numThreads; ++i) {
         const int sy_start = i * chunkSize;
-        const int sy_end   = (i == numThreads - 1) ? GB_H : sy_start + chunkSize;
-        if (sy_start >= GB_H) {
-            ult::renderThreads[i] = std::thread([](){});
-            continue;
-        }
-        ult::renderThreads[i] = std::thread(render_gb_screen_chunk,
-                                             renderer, is565, sy_start, sy_end);
+        const int sy_end   = std::min(sy_start + chunkSize, GB_H);
+
+        ult::renderThreads[i] = std::thread(
+            render_gb_screen_chunk,
+            renderer, is565, sy_start, sy_end
+        );
     }
+
     for (auto& t : ult::renderThreads)
         t.join();
 }
@@ -498,6 +498,22 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
     static constexpr int LOGO_Y    = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1;
 
     static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
+
+    // In DMG or Native palette mode the hardware colour block is absent — show
+    // plain "GAME BOY" only (no rainbow "COLOR" suffix).
+    if (g_palette_mode == PaletteMode::DMG || g_palette_mode == PaletteMode::NATIVE) {
+        static bool measured_plain = false;
+        static u32  w_plain = 0;
+        if (!measured_plain) {
+            w_plain = renderer->getTextDimensions("GAME BOY", false, LOGO_SIZE).first;
+            measured_plain = true;
+        }
+        const int x = static_cast<int>(FB_W / 2 - w_plain / 2);
+        renderer->drawString("GAME BOY", false, x, LOGO_Y, LOGO_SIZE, WHITE);
+        return;
+    }
+
+    // GBC mode — draw "GAME BOY COLOR" with rainbow letters.
     static constexpr tsl::Color C_RED = {0xF, 0x1, 0x1, 0xF};  // C
     static constexpr tsl::Color C_ORA = {0xF, 0x7, 0x0, 0xF};  // O
     static constexpr tsl::Color C_YEL = {0xF, 0xD, 0x0, 0xF};  // L
@@ -549,63 +565,49 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
 // Using a=0xF (fully opaque) instead of the previous a=0xE to allow direct writes.
 // The visual difference over any wallpaper is imperceptible for near-black fills.
 // No-op in 2.5× mode (g_vp_2x == false).
+static inline void fill_letterbox_rect(tsl::gfx::Renderer* renderer,
+                                       const int ox0, const int ox1,
+                                       const int oy0, const int oy1,
+                                       const tsl::Color color) {
+    const int w = ox1 - ox0;
+    const uint32_t* __restrict__ col = s_outer_col_lut + ox0;
+
+    for (int oy = oy0; oy < oy1; ++oy) {
+        const uint32_t row_base = s_outer_row_lut[oy];
+        int ox = 0;
+
+        for (; ox + 7 < w; ox += 8) {
+            renderer->setPixelAtOffset(row_base + col[ox + 0], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 1], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 2], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 3], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 4], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 5], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 6], color);
+            renderer->setPixelAtOffset(row_base + col[ox + 7], color);
+        }
+        for (; ox < w; ++ox)
+            renderer->setPixelAtOffset(row_base + col[ox], color);
+    }
+}
+
 inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
     if (!g_vp_2x) return;
     if (!s_outer_lut_ready) init_outer_lut();
 
-    // RGBA4444 packed: r=2, g=2, b=2, a=0xF  →  0xF222
     static constexpr uint16_t PACKED_LB = 0xE111u;
     const tsl::Color LB_COLOR = renderer->a(PACKED_LB);
 
-    // ix/iy: inner viewport origin relative to outer LUT origin (VP_X/VP_Y).
-    const int ix = vp_x() - VP_X;   // = 40 in 2× mode
-    const int iy = vp_y() - VP_Y;   // = 36 in 2× mode
-    const int iw = vp_w();           // = 320 in 2× mode
-    const int ih = vp_h();           // = 288 in 2× mode
+    // 2× mode inner viewport relative to outer border frame
+    static constexpr int ix = 40;
+    static constexpr int iy = 36;
+    static constexpr int iw = 320;
+    static constexpr int ih = 288;
 
-    // Fill a rectangular strip using the outer swizzle LUTs.
-    // ox/oy are relative to VP_X/VP_Y (outer LUT indices).
-    // 8× unrolled inner loop: independent stores let the CPU pipeline them.
-    const auto fill = [&](const int ox0, const int ox1,
-                          const int oy0, const int oy1) __attribute__((always_inline)) {
-        const int w = ox1 - ox0;
-        for (int oy = oy0; oy < oy1; ++oy) {
-            const uint32_t row_base = s_outer_row_lut[oy];
-            const uint32_t* __restrict__ cl = s_outer_col_lut + ox0;
-            int ox = 0;
-            for (; ox + 7 < w; ox += 8) {
-                renderer->setPixelAtOffset(row_base + cl[ox + 0], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 1], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 2], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 3], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 4], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 5], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 6], LB_COLOR);
-                renderer->setPixelAtOffset(row_base + cl[ox + 7], LB_COLOR);
-            }
-            for (; ox < w; ++ox)
-                renderer->setPixelAtOffset(row_base + cl[ox], LB_COLOR);
-        }
-    };
-
-    // Left strip:   x = [VP_X,          vp_x())          y = [VP_Y, VP_Y+VP_H)
-    fill(0,          ix,                  0,     VP_H);
-    // Right strip:  x = [vp_x()+vp_w(), VP_X+VP_W)       y = [VP_Y, VP_Y+VP_H)
-    fill(ix + iw,    VP_W,                0,     VP_H);
-    // Top strip:    x = [vp_x(),         vp_x()+vp_w())  y = [VP_Y,        vp_y())
-    fill(ix,         ix + iw,             0,     iy);
-    // Bottom strip: x = [vp_x(),         vp_x()+vp_w())  y = [vp_y()+vp_h(), VP_Y+VP_H)
-    fill(ix,         ix + iw,             iy + ih, VP_H);
-
-
-    // Power indicator LED — in the left letterbox strip, slightly above centre,
-    // mimicking where the power light lives on a real GBC.
-    //   x: centre of left strip (VP_X to vp_x()) in absolute coords → VP_X + ix/2
-    //   y: upper third of the full strip height                      → VP_Y + VP_H/3
-    //const int led_cx = VP_X + ix / 2 -2;
-    //const int led_cy = VP_Y + VP_H / 3;
-    //renderer->drawCircle(led_cx, led_cy, 4, true, {0x7, 0x0, 0x0, 0xF});  // dark rim
-    //renderer->drawCircle(led_cx, led_cy, 3, true, {0xF, 0x2, 0x2, 0xF});  // red fill
+    fill_letterbox_rect(renderer, 0,       ix,       0,      VP_H, LB_COLOR); // left
+    fill_letterbox_rect(renderer, ix + iw, VP_W,     0,      VP_H, LB_COLOR); // right
+    fill_letterbox_rect(renderer, ix,      ix + iw,  0,      iy,   LB_COLOR); // top
+    fill_letterbox_rect(renderer, ix,      ix + iw,  iy + ih, VP_H, LB_COLOR); // bottom
 }
 
 // -- Border around the viewport -----------------------------------------------

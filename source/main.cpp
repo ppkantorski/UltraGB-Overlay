@@ -8,7 +8,7 @@
  *
  *   Controls in-game:
  *     A / B / D-pad / + (Start) / - (Select) — mapped to GB buttons
- *     ZL + ZR — pause and return to ROM picker (state preserved)
+ *     X — pause and return to ROM picker (state preserved)
  *     System overlay combo — hides overlay (game pauses automatically)
  ********************************************************************************/
 
@@ -292,7 +292,7 @@ static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
 // the new malloc sees the maximum possible contiguous free region.
 
 GBState  g_gb;
-uint16_t g_gb_fb[GB_W * GB_H] = {};
+uint16_t* g_gb_fb = nullptr;   // ~45 KB heap-allocated on game load, freed on unload
 static bool g_emu_active = false;
 static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
 PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC title-lookup by default
@@ -484,7 +484,7 @@ static void save_state(GBState& s) {
     fwrite(&ramSz,   sizeof(ramSz),   1, f);
     fwrite(&fbBytes, sizeof(fbBytes), 1, f);
     fwrite(&fbFlags, sizeof(fbFlags), 1, f);
-    fwrite(&s.gb,    sizeof(s.gb),    1, f);  // includes CPU regs, WRAM, VRAM, OAM, HRAM
+    fwrite(s.gb,     sizeof(*s.gb),   1, f);  // includes CPU regs, WRAM, VRAM, OAM, HRAM
     if (s.cartRam && s.cartRamSz)
         fwrite(s.cartRam, 1, s.cartRamSz, f);
     fwrite(g_gb_fb, 1, fbBytes, f);
@@ -534,20 +534,20 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     if (fbBytes != static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t))) { fclose(f); return false; }
 
     // Read the core struct — this overwrites function pointers; we re-patch below
-    if (fread(&s.gb, sizeof(s.gb), 1, f) != 1) { fclose(f); return false; }
+    if (fread(s.gb, sizeof(*s.gb), 1, f) != 1) { fclose(f); return false; }
 
     // Re-patch all function pointers that were serialized as garbage
-    s.gb.gb_rom_read       = gb_rom_read;
-    s.gb.gb_rom_read_16bit = gb_rom_read16;
-    s.gb.gb_rom_read_32bit = gb_rom_read32;
-    s.gb.gb_cart_ram_read  = gb_cart_ram_read;
-    s.gb.gb_cart_ram_write = gb_cart_ram_write;
-    s.gb.gb_error          = gb_error;
-    s.gb.gb_serial_tx      = nullptr;
-    s.gb.gb_serial_rx      = nullptr;
-    s.gb.gb_bootrom_read   = nullptr;
-    s.gb.direct.priv       = nullptr;
-    gb_init_lcd(&s.gb, gb_lcd_draw_line);  // re-sets display.lcd_draw_line
+    s.gb->gb_rom_read       = gb_rom_read;
+    s.gb->gb_rom_read_16bit = gb_rom_read16;
+    s.gb->gb_rom_read_32bit = gb_rom_read32;
+    s.gb->gb_cart_ram_read  = gb_cart_ram_read;
+    s.gb->gb_cart_ram_write = gb_cart_ram_write;
+    s.gb->gb_error          = gb_error;
+    s.gb->gb_serial_tx      = nullptr;
+    s.gb->gb_serial_rx      = nullptr;
+    s.gb->gb_bootrom_read   = nullptr;
+    s.gb->direct.priv       = nullptr;
+    gb_init_lcd(s.gb, gb_lcd_draw_line);  // re-sets display.lcd_draw_line
 
     // Restore cart RAM
     if (s.cartRam && s.cartRamSz) {
@@ -574,7 +574,7 @@ static bool load_state(GBState& s, bool* apu_restored = nullptr) {
     //   sessions.  A lossy RGBA4444→RGB565 expansion would look wrong, so just
     //   clear — the real frame arrives from the core within 16 ms.
     else if (!g_fb_is_prepacked && fbFlags == 1u) {
-        memset(g_gb_fb, 0, sizeof(g_gb_fb));
+        memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
     }
 
     // Restore full GBAPU snapshot — channels enabled/disabled, timers, duty
@@ -836,6 +836,10 @@ static void gb_cancel_load() {
     g_gb.romSize     = 0;
     g_gb.romPath[0]  = '\0';
     g_gb.savePath[0] = '\0';
+    free(g_gb.gb);
+    g_gb.gb = nullptr;
+    free(g_gb_fb);
+    g_gb_fb = nullptr;
     maybe_reload_wallpaper();
 }
 
@@ -876,7 +880,7 @@ bool gb_load_rom(const char* path) {
     // The old guard (sz >= ROM_2MB && sz < ROM_4MB) would let a 4 MB ROM slip
     // past this branch and rely on the !expandedMemory check below — safe only
     // if limitedMemory always implies !expandedMemory, which is not enforced here.
-    if (ult::limitedMemory && sz >= ROM_2MB) {
+    if (ult::limitedMemory && sz >= ROM_2MB && sz < ROM_4MB) {
         show_notify("Requires at least 6MB.");
         fclose(f); return false;
     }
@@ -1001,8 +1005,17 @@ bool gb_load_rom(const char* path) {
     strncpy(g_gb.romPath, path, sizeof(g_gb.romPath)-1);
     build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), INTERNAL_SAVE_DIR, ".sav");
 
+    // Allocate the core emulator struct — contains WRAM (32 KB) + VRAM (16 KB) + OAM/HRAM.
+    // Lives on the heap so these ~49 KB are only resident during active gameplay.
+    g_gb.gb = static_cast<struct gb_s*>(calloc(1, sizeof(struct gb_s)));
+    if (!g_gb.gb) {
+        gb_cancel_load();
+        show_notify("Not enough memory.");
+        return false;
+    }
+
     const enum gb_init_error_e err =
-        gb_init(&g_gb.gb,
+        gb_init(g_gb.gb,
                 gb_rom_read, gb_rom_read16, gb_rom_read32,
                 gb_cart_ram_read, gb_cart_ram_write,
                 gb_error, nullptr);
@@ -1015,7 +1028,7 @@ bool gb_load_rom(const char* path) {
     // Detect whether this is a CGB ROM so the renderer uses the right converter.
     // cgbMode is set by gb_init() when it reads byte 0x143 of the ROM header.
 #if WALNUT_FULL_GBC_SUPPORT
-    g_fb_is_rgb565 = (g_gb.gb.cgb.cgbMode != 0);
+    g_fb_is_rgb565 = (g_gb.gb->cgb.cgbMode != 0);
 #else
     g_fb_is_rgb565 = false;
 #endif
@@ -1052,10 +1065,10 @@ bool gb_load_rom(const char* path) {
     // Apply per-game palette for DMG games and CGB-compat games in DMG-palette
     // mode.  For CGB-only games (cgbMode=1 and g_fb_is_rgb565=true), the palette
     // is always GBC — hardware colour, no user palette applies.
-    // We check g_gb.gb.cgb.cgbMode directly rather than g_fb_is_rgb565 because
+    // We check g_gb.gb->cgb.cgbMode directly rather than g_fb_is_rgb565 because
     // CGB-compat games in DMG-palette mode have cgbMode=1 but g_fb_is_rgb565=false.
 #if WALNUT_FULL_GBC_SUPPORT
-    g_palette_mode = (g_gb.gb.cgb.cgbMode && g_fb_is_rgb565)
+    g_palette_mode = (g_gb.gb->cgb.cgbMode && g_fb_is_rgb565)
                      ? PaletteMode::GBC
                      : load_game_palette_mode(path);
 #else
@@ -1084,13 +1097,13 @@ bool gb_load_rom(const char* path) {
     g_lcd_ghosting = ghostingHardLocked ? false : load_game_lcd_ghosting(path);
 
     size_t ramSz = 0;
-    gb_get_save_size_s(&g_gb.gb, &ramSz);
+    gb_get_save_size_s(g_gb.gb, &ramSz);
     // MBC3 cartridges (especially Zelda Oracle / Pokémon Gold/Silver) can have
     // bad ROM headers that declare only 8KB of SRAM when the game actually uses
     // 4 banks × 8KB = 32KB.  If the game writes to banks 1–3 and gets 0xFF back
     // it will enter a corrupted state during the intro save-RAM initialisation.
     // Clamp MBC3 to a minimum of 32KB so all four banks are always available.
-    if (g_gb.gb.mbc == 3 && ramSz > 0 && ramSz < 0x8000)
+    if (g_gb.gb->mbc == 3 && ramSz > 0 && ramSz < 0x8000)
         ramSz = 0x8000;
     if (ramSz) {
         g_gb.cartRam = static_cast<uint8_t*>(calloc(ramSz, 1));
@@ -1104,12 +1117,20 @@ bool gb_load_rom(const char* path) {
         load_save(g_gb);
     }
 
-    gb_init_lcd(&g_gb.gb, gb_lcd_draw_line);
+    gb_init_lcd(g_gb.gb, gb_lcd_draw_line);
+
+    // Allocate the framebuffer — ~45 KB heap, only resident during active gameplay.
+    g_gb_fb = static_cast<uint16_t*>(calloc(GB_W * GB_H, sizeof(uint16_t)));
+    if (!g_gb_fb) {
+        gb_cancel_load();
+        show_notify("Not enough memory.");
+        return false;
+    }
 
     // Clear the framebuffer BEFORE gb_reset() — peanut_gb fires gb_lcd_draw_line
     // for line 0 during reset itself.  If memset runs after, that first draw is
     // erased and row 0 stays black until the second frame completes.
-    memset(g_gb_fb, 0, sizeof(g_gb_fb));
+    memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
 
     // ── Attempt to restore a previously saved state ───────────────────────────
     // save_state() is called from gb_unload_rom() so every clean unload leaves a
@@ -1130,13 +1151,13 @@ bool gb_load_rom(const char* path) {
     }
 
     // ── Init audio BEFORE gb_reset() so the APU callback is live from frame 1 ──
-    gb_audio_init(&g_gb.gb);
-    gb_audio_set_gb_ptr(&g_gb.gb);  // give audio_write() cycle-accurate LY+lcd_count offsets
+    gb_audio_init(g_gb.gb);
+    gb_audio_set_gb_ptr(g_gb.gb);  // give audio_write() cycle-accurate LY+lcd_count offsets
 
     // If load_state succeeded, gb_reset() must NOT be called — it would wipe
     // the restored CPU state.  If cold-booting, gb_reset() is already called
     // implicitly by gb_init() above, so the commented-out call below stays out.
-    //gb_reset(&g_gb.gb);
+    //gb_reset(g_gb.gb);
     (void)resumed;
 
     // On a CGB cold boot (no existing state file), start the bounce counter.
@@ -1145,7 +1166,7 @@ bool gb_load_rom(const char* path) {
     // Oracle of Seasons' intro freeze.  Applies whenever cgbMode=1 (regardless of
     // whether the display is in CGB-colour or DMG-palette mode); DMG cold boots
     // and all resumed states stay -1.
-    g_cgb_bounce_frames = (!resumed && g_gb.gb.cgb.cgbMode) ? 0 : -1;
+    g_cgb_bounce_frames = (!resumed && g_gb.gb->cgb.cgbMode) ? 0 : -1;
 
     g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     reset_lcd_ghosting();    // don't bleed prev-game pixels into first frame
@@ -1165,7 +1186,9 @@ void gb_unload_rom() {
     // re-mallocing 68 KB every game creates heap holes on the 6 MB tier.
     // reset_lcd_ghosting() clears the valid flag so the first frame of the
     // next game seeds s_prev_fb fresh (no inter-game pixel bleed).
-    reset_lcd_ghosting();
+    //reset_lcd_ghosting(); // WRONG
+
+    free_lcd_ghosting();
 
     // Free the ROM buffer BEFORE save_state so the ~1 MB slab is released while
     // save_state writes to disk.  save_state() only reads gb_s (BSS), cartRam,
@@ -1185,6 +1208,12 @@ void gb_unload_rom() {
     write_save(g_gb);
     if (g_gb.cartRam) { free(g_gb.cartRam); g_gb.cartRam = nullptr; }
     g_gb.cartRamSz   = 0;
+
+    // Free the core emulator struct and framebuffer — these are now demand-allocated
+    // so they only occupy memory during active gameplay (~49 KB WRAM+VRAM + ~45 KB FB).
+    free(g_gb.gb);  g_gb.gb  = nullptr;
+    free(g_gb_fb);  g_gb_fb  = nullptr;
+
     g_gb.romPath[0]  = '\0';
     g_gb.savePath[0] = '\0';
 
@@ -1234,7 +1263,7 @@ void gb_set_input(u64 keysHeld) {
     if (keysHeld & KEY_LEFT)  joy &= ~(1u << 5);
     if (keysHeld & KEY_UP)    joy &= ~(1u << 6);
     if (keysHeld & KEY_DOWN)  joy &= ~(1u << 7);
-    g_gb.gb.direct.joypad = joy;
+    g_gb.gb->direct.joypad = joy;
 }
 
 // =============================================================================
@@ -1552,8 +1581,8 @@ public:
             const s32 top       = baseline - static_cast<s32>(dh);
             const s32 thirdH    = static_cast<s32>(dh) / 3;
             // 46% wide for the vertical (↑↓) strip, 46% tall for the horizontal (←→) strip
-            const s32 stripW    = static_cast<s32>(dw) * 46 / 100;
-            const s32 stripH    = static_cast<s32>(dh) * 46 / 100;
+            const s32 stripW    = static_cast<s32>(dw) * 34 / 100;
+            const s32 stripH    = static_cast<s32>(dh) * 34 / 100;
 
             // E115 (↑↓): narrow strip horizontally (stripW), but fully unbounded
             // vertically — scissor spans the entire screen height so arrow tips
@@ -1567,7 +1596,7 @@ public:
             // horizontally — scissor spans the entire screen width so arrow tips
             // are never clipped at either side.
             const s32 rowNudge = thirdH / 4;
-            renderer->enableScissoring(0, top + (static_cast<s32>(dh) - stripH) / 2 + rowNudge,
+            renderer->enableScissoring(0, top + (static_cast<s32>(dh) - stripH) / 2 + rowNudge +4,
                                        FB_W, stripH);
             renderer->drawString("\uE116", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
             renderer->disableScissoring();
@@ -1813,16 +1842,43 @@ public:
             const int tx = static_cast<int>(touchPos.x) - static_cast<int>(ult::layerEdge);
             const int ty = static_cast<int>(touchPos.y);
 
-            // D-pad — split into 4 arms from the measured glyph centre
+            // D-pad — stop-sign layout aligned to the drawn black rectangles.
+            //
+            // The cross is divided into 9 zones matching the physical shape:
+            //   • Centre overlap (|dx|<=HALF_ARM && |dy|<=HALF_ARM) → dead zone
+            //   • Top / bottom protrusion (|dx|<=HALF_ARM, outside centre) → UP / DOWN
+            //   • Left / right protrusion (|dy|<=HALF_ARM, outside centre) → LEFT / RIGHT
+            //   • Four corner triangles (outside both arms' widths) → two simultaneous
+            //     directions, e.g. top-right corner → UP + RIGHT.
+            //
+            // HALF_ARM matches the backing rectangle arm half-widths (ARM_W=46, LIP=4 → 27 px).
+            // HALF_SPAN matches half the full arm length (FULL=131, LIP*2=8, +pad → 70 px).
+            // D_CY is the backing rect visual centre (DPAD_CY + 5 ≈ 577).
             {
-                const int dx = tx - g_dpad_hx;
-                const int dy = ty - g_dpad_hy;
-                if (dx*dx + dy*dy <= DPAD_R * DPAD_R) {
-                    if (std::abs(dx) >= std::abs(dy)) {
-                        g_touch_keys |= (dx >= 0) ? KEY_RIGHT : KEY_LEFT;
-                    }
-                    else {
-                        g_touch_keys |= (dy >= 0) ? KEY_DOWN : KEY_UP;
+                static constexpr int D_CX        = DPAD_DRAW_X + 67;  // backing rect centre X
+                static constexpr int D_CY        = DPAD_DRAW_Y - 61;  // backing rect centre Y
+                static constexpr int D_HALF_ARM  = 27;  // half the narrow arm width / height
+                static constexpr int D_HALF_SPAN = 70;  // half the full arm length
+
+                const int dx = tx - D_CX;
+                const int dy = ty - D_CY;
+
+                if (std::abs(dx) <= D_HALF_SPAN && std::abs(dy) <= D_HALF_SPAN) {
+                    const bool in_v = std::abs(dx) <= D_HALF_ARM;  // within vertical bar's width
+                    const bool in_h = std::abs(dy) <= D_HALF_ARM;  // within horizontal bar's height
+
+                    if (in_v && in_h) {
+                        // Centre overlap — dead zone, no input
+                    } else if (in_v) {
+                        // Top or bottom protrusion
+                        g_touch_keys |= (dy > 0) ? KEY_DOWN : KEY_UP;
+                    } else if (in_h) {
+                        // Left or right protrusion
+                        g_touch_keys |= (dx > 0) ? KEY_RIGHT : KEY_LEFT;
+                    } else {
+                        // Corner right-triangle — two simultaneous directions
+                        g_touch_keys |= (dx > 0) ? KEY_RIGHT : KEY_LEFT;
+                        g_touch_keys |= (dy > 0) ? KEY_DOWN : KEY_UP;
                     }
                 }
             }
@@ -2382,7 +2438,7 @@ public:
                     g_palette_mode    = next;
                     // Recalculate renderer flags. cgbMode stays 1 for all CGB games;
                     // we redirect between the rgb565 and prepacked output paths only.
-                    const bool cgbCore = (g_gb.gb.cgb.cgbMode != 0);
+                    const bool cgbCore = (g_gb.gb->cgb.cgbMode != 0);
                     g_fb_is_rgb565    = cgbCore && (next == PaletteMode::GBC);
                     g_fb_is_prepacked = !g_fb_is_rgb565;
                     gb_select_dmg_palette();  // rebakes g_dmg_flat_pal for new mode
@@ -2832,6 +2888,7 @@ public:
 class Overlay : public tsl::Overlay {
 public:
     virtual void initServices() override {
+        ult::COPY_BUFFER_SIZE = 1024; // minimize copy buffer
         tsl::overrideBackButton = true;
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_DIR);
