@@ -1,16 +1,22 @@
 /********************************************************************************
  * File: elm_ultraframe.hpp
  * Description:
- *   UltraGBOverlayFrame — two-page overlay frame for UltraGB.
+ *   UltraGBOverlayFrame — single-page overlay frame for UltraGB.
  *
- *   Replaces AnimatedOverlayFrame in RomSelectorGui with a frame that:
+ *   Used by RomSelectorGui (ROMs page) and SettingsGui (Settings page).
  *     • Draws the animated "UltraGB" wave title (via draw_ultraboy_title)
  *     • Shows a left-page ("ROMs") or right-page ("Settings") footer button
- *     • Exposes setContent() / setPageNames() so RomSelectorGui can swap
- *       between the ROM list and the Settings list in-place — no stack push.
+ *       to signal the other page; navigation is handled by swapTo<> in each
+ *       Gui's handleInput — no in-place list swapping, no dual list ownership.
  *
- *   Content pointer is NON-OWNING — RomSelectorGui owns both lists and
- *   deletes them in its destructor.
+ *   Content pointer is OWNING — the frame deletes m_contentElement in its
+ *   destructor, exactly like tsl::elm::OverlayFrame does.  This means each
+ *   Gui's createUI() can create a list as a plain local, hand it to the frame
+ *   via setContent(), and return the frame; Tesla owns the frame via
+ *   m_topElement, and everything is freed automatically when swapTo pops the
+ *   Gui off the stack (swapTo destroys the old Gui → ~Gui deletes m_topElement
+ *   → ~UltraGBOverlayFrame deletes list → ~List deletes all items).
+ *   Only one list lives in memory at a time.
  *
  *   NO mutex — Tesla's UI path (draw/layout/requestFocus/onTouch) is
  *   single-threaded.
@@ -41,7 +47,7 @@ public:
         disableSound.store(false, std::memory_order_release);
     }
 
-    ~UltraGBOverlayFrame() override = default;
+    ~UltraGBOverlayFrame() override { delete m_contentElement; }
 
     // -----------------------------------------------------------------------
     void draw(tsl::gfx::Renderer* renderer) override {
@@ -169,11 +175,13 @@ public:
 
     // -----------------------------------------------------------------------
     /**
-     * Swap the visible content element — NON-OWNING.
-     * RomSelectorGui owns both lists and deletes them in its destructor.
-     * The previous pointer is overwritten, never deleted here.
+     * Set the visible content element — OWNING.
+     * The frame takes ownership; the previous content element (if any) is
+     * deleted.  In normal usage createUI() calls this exactly once, so the
+     * delete-old path is just a safety net.
      */
     void setContent(tsl::elm::Element* content) {
+        delete m_contentElement;   // safe on nullptr; drops any previous owner
         m_contentElement = content;
         if (content != nullptr) {
             m_contentElement->setParent(this);
@@ -190,7 +198,7 @@ public:
     tsl::elm::Element* getContent() const { return m_contentElement; }
 
 private:
-    tsl::elm::Element* m_contentElement = nullptr;  ///< Non-owning.
+    tsl::elm::Element* m_contentElement = nullptr;  ///< Owning — deleted in destructor.
     std::string        m_pageLeftName;
     std::string        m_pageRightName;
 };

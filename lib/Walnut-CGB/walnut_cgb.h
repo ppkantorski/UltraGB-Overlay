@@ -807,6 +807,11 @@ struct gb_s
 
 		uint8_t window_clear;
 		uint8_t WY;
+		/* SCX is latched at the start of Mode 3 (pixel output), after the
+		 * full 80-cycle Mode 2 window has elapsed.  This matches real PPU
+		 * behaviour: the register is sampled once per scanline, not read
+		 * live during pixel output. */
+		uint8_t scx_latch;
 
 		/* Only support 30fps frame skip. */
 		bool frame_skip_count : 1;
@@ -1792,6 +1797,16 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 	case 0x8:
 	case 0x9:
+		/* VRAM is hardware-locked during Mode 3 (LCD Draw / pixel
+		 * transfer). CPU writes during Mode 3 are silently ignored on
+		 * real hardware.  Without this guard the emulator lets room-
+		 * loading VRAM writes corrupt sprite tile data that the PPU is
+		 * actively reading, producing the "bookshelf sword" effect where
+		 * a sprite's pixel data is replaced by background tile graphics
+		 * while its OAM entry (position, palette, glow) stays intact. */
+		if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+		   (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+			return;
 #if WALNUT_FULL_GBC_SUPPORT
 		gb->vram[addr - gb->cgb.vramBankOffset] = val;
 #else
@@ -1868,6 +1883,18 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		if(addr < UNUSED_ADDR)
 		{
+			/* OAM is hardware-locked during Mode 2 (OAM Scan) and Mode 3
+			 * (LCD Draw) when the LCD is enabled.  CPU writes during these
+			 * modes are silently ignored on real hardware.  Without this
+			 * guard the emulator applies mid-frame OAM writes that real HW
+			 * would discard, causing progressive sprite corruption in games
+			 * (e.g. Link's Awakening DX: Link's glyph/orientation glitch
+			 * when repeatedly interacting with an NPC while charging the
+			 * sword — each poke lands an OAM write during active display,
+			 * slowly corrupting which tile/flip data the PPU sees). */
+			if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+			   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+				return;
 			gb->oam[addr - OAM_ADDR] = val;
 			return;
 		}
@@ -2353,6 +2380,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
     switch (WALNUT_GB_GET_MSN16(addr)) {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             dst = &gb->vram[addr - gb->cgb.vramBankOffset];
 #else
@@ -2381,6 +2411,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
                 dst = &gb->wram[addr - ECHO_ADDR];
 #endif
             } else if (addr < UNUSED_ADDR) {
+                if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+                   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+                    return;
                 dst = &gb->oam[addr - OAM_ADDR];
             }
             break;
@@ -2414,6 +2447,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
     switch (WALNUT_GB_GET_MSN16(addr)) {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             *(uint32_t*)&gb->vram[addr - gb->cgb.vramBankOffset] = val;
 #else
@@ -2444,6 +2480,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
                 return;
             }
             if(addr < UNUSED_ADDR) {
+                if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+                   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+                    return;
                 *(uint32_t*)&gb->oam[addr - OAM_ADDR] = val;
                 return;
             }
@@ -2468,6 +2507,9 @@ void __gb_write16(struct gb_s *gb, uint_fast16_t addr, uint16_t val)
     {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             *((uint16_t *)(gb->vram + (addr - gb->cgb.vramBankOffset))) = val;
 #else
@@ -2806,8 +2848,12 @@ void __gb_draw_line(struct gb_s *gb)
 		 * to left. */
 		disp_x = LCD_WIDTH - 1;
 
-		/* The X coordinate to begin drawing the background at. */
-		bg_x = disp_x + gb->hram_io[IO_SCX];
+		/* The X coordinate to begin drawing the background at.
+		 * Use the per-scanline latch (set at Mode 3 start) rather than the
+		 * live register, matching real PPU behaviour where SCX is sampled
+		 * once at the beginning of pixel output and held stable for the
+		 * entire scanline. */
+		bg_x = disp_x + gb->display.scx_latch;
 
 		/* Get tile index for current background tile. */
 		idx = gb->vram[bg_map + (bg_x >> 3)];
@@ -2863,7 +2909,7 @@ void __gb_draw_line(struct gb_s *gb)
 			{
 				/* fetch next tile */
 				px = 0;
-				bg_x = disp_x + gb->hram_io[IO_SCX];
+				bg_x = disp_x + gb->display.scx_latch;
 				idx = gb->vram[bg_map + (bg_x >> 3)];
 #if WALNUT_FULL_GBC_SUPPORT
 				idxAtt = gb->vram[bg_map + (bg_x >> 3) + 0x2000];
@@ -5471,9 +5517,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
@@ -5632,7 +5683,13 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
@@ -7459,9 +7516,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
@@ -7618,7 +7680,13 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
@@ -10041,9 +10109,14 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				/* FIX: If the game is HALTed with no enabled interrupts
 				 * pending, the do-while condition stays true forever even
 				 * though gb_frame is already set, stalling gb_run_frame
-				 * indefinitely.  Break out so the frame can complete. */
-				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE]))
+				 * indefinitely.  Break out so the frame can complete.
+				 * Also clear gb_halt here so the next __gb_step_cpu call
+				 * does not re-enter the interrupt dispatch path with nothing
+				 * in IO_IF -- which would disable IME and corrupt the stack. */
+				if(gb->gb_halt && !(gb->hram_io[IO_IF] & gb->hram_io[IO_IE])) {
+					gb->gb_halt = false;
 					break;
+				}
 			}
 			continue;
 		}
@@ -10199,7 +10272,13 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)

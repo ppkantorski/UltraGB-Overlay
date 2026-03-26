@@ -33,6 +33,10 @@
 
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
 extern bool g_fb_is_rgb565;
+// true when g_gb_fb stores pre-packed RGBA4444 values (DMG games only).
+// gb_select_dmg_palette bakes the conversion into g_dmg_flat_pal so
+// gb_lcd_draw_line can write RGBA4444 directly, skipping runtime conversion.
+extern bool g_fb_is_prepacked;
 // PaletteMode defined in gb_core.h (included above)
 
 // ── Runtime viewport scale toggle ─────────────────────────────────────────────
@@ -174,23 +178,211 @@ inline void toggle_vp_scale() {
     s_coord_ready = false;
 }
 
+// Set the viewport scale to an explicit value and invalidate the LUTs.
+// Use this instead of toggle_vp_scale() when the caller already knows the
+// desired state (e.g. a MiniToggleListItem listener, where the framework
+// has already flipped its own internal state before calling the listener).
+// Calling toggle_vp_scale() there would double-flip g_vp_2x and leave the
+// LUTs rebuilt at the WRONG scale — the exact bug the Settings toggle had.
+inline void set_vp_scale(const bool want_2x) {
+    g_vp_2x       = want_2x;
+    s_lut_ready   = false;
+    s_coord_ready = false;
+}
+
+// -- LCD ghosting (frame blend) -----------------------------------------------
+// Simulates GBC LCD phosphor persistence: pixels that toggle on/off at 30 Hz
+// appear semi-transparent instead of flickering.  Games like Link's Awakening
+// deliberately use this — Chain Chomp's chain alternates every frame expecting
+// the LCD to average it into a translucent ghost.
+//
+// Problem with naïve 50/50 blend: it blurs moving characters and causes
+// sprite "doubling" — a 1-bit flicker flag triggers on the frame a sprite
+// LEAVES a pixel (change #2), blending old position with new background.
+//
+// Solution — saturating-counter blend:
+//   s_flicker_mask[i] is a uint8_t counter, not a flag.
+//     • Increments (saturating at 255) each frame the pixel changes.
+//     • Resets to 0 each frame the pixel stays the same.
+//   Blend fires only when counter_prev >= FLICKER_THRESHOLD (3).
+//
+//   A sprite passing through pixel A causes EXACTLY 2 changes:
+//     arrive (counter→1), leave (counter→2).  2 < 3 → NEVER blended.
+//
+//   Chain Chomp chain (alternates every frame indefinitely):
+//     change→1, change→2, change→3, change≥3 → BLEND on frame 4+ (≈50ms warm-up).
+//
+//   Result: sustained per-pixel flicker is ghosted; moving sprites and
+//   walking animations are written raw with zero blur and zero doubling.
+//
+// TRANSITION GUARD (bulk-change detection):
+//   During a room/map transition the scroll causes a large fraction of the
+//   screen to change on every scroll frame, building flicker counters up to
+//   ≥ FLICKER_THRESHOLD.  On the first stable frame of the new map those
+//   stale counters would fire a blend against transition data, producing a
+//   one-frame smear/artifact around the character's path and edge tiles.
+//
+//   Fix: a single pre-pass counts changed pixels.  If the count exceeds
+//   BULK_CHANGE_LIMIT (30% of the screen), the frame is classified as a
+//   transition frame and any changed pixel has its counter reset to 0 rather
+//   than incremented — no blend fires, no counter pollution carries forward.
+//
+//   Chain chomp chain: ~20–40 pixels change per frame → never triggers.
+//   Normal heavy sprite frame: ~1,000–2,500 pixels → never triggers.
+//   Room transition scroll frame: ~10,000–23,040 pixels → always triggers.
+//   The 30% threshold (~6,912 px) gives a wide safety margin between the two.
+//
+//   Performance: one extra pass through 23,040 uint16_t comparisons whose
+//   cache lines are already hot from the draw pass — negligible overhead.
+//   Memory: one stack int (changed_count). Zero additional heap or BSS.
+//
+// Memory (heap, freed on ROM unload):
+//   s_prev_fb      — raw pixels from last frame              45,056 bytes
+//   s_flicker_mask — 1 byte per pixel: saturating change count  23,040 bytes
+//   BSS cost: two pointers = 16 bytes.
+//   On limitedMemory devices both allocations are skipped entirely.
+static uint16_t* s_prev_fb      = nullptr;  // 45 KB, raw previous frame
+static uint8_t*  s_flicker_mask = nullptr;  // 23 KB, per-pixel alternation flag
+static bool      s_prev_fb_valid = false;   // false until first frame is seeded
+
+// Fraction of total pixels that must change in one frame for it to be
+// classified as a bulk transition (room scroll / map cut) rather than
+// normal per-pixel flicker.  30% → 6,912 pixels out of 23,040 total.
+// Chain chomp flicker: ~20–40 px.  Heavy sprite frame: ~1,000–2,500 px.
+// Room transition scroll frame: ~10,000–23,040 px.  Wide safety margin.
+static constexpr float BULK_CHANGE_FRAC  = 0.30f;
+static constexpr int   BULK_CHANGE_LIMIT =
+    static_cast<int>(GB_W * GB_H * BULK_CHANGE_FRAC);  // 6,912
+
+// Called after every gb_run_one_frame() when ghosting may be active.
+inline void apply_lcd_ghosting() {
+    if (!g_lcd_ghosting) return;
+    if (ult::limitedMemory) return;
+
+    if (!s_prev_fb) {
+        s_prev_fb = static_cast<uint16_t*>(malloc(GB_W * GB_H * sizeof(uint16_t)));
+        if (!s_prev_fb) return;
+    }
+    if (!s_flicker_mask) {
+        s_flicker_mask = static_cast<uint8_t*>(calloc(GB_W * GB_H, 1));
+        if (!s_flicker_mask) return;
+    }
+
+    if (!s_prev_fb_valid) {
+        // Seed on the first frame — no blend yet, just capture state.
+        memcpy(s_prev_fb, g_gb_fb, GB_W * GB_H * sizeof(uint16_t));
+        memset(s_flicker_mask, 0, GB_W * GB_H);
+        s_prev_fb_valid = true;
+        return;
+    }
+
+    static constexpr uint8_t FLICKER_THRESHOLD = 3u;
+    const int total = GB_W * GB_H;
+
+    // ── Pre-pass: bulk-transition detection ──────────────────────────────────
+    // Count how many pixels changed this frame.  The pixel array (~45 KB) is
+    // already hot in L2 cache from the draw pass so the extra traversal is
+    // negligible.  If the count exceeds BULK_CHANGE_LIMIT we are in a scroll
+    // or map-cut frame: reset counters for changed pixels instead of
+    // incrementing them, preventing stale counts from ghosting the first
+    // stable frame of the new map.
+    int changed_count = 0;
+    for (int i = 0; i < total; i++)
+        changed_count += (g_gb_fb[i] != s_prev_fb[i]);
+
+    const bool bulk_transition = (changed_count > BULK_CHANGE_LIMIT);
+
+    if (g_fb_is_rgb565) {
+        // CGB: raw RGB565.
+        for (int i = 0; i < total; i++) {
+            const uint16_t prev = s_prev_fb[i];
+            const uint16_t curr = g_gb_fb[i];
+            const bool changed_now = (curr != prev);
+
+            uint8_t mask = s_flicker_mask[i];
+
+            if (bulk_transition & changed_now) {
+                // Transition frame: suppress counter build-up for changed pixels.
+                // No blend, no increment — reset so scroll accumulation does not
+                // carry into the first stable frame of the new map.
+                mask = 0u;
+            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
+                // Pixel has been changing for FLICKER_THRESHOLD+ consecutive frames
+                // → genuine sustained flicker (e.g. Chain Chomp chain at 30 Hz).
+                // 50/50 blend produces stable mid-brightness — no flicker.
+                const uint8_t r = (uint8_t)(((curr >> 11 & 0x1Fu) + (prev >> 11 & 0x1Fu)) >> 1);
+                const uint8_t g = (uint8_t)(((curr >>  5 & 0x3Fu) + (prev >>  5 & 0x3Fu)) >> 1);
+                const uint8_t b = (uint8_t)(((curr       & 0x1Fu) + (prev       & 0x1Fu)) >> 1);
+                g_gb_fb[i] = (uint16_t)((r << 11) | (g << 5) | b);
+            }
+            // else: write raw (g_gb_fb[i] already holds curr from draw_line)
+
+            // Saturating increment on change; reset to 0 on stable or transition.
+            s_flicker_mask[i] = (bulk_transition & changed_now)
+                ? 0u
+                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
+            s_prev_fb[i] = curr;   // always store raw for next frame
+        }
+    } else {
+        // DMG: pre-packed RGBA4444; alpha is always 0xF, blend only RGB nibbles.
+        for (int i = 0; i < total; i++) {
+            const uint16_t prev = s_prev_fb[i];
+            const uint16_t curr = g_gb_fb[i];
+            const bool changed_now = (curr != prev);
+
+            uint8_t mask = s_flicker_mask[i];
+
+            if (bulk_transition & changed_now) {
+                mask = 0u;
+            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
+                const uint8_t r = (uint8_t)(((curr       & 0xFu) + (prev       & 0xFu)) >> 1);
+                const uint8_t g = (uint8_t)(((curr >>  4 & 0xFu) + (prev >>  4 & 0xFu)) >> 1);
+                const uint8_t b = (uint8_t)(((curr >>  8 & 0xFu) + (prev >>  8 & 0xFu)) >> 1);
+                g_gb_fb[i] = (uint16_t)(r | (g << 4) | (b << 8) | 0xF000u);
+            }
+
+            s_flicker_mask[i] = (bulk_transition & changed_now)
+                ? 0u
+                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
+            s_prev_fb[i] = curr;
+        }
+    }
+}
+
+// Invalidate ghosting state — next apply_lcd_ghosting() call re-seeds instead
+// of blending.  Does NOT free allocations; keeps them live for reuse on ROM switch.
+inline void reset_lcd_ghosting() {
+    s_prev_fb_valid = false;
+}
+
+// Release all ghosting heap memory.  Call from gb_unload_rom() so the ~68 KB
+// returns to the heap when no game is running.
+inline void free_lcd_ghosting() {
+    free(s_prev_fb);      s_prev_fb      = nullptr;
+    free(s_flicker_mask); s_flicker_mask = nullptr;
+    s_prev_fb_valid = false;
+}
+
 // -- GB screen render ---------------------------------------------------------
 // Hot path summary per frame:
 //   - Outer loop: 144 GB source rows
 //   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
-//   - Per run: one colour conversion (rgb555/565 -> packed uint16)
-//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset,
-//     which is: framebuffer[offset] = color  (direct write, no blend, no swizzle math)
-//   - No drawRect, no per-pixel getPixelOffset, no blend math (a=0xF).
+//   - Per run: colour conversion fires exactly once (or zero times if IS_PREPACKED)
+//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset
+//
+// Template parameters (both resolved at compile time, zero runtime overhead):
+//   IS565       — true for CGB games (Walnut emits RGB565 via fixPalette)
+//   IS_PREPACKED— true for DMG games: g_gb_fb already holds RGBA4444 values
+//                 pre-baked by gb_select_dmg_palette(); conversion is skipped
+//                 entirely, making the hot loop a pure lookup + scatter-write.
 //
 // When ult::expandedMemory is true, the 144 source rows are split evenly across
-// ult::renderThreads (same global thread pool used by drawBitmapRGBA4444).
-// Each source row maps to a disjoint set of output rows so there are zero
-// shared writes — no locks needed.
+// ult::renderThreads.  Each source row maps to a disjoint set of output rows so
+// there are zero shared writes — no locks needed.
 
-static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
-                                   const bool is565,
-                                   const int sy_start, const int sy_end) {
+template <bool IS565, bool IS_PREPACKED>
+static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
+                                        const int sy_start, const int sy_end) {
     for (int sy = sy_start; sy < sy_end; ++sy) {
         const int oy0 = s_dy0[sy];
         const int oy1 = s_dy1[sy];
@@ -208,10 +400,15 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
             const int ox1   = s_dx1[sx - 1];
             const int run_w = ox1 - ox0;
 
-            // Colour conversion: once per run
-            const uint16_t packed = is565
-                ? rgb565_to_packed(run_pix)
-                : rgb555_to_packed(run_pix);
+            // Colour conversion: once per run — dead code per unused branch
+            uint16_t packed;
+            if constexpr (IS_PREPACKED) {
+                packed = run_pix;                   // already RGBA4444 from draw_line
+            } else if constexpr (IS565) {
+                packed = rgb565_to_packed(run_pix); // CGB: fixPalette → RGB565 → pack
+            } else {
+                packed = rgb555_to_packed(run_pix); // DMG non-prepacked fallback
+            }
             const tsl::Color color = *reinterpret_cast<const tsl::Color*>(&packed);
 
             for (int oy = oy0; oy < oy1; ++oy) {
@@ -238,6 +435,20 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
             run_pix = pix;
         }
     }
+}
+
+// Thin wrapper with the original signature so std::thread(render_gb_screen_chunk, ...)
+// works without changes.  The dispatch is one branch per thread launch — entirely
+// outside the pixel loop — so the cost is negligible.
+static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
+                                   const bool is565,
+                                   const int sy_start, const int sy_end) {
+    if (g_fb_is_prepacked)
+        render_gb_screen_chunk_impl<false, true>(renderer, sy_start, sy_end);
+    else if (is565)
+        render_gb_screen_chunk_impl<true,  false>(renderer, sy_start, sy_end);
+    else
+        render_gb_screen_chunk_impl<false, false>(renderer, sy_start, sy_end);
 }
 
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
@@ -297,13 +508,16 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
     static u32  w_prefix = 0, wC = 0, wO = 0, wL = 0, wO2 = 0, wR = 0;
 
     if (!measured) {
-        static const auto [wp,  hp]  = renderer->getTextDimensions("GAME BOY ", false, LOGO_SIZE);
-        static const auto [wc,  hc]  = renderer->getTextDimensions("C", false, LOGO_SIZE);
-        static const auto [wo,  ho]  = renderer->getTextDimensions("O", false, LOGO_SIZE);
-        static const auto [wl,  hl]  = renderer->getTextDimensions("L", false, LOGO_SIZE);
-        static const auto [wo2, ho2] = renderer->getTextDimensions("O", false, LOGO_SIZE);
-        static const auto [wr,  hr]  = renderer->getTextDimensions("R", false, LOGO_SIZE);
-        w_prefix = wp; wC = wc; wO = wo; wL = wl; wO2 = wo2; wR = wr;
+        // No 'static' needed — the outer 'measured' flag already guarantees this
+        // block runs exactly once.  Removing 'static' eliminates six hidden guard
+        // variables and their __cxa_guard_acquire/release call sequences from .text.
+        // wO2 measures the same glyph ("O") at the same size as wO — reuse it.
+        w_prefix = renderer->getTextDimensions("GAME BOY ", false, LOGO_SIZE).first;
+        wC       = renderer->getTextDimensions("C",         false, LOGO_SIZE).first;
+        wO       = renderer->getTextDimensions("O",         false, LOGO_SIZE).first;
+        wL       = renderer->getTextDimensions("L",         false, LOGO_SIZE).first;
+        wO2      = wO;  // same glyph, same size — no second call needed
+        wR       = renderer->getTextDimensions("R",         false, LOGO_SIZE).first;
         measured = true;
     }
 
