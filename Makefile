@@ -17,7 +17,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.4.0
+APP_VERSION := 0.4.5
 TARGET      := gbemu
 BUILD       := build
 SOURCES     := source
@@ -30,7 +30,7 @@ include ${TOPDIR}/lib/libultrahand/ultrahand.mk
 #---------------------------------------------------------------------------------
 # Walnut-GB compile-time options (passed to both C and C++ TUs)
 #---------------------------------------------------------------------------------
-PEANUT_DEFINES := -DENABLE_LCD=1 \
+WALNUT_DEFINES := -DENABLE_LCD=1 \
                   -DWALNUT_FULL_GBC_SUPPORT=1
 
 #---------------------------------------------------------------------------------
@@ -43,7 +43,7 @@ CFLAGS := -Wall -O2 \
           -falign-functions=16 \
           -fvisibility=hidden \
           -fmerge-all-constants \
-          $(ARCH) $(DEFINES) $(PEANUT_DEFINES)
+          $(ARCH) $(DEFINES) $(WALNUT_DEFINES)
 
 CFLAGS += $(INCLUDE) -D__SWITCH__ -DAPP_VERSION="\"$(APP_VERSION)\"" -D_FORTIFY_SOURCE=2
 
