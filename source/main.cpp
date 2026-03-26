@@ -49,6 +49,13 @@ static char g_last_rom_path[256]    = {};   // basename of last-played ROM, pers
 static char g_pending_rom_path[256] = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
 static char g_rom_selector_scroll[256] = {};  // last ROM the user interacted with in the selector; used to restore scroll on page flip
 
+// Set true by GBEmulatorGui when it exits to RomSelectorGui via X.
+// RomSelectorGui reads and clears this in its constructor, then blocks all
+// navigation input (and keeps clearing jumpToTop/Bottom/skipUp/skipDown) until every
+// physical key is released — preventing L/R/ZL/ZR presses made in-game from
+// firing a list-jump the moment the ROM selector appears.
+static bool g_waitForInputRelease = false;
+
 // Persistent config path string — avoids a heap alloc on every setIniFileValue call
 // (CONFIG_FILE is 31 chars, exceeds ARM64 libstdc++ SSO threshold of 15, so each
 // std::string(CONFIG_FILE) temporary heap-allocates.  This single persistent instance
@@ -1700,6 +1707,18 @@ public:
             //tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
             gb_unload_rom();  // sets running=false, emu_active=false, frees all
             triggerExitFeedback();
+            // Clear any stale L/R/ZL/ZR jump signals that the Overlay-level
+            // state machine may have armed while these buttons were used in-game.
+            // Without this, the ROM selector list jumps to top/bottom on the very
+            // first UP/DOWN press after returning.
+            jumpToTop.store(false, std::memory_order_release);
+            jumpToBottom.store(false, std::memory_order_release);
+            skipUp.store(false, std::memory_order_release);
+            skipDown.store(false, std::memory_order_release);
+            // Signal RomSelectorGui to swallow input until all keys are released.
+            // This prevents keys still physically held at swap time from re-arming
+            // the Overlay's static jump state machines and firing a second jump.
+            g_waitForInputRelease = true;
             tsl::swapTo<RomSelectorGui>();
             return true;
         }
@@ -2249,8 +2268,17 @@ public:
 // =============================================================================
 class RomSelectorGui : public tsl::Gui {
     std::string m_jump_to;  // item to scroll to on createUI; empty = scroll to inProgress
+    bool m_waitForRelease = false;  // true while we wait for all keys to clear after emulator exit
 public:
-    explicit RomSelectorGui(std::string jumpTo = "") : m_jump_to(std::move(jumpTo)) {}
+    explicit RomSelectorGui(std::string jumpTo = "") : m_jump_to(std::move(jumpTo)) {
+        // If GBEmulatorGui flagged that L/R/ZL/ZR may still be physically held,
+        // arm the release-gate so handleInput swallows those keys until the
+        // controller is clean.
+        if (g_waitForInputRelease) {
+            g_waitForInputRelease = false;
+            m_waitForRelease = true;
+        }
+    }
 
     // No destructor needed: Tesla deletes m_topElement (frame) →
     // ~UltraGBOverlayFrame deletes m_contentElement (list) →
@@ -2387,7 +2415,22 @@ public:
                              const HidTouchState& touchPos,
                              HidAnalogStickState leftJoy,
                              HidAnalogStickState rightJoy) override {
-        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        (void)touchPos; (void)leftJoy; (void)rightJoy;
+
+        // Wait for a clean controller state after returning from the emulator.
+        // L/R/ZL/ZR pressed during gameplay arm Tesla's static Overlay-level
+        // jump state machines (jumpToTop/jumpToBottom/skipUp/skipDown).  Keep clearing those
+        // signals and swallowing all input until every physical key is released,
+        // so the first UP/DOWN press the user makes in the selector is intentional.
+        if (m_waitForRelease) {
+            jumpToTop.store(false, std::memory_order_release);
+            jumpToBottom.store(false, std::memory_order_release);
+            skipUp.store(false, std::memory_order_release);
+            skipDown.store(false, std::memory_order_release);
+            if (keysHeld) return true;
+            m_waitForRelease = false;
+            return true;
+        }
 
         // simulatedNextPage fires when the user taps the footer page button.
         // On the Games page the footer shows right-arrow "Settings".
