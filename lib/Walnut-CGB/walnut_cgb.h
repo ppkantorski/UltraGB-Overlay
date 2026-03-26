@@ -807,6 +807,12 @@ struct gb_s
 
 		uint8_t window_clear;
 		uint8_t WY;
+		/* SCX is latched at the start of Mode 3 (pixel output), after the
+		 * full 80-cycle Mode 2 window has elapsed.  This gives HBlank/LYC
+		 * interrupt handlers time to update IO_SCX before it is sampled,
+		 * matching real PPU behaviour and fixing the Super Mario Land
+		 * status-bar horizontal-scroll glitch. */
+		uint8_t scx_latch;
 
 		/* Only support 30fps frame skip. */
 		bool frame_skip_count : 1;
@@ -2843,8 +2849,12 @@ void __gb_draw_line(struct gb_s *gb)
 		 * to left. */
 		disp_x = LCD_WIDTH - 1;
 
-		/* The X coordinate to begin drawing the background at. */
-		bg_x = disp_x + gb->hram_io[IO_SCX];
+		/* The X coordinate to begin drawing the background at.
+		 * Use the per-scanline latch (set at Mode 3 start) rather than the
+		 * live register so that mid-frame SCX writes by interrupt handlers
+		 * (e.g. Super Mario Land status-bar trick) don't bleed into the
+		 * wrong scanlines. */
+		bg_x = disp_x + gb->display.scx_latch;
 
 		/* Get tile index for current background tile. */
 		idx = gb->vram[bg_map + (bg_x >> 3)];
@@ -2900,7 +2910,7 @@ void __gb_draw_line(struct gb_s *gb)
 			{
 				/* fetch next tile */
 				px = 0;
-				bg_x = disp_x + gb->hram_io[IO_SCX];
+				bg_x = disp_x + gb->display.scx_latch;
 				idx = gb->vram[bg_map + (bg_x >> 3)];
 #if WALNUT_FULL_GBC_SUPPORT
 				idxAtt = gb->vram[bg_map + (bg_x >> 3) + 0x2000];
@@ -5674,7 +5684,13 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				/* Latch SCX at Mode 3 start — after all of Mode 2's 80
+				 * cycles have elapsed, so any HBlank/LYC interrupt handler
+				 * that updated IO_SCX during Mode 2 is reflected here. */
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
@@ -7665,7 +7681,10 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
@@ -10251,7 +10270,10 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_LCD_DRAW;
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
+			{
+				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
+			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
 			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
