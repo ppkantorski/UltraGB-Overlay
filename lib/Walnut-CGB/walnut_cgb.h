@@ -808,10 +808,9 @@ struct gb_s
 		uint8_t window_clear;
 		uint8_t WY;
 		/* SCX is latched at the start of Mode 3 (pixel output), after the
-		 * full 80-cycle Mode 2 window has elapsed.  This gives HBlank/LYC
-		 * interrupt handlers time to update IO_SCX before it is sampled,
-		 * matching real PPU behaviour and fixing the Super Mario Land
-		 * status-bar horizontal-scroll glitch. */
+		 * full 80-cycle Mode 2 window has elapsed.  This matches real PPU
+		 * behaviour: the register is sampled once per scanline, not read
+		 * live during pixel output. */
 		uint8_t scx_latch;
 
 		/* Only support 30fps frame skip. */
@@ -2851,9 +2850,9 @@ void __gb_draw_line(struct gb_s *gb)
 
 		/* The X coordinate to begin drawing the background at.
 		 * Use the per-scanline latch (set at Mode 3 start) rather than the
-		 * live register so that mid-frame SCX writes by interrupt handlers
-		 * (e.g. Super Mario Land status-bar trick) don't bleed into the
-		 * wrong scanlines. */
+		 * live register, matching real PPU behaviour where SCX is sampled
+		 * once at the beginning of pixel output and held stable for the
+		 * entire scanline. */
 		bg_x = disp_x + gb->display.scx_latch;
 
 		/* Get tile index for current background tile. */
@@ -5685,9 +5684,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
 			{
-				/* Latch SCX at Mode 3 start — after all of Mode 2's 80
-				 * cycles have elapsed, so any HBlank/LYC interrupt handler
-				 * that updated IO_SCX during Mode 2 is reflected here. */
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
 				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
 			}
@@ -7682,6 +7681,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
 			{
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
 				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
 			}
@@ -10271,6 +10273,9 @@ void __gb_step_cpu_x(struct gb_s *gb)
 #if ENABLE_LCD
 			if(!gb->lcd_blank)
 			{
+				/* Latch SCX at Mode 3 start — matches real PPU behaviour
+				 * where SCX is sampled once per scanline and held stable
+				 * for the duration of pixel output. */
 				gb->display.scx_latch = gb->hram_io[IO_SCX];
 				__gb_draw_line(gb);
 			}
