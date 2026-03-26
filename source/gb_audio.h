@@ -68,6 +68,13 @@
 #include <switch.h>
 #include "audio.hpp"   // ult::Audio::m_audioMutex, m_initialized
 
+// Forward-declare the APU callbacks that walnut_cgb.h calls.
+// gb_audio.h must be self-contained so it can be included before gb_core.h.
+extern "C" {
+    uint8_t audio_read(uint8_t addr);
+    void    audio_write(uint8_t addr, uint8_t val);
+}
+
 extern "C" {
 #include "walnut_cgb.h"
 }
@@ -182,7 +189,12 @@ static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
                a.ch1.len_en=(val>>6)&1;
                if(val&0x80){a.ch1.enabled=a.ch1.dac_on;a.ch1.vol=a.ch1.vol_init;
                    a.ch1.vol_timer=a.ch1.vol_period;
-                   a.ch1.timer=ch1_p(a)>0?ch1_p(a):1;a.ch1.duty_pos=0;
+                   a.ch1.timer=ch1_p(a)>0?ch1_p(a):1;
+                   // NOTE: duty_pos is intentionally NOT reset here.  Real GB
+                   // hardware does not reset the duty-cycle position on trigger —
+                   // only the period timer and envelope are reloaded.  Resetting
+                   // duty_pos caused a phase discontinuity (click) on retriggered
+                   // notes that doesn't exist on hardware.
                    if(a.ch1.len_timer==0)a.ch1.len_timer=64;
                    a.ch1.sw_shadow=a.ch1.period;
                    a.ch1.sw_timer=a.ch1.sw_period?a.ch1.sw_period:8;}break;
@@ -194,7 +206,8 @@ static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
                a.ch2.len_en=(val>>6)&1;
                if(val&0x80){a.ch2.enabled=a.ch2.dac_on;a.ch2.vol=a.ch2.vol_init;
                    a.ch2.vol_timer=a.ch2.vol_period;
-                   a.ch2.timer=ch2_p(a)>0?ch2_p(a):1;a.ch2.duty_pos=0;
+                   a.ch2.timer=ch2_p(a)>0?ch2_p(a):1;
+                   // duty_pos not reset — see CH1 trigger comment above.
                    if(a.ch2.len_timer==0)a.ch2.len_timer=64;}break;
     case 0x1A: a.ch3.dac_on=(val&0x80)!=0;if(!a.ch3.dac_on)a.ch3.enabled=false;break;
     case 0x1B: a.ch3.len_timer=256-val;break;
@@ -240,7 +253,24 @@ static void apply_reg(GBAPU& a, uint8_t addr, uint8_t val) {
 // silently dropped the critical NR30=0x80 / NR34 writes, leaving CH3's DAC in
 // the OFF state every frame → complete silence on the voice channel.
 // ─────────────────────────────────────────────────────────────────────────────
-struct RegEvent { uint8_t addr, val; };
+struct RegEvent { uint8_t addr, val; uint16_t cycle; };  // cycle: T-cycles since frame start (0..70223)
+
+// Pointer to the live gb_s struct, set once via gb_audio_set_gb_ptr().
+// audio_write() reads hram_io[IO_LY]*456 + counter.lcd_count to get the exact
+// T-cycle offset within the current frame — zero overhead, perfectly accurate,
+// and independent of wall-clock time (which fails because the emulator runs
+// faster than real-time: a 16.75 ms game frame may complete in ~2 ms, so all
+// events get near-zero delta_ns and pile up at sample 0, breaking Pikachu).
+static const gb_s* s_gb_ptr = nullptr;
+
+// gb_audio_set_gb_ptr — call once after gb_s is initialised, before the first
+// gb_run_one_frame.  The pointer remains valid for the entire emulation session.
+static inline void gb_audio_set_gb_ptr(const gb_s* p) { s_gb_ptr = p; }
+
+// gb_audio_mark_frame_start — now a no-op; kept so existing call sites in
+// gb_core.h compile without modification.  Cycle offsets are derived from the
+// live gb_s counters in audio_write() instead of a wall-clock snapshot.
+static inline void gb_audio_mark_frame_start() {}
 // SPSC ring — must be power-of-2 for the bitmask drain.
 // One frame worst-case (Pokémon Yellow Pikachu voice): ~134 IRQs × 20 events
 // ≈ 2,680 events.  4096 holds a full frame plus ~1,400 slots of headroom.
@@ -260,14 +290,26 @@ static constexpr uint32_t LOC_CAP  = 3072u;
 static RegEvent s_local_evts[LOC_CAP];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // generate_samples — writes n_samp stereo int16 samples into dst,
-// distributing the supplied register events proportionally across the frame.
+// distributing the supplied register events at their true T-cycle position
+// within the frame.
 //
 // Event distribution:
-//   Event j of n_evts total is applied just before sample floor(j*n_samp/n_evts).
-//   This maps each of Pokémon Yellow's ~134 wave-table updates to its correct
-//   ~6-sample window (48 kHz / 8 kHz = 6 output samples per voice sample),
-//   reproducing intelligible speech rather than a garbled 60 Hz buzz.
+//   Each RegEvent carries a `cycle` field (T-cycles since frame start, 0..70223)
+//   stamped by audio_write() via LY*456+lcd_count.  generate_samples converts
+//   this to an output sample index:
+//       due_sample = floor(event.cycle * n_samp / GB_FRAME_CYC)
+//   This correctly places:
+//     • Pokémon Yellow Pikachu voice: ~134 wave-table clusters fired at 8 kHz
+//       IRQ intervals → evenly spaced cycles → same ~6-sample windows as before.
+//     • Tamagotchi / short SFX: NR21-NR24 all written within ~100 T-cycles at
+//       frame start → all map to sample 0-1 → trigger fires immediately rather
+//       than being delayed to sample 602, so a tight length counter still
+//       produces the full audible note.
+//   The old index-based formula (j * n_samp / n_evts) was equivalent only when
+//   events were perfectly evenly spaced — true for Pikachu's voice, wrong for
+//   any game whose sound effects are clustered at the start of a frame.
 //
 // Output pipeline per sample:
 //   1. Frame sequencer tick (length / sweep / volume envelope, integer)
@@ -296,18 +338,13 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     uint32_t evt_idx = 0;   // next event to apply
 
     for (uint32_t i=0; i<n_samp; ++i) {
-        // ── Proportional event distribution ───────────────────────────────────
-        // Apply every event whose mapped sample index is <= i.
-        // Event j maps to sample floor(j * n_samp / n_evts), distributing all
-        // wave-table / trigger writes evenly across the frame so each voice
-        // sample occupies its correct ~6-output-sample window.
-        // Division by n_evts is safe: the while guard (evt_idx < n_evts) ensures
-        // n_evts > 0 before the body is entered, so the n_evts == 0 case —
-        // which is the only one that could divide by zero — never reaches the
-        // division.  The early exit is implicit but guaranteed by the condition.
+        // ── Cycle-accurate event distribution ────────────────────────────────
+        // Apply every event whose T-cycle timestamp maps to sample index <= i.
+        // event.cycle is 0..GB_FRAME_CYC-1; due = cycle * n_samp / GB_FRAME_CYC.
+        // n_evts==0 is safe: the while guard ensures the body never executes.
         while (evt_idx < n_evts) {
             const uint32_t due = static_cast<uint32_t>(
-                static_cast<uint64_t>(evt_idx) * n_samp / n_evts);
+                static_cast<uint64_t>(evts[evt_idx].cycle) * n_samp / GB_FRAME_CYC);
             if (due > i) break;
             apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
             ++evt_idx;
@@ -532,10 +569,24 @@ void audio_write(const uint8_t addr, const uint8_t val) {
     if (addr>=0x10&&addr<=0x4F)
         s_ctrl.regs[addr-0x10]=val;
 
+    // Derive the T-cycle offset within the current frame directly from the
+    // emulator's own counters: LY (0..153) * 456 + lcd_count gives the exact
+    // T-cycle position.  This is zero-overhead and cycle-accurate.
+    // Wall-clock time cannot be used because the emulator runs faster than
+    // real-time (a 16.75 ms game frame may finish in ~2 ms), which would cause
+    // all events to cluster at sample 0 and destroy the Pikachu voice.
+    uint16_t cycle = 0;
+    if (s_gb_ptr) {
+        const uint32_t ly  = s_gb_ptr->hram_io[IO_LY];
+        const uint32_t lc  = s_gb_ptr->counter.lcd_count;
+        const uint32_t raw = ly * 456u + lc;
+        cycle = (uint16_t)(raw < GB_FRAME_CYC ? raw : GB_FRAME_CYC - 1u);
+    }
+
     const uint32_t w    = s_ctrl.evt_w.load(std::memory_order_relaxed);
     const uint32_t next = (w+1u)&EVT_MASK;
     if (next!=s_ctrl.evt_r.load(std::memory_order_acquire)){
-        s_ctrl.events[w]={addr,val};
+        s_ctrl.events[w]={addr,val,cycle};
         s_ctrl.evt_w.store(next,std::memory_order_release);
     }
 }
@@ -998,7 +1049,7 @@ static void gb_audio_submit() {
     const uint32_t w    = s_ctrl.evt_w.load(std::memory_order_relaxed);
     const uint32_t next = (w + 1u) & EVT_MASK;
     if (next != s_ctrl.evt_r.load(std::memory_order_acquire)) {
-        s_ctrl.events[w] = {0xFF, 0};
+        s_ctrl.events[w] = {0xFF, 0, 0};
         s_ctrl.evt_w.store(next, std::memory_order_release);
     }
 }

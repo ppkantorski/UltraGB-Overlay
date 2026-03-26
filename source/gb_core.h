@@ -1015,6 +1015,12 @@ void gb_unload_rom();
 // Must only be called when g_gb.running == true.
 inline void gb_run_one_frame() {
     if (g_gb.running) {
+        // Stamp the frame origin so every audio_write() call during this frame
+        // can compute an accurate T-cycle offset for generate_samples().
+        // Must be called immediately before gb_run_frame_dualfetch() so that
+        // delta_ns = (audio_write time) - (frame start time) is proportional
+        // to T-cycles elapsed in the frame.
+        gb_audio_mark_frame_start();
         gb_run_frame_dualfetch(&g_gb.gb);
         //gb_run_frame(&g_gb.gb);
     }

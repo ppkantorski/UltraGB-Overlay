@@ -19,9 +19,9 @@
 #include <ultra.hpp>
 #include <tesla.hpp>
 
+#include "gb_audio.h"       // ← GB APU → audout bridge  (must precede gb_core.h)
 #include "gb_core.h"
 #include "gb_renderer.h"
-#include "gb_audio.h"       // ← GB APU → audout bridge
 #include "elm_volume.hpp"    // ← VolumeTrackBar
 #include "elm_ultraframe.hpp" // ← UltraGBOverlayFrame (two-page frame)
 
@@ -896,6 +896,7 @@ bool gb_load_rom(const char* path) {
 
     // ── Init audio BEFORE gb_reset() so the APU callback is live from frame 1 ──
     gb_audio_init(&g_gb.gb);
+    gb_audio_set_gb_ptr(&g_gb.gb);  // give audio_write() cycle-accurate LY+lcd_count offsets
 
     // If load_state succeeded, gb_reset() must NOT be called — it would wipe
     // the restored CPU state.  If cold-booting, gb_reset() is already called
