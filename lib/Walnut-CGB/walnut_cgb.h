@@ -1792,6 +1792,16 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 	case 0x8:
 	case 0x9:
+		/* VRAM is hardware-locked during Mode 3 (LCD Draw / pixel
+		 * transfer). CPU writes during Mode 3 are silently ignored on
+		 * real hardware.  Without this guard the emulator lets room-
+		 * loading VRAM writes corrupt sprite tile data that the PPU is
+		 * actively reading, producing the "bookshelf sword" effect where
+		 * a sprite's pixel data is replaced by background tile graphics
+		 * while its OAM entry (position, palette, glow) stays intact. */
+		if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+		   (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+			return;
 #if WALNUT_FULL_GBC_SUPPORT
 		gb->vram[addr - gb->cgb.vramBankOffset] = val;
 #else
@@ -1868,6 +1878,18 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 		if(addr < UNUSED_ADDR)
 		{
+			/* OAM is hardware-locked during Mode 2 (OAM Scan) and Mode 3
+			 * (LCD Draw) when the LCD is enabled.  CPU writes during these
+			 * modes are silently ignored on real hardware.  Without this
+			 * guard the emulator applies mid-frame OAM writes that real HW
+			 * would discard, causing progressive sprite corruption in games
+			 * (e.g. Link's Awakening DX: Link's glyph/orientation glitch
+			 * when repeatedly interacting with an NPC while charging the
+			 * sword — each poke lands an OAM write during active display,
+			 * slowly corrupting which tile/flip data the PPU sees). */
+			if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+			   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+				return;
 			gb->oam[addr - OAM_ADDR] = val;
 			return;
 		}
@@ -2353,6 +2375,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
     switch (WALNUT_GB_GET_MSN16(addr)) {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             dst = &gb->vram[addr - gb->cgb.vramBankOffset];
 #else
@@ -2381,6 +2406,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
                 dst = &gb->wram[addr - ECHO_ADDR];
 #endif
             } else if (addr < UNUSED_ADDR) {
+                if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+                   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+                    return;
                 dst = &gb->oam[addr - OAM_ADDR];
             }
             break;
@@ -2414,6 +2442,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
     switch (WALNUT_GB_GET_MSN16(addr)) {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             *(uint32_t*)&gb->vram[addr - gb->cgb.vramBankOffset] = val;
 #else
@@ -2444,6 +2475,9 @@ void __gb_write32(struct gb_s *gb, uint16_t addr, uint32_t val) {
                 return;
             }
             if(addr < UNUSED_ADDR) {
+                if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+                   (gb->hram_io[IO_STAT] & STAT_MODE) >= IO_STAT_MODE_OAM_SCAN)
+                    return;
                 *(uint32_t*)&gb->oam[addr - OAM_ADDR] = val;
                 return;
             }
@@ -2468,6 +2502,9 @@ void __gb_write16(struct gb_s *gb, uint_fast16_t addr, uint16_t val)
     {
         case 0x8: // VRAM
         case 0x9:
+            if((gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&
+               (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW)
+                return;
 #if WALNUT_FULL_GBC_SUPPORT
             *((uint16_t *)(gb->vram + (addr - gb->cgb.vramBankOffset))) = val;
 #else
