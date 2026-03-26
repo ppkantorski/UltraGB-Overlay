@@ -965,9 +965,51 @@ static void gb_lcd_draw_line(struct gb_s* gb,
 
 #if WALNUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode) {
-        // CGB path: fixPalette is pre-built RGB565 — one lookup per pixel.
-        for (int x = 0; x < GB_W; x++)
-            row[x] = gb->cgb.fixPalette[pixels[x]];
+        if (g_fb_is_prepacked) {
+            // CGB-compatible game running in CGB hardware mode but displaying
+            // with a user-chosen DMG palette (DMG-green / Native grey).
+            // The emulator core keeps cgbMode=1 so all CGB hardware (double
+            // speed, VRAM banking, CGB palettes) runs correctly.  Only the
+            // display output is re-routed through the DMG flat palette.
+            //
+            // CGB pixel-index layout (Walnut CGB scanline renderer):
+            //   0x00–0x1F  BG  (palette_num[4:2] × 4 + color_id[1:0])
+            //   0x20–0x3F  OBJ (palette_num[4:2] × 4 + color_id[1:0] + 0x20)
+            //   bits[1:0]  = raw color_id from tile data — NOT a shade value.
+            //
+            // WHY WE CANNOT USE (px & 0x03) AS SHADE:
+            //   In CGB mode, color_id (bits[1:0]) is a raw index into the
+            //   game's CGB palette registers.  The game defines what RGB color
+            //   each index means.  A CGB-compat game may put color 0 = black
+            //   and color 3 = white (inverse of DMG convention), producing
+            //   inverted glyphs and colors when the raw index is used as shade.
+            //
+            // CORRECT APPROACH: look up the true RGB565 color from
+            //   fixPalette[px], compute perceptual luminance, and map to
+            //   shade 0 (lightest) … 3 (darkest) for the DMG palette.
+            //
+            // BT.601-approximate luma (all channels normalised to 5-bit):
+            //   luma = (R×2 + G5×5 + B) / 8,  range 0–31
+            //   shade = 3 − (luma >> 3)         (inverted: high luma = light)
+            for (int x = 0; x < GB_W; x++) {
+                const uint8_t  px  = pixels[x];
+                const uint16_t rgb = gb->cgb.fixPalette[px];
+                // RGB565: R=[15:11] 5-bit, G=[10:5] 6-bit, B=[4:0] 5-bit
+                const uint8_t r  = (uint8_t)((rgb >> 11) & 0x1Fu);
+                const uint8_t g5 = (uint8_t)((rgb >>  6) & 0x1Fu);  // top 5 of 6 green bits
+                const uint8_t b  = (uint8_t)( rgb        & 0x1Fu);
+                // Perceptual luma 0–31 (max = (31×2+31×5+31)/8 = 31)
+                const uint8_t luma  = (uint8_t)((r * 2u + g5 * 5u + b) / 8u);
+                // shade 0 = lightest (luma 24–31), shade 3 = darkest (luma 0–7)
+                const uint8_t shade = 3u - (luma >> 3u);
+                // Route through BG or OBJ sub-palette slot
+                row[x] = g_dmg_flat_pal[(px < 0x20u) ? (0x20u | shade) : shade];
+            }
+        } else {
+            // Normal CGB path: fixPalette is pre-built RGB565 — one lookup per pixel.
+            for (int x = 0; x < GB_W; x++)
+                row[x] = gb->cgb.fixPalette[pixels[x]];
+        }
         return;
     }
 #endif
