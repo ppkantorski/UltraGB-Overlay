@@ -1934,7 +1934,7 @@ public:
 // Opened by pressing Y on a ROM entry in RomSelectorGui.
 //
 // Items shown:
-//   • "Pallet Mode" (DMG Games only) — single cycling item (GBC → DMG → Native)
+//   • "Pallet Mode" — cycling (GBC → DMG → Native) for DMG games; read-only "GBC" for GBC games
 //   • "Save States" — opens SaveStatesGui with 10 named slots
 //   • "Reset"       — cold-boots the game (deletes internal state first)
 //
@@ -1998,8 +1998,21 @@ public:
         list->addItem(new tsl::elm::CategoryHeader("Display"));
 
 
-        // ── Pallet Mode (DMG only) ─────────────────────────────────────────
-        if (!isCgb) {
+        // ── Pallet Mode ───────────────────────────────────────────────────
+        // Always shown so the user can see which palette is active.
+        // GBC games are locked to "GBC" hardware colour — clicking does nothing.
+        // DMG games cycle through GBC → DMG → Native on each A press.
+        if (isCgb) {
+            auto* palItem = new tsl::elm::ListItem("Pallet Mode", "GBC");
+            palItem->setValueColor(tsl::offTextColor);
+            palItem->setClickListener([](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                // GBC games always use hardware colour; mode is not configurable.
+                show_notify("Only supports GBC pallet.");
+                return true;
+            });
+            list->addItem(palItem);
+        } else {
             const PaletteMode current = load_game_palette_mode(romPath.c_str());
             const char* modeLabel = palette_mode_label(current);
 
@@ -2018,7 +2031,7 @@ public:
                     g_palette_mode = next;
                     gb_select_dmg_palette();
                 }
-                triggerNavigationFeedback();
+                //triggerNavigationFeedback();
                 palItem->setValue(palette_mode_label(next));
                 return true;
             });
