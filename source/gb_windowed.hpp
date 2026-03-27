@@ -70,12 +70,22 @@
 //                + ((y&8)<<5) + ((y&6)<<4) + ((y&1)<<3)
 //
 // Arrays are sized for maximum 3× scale: 480 cols, 432 rows.
-static uint32_t s_win_col[GB_W * 3];  // up to 480 entries (3× scale)
-static uint32_t s_win_row[GB_H * 3];  // up to 432 entries (3× scale)
+static uint32_t s_win_col[GB_W * 4];  // up to 640 entries (4× scale)
+static uint32_t s_win_row[GB_H * 4];  // up to 576 entries (4× scale)
 static bool     s_win_lut_ready = false;
 // Set true by GBWindowedGui::handleInput while a touch-drag reposition is active.
 // Read by GBWindowedElement::draw to overlay a 4-pixel red border on the frame.
 static bool     s_win_dragging  = false;
+static int      s_focus_flash   = 0;     // counts down each draw; 0 = hidden
+static bool     s_focus_flash_red = false; // true=red (focus lost), false=green (focus gained)
+
+// Update the notification hit-test offsets to match the current VI layer position.
+// Must be called whenever g_win_pos_x / g_win_pos_y change.
+static void sync_notif_touch_offsets() {
+    // layerEdge already drives the notification hit-test X — repurpose it.
+    ult::layerEdge = (g_win_pos_x * 2) / 3;
+    tsl::layerEdgeY = (g_win_pos_y * 2) / 3;
+}
 
 // Build col/row LUT for the given scale.  Called once per windowed session
 // (statics are zero-initialised on each overlay launch → s_win_lut_ready=false).
@@ -187,6 +197,24 @@ public:
                     }
                 }
             }
+        }
+
+        // ── Pass-through flash border ────────────────────────────────────────
+        if (s_focus_flash > 0) {
+            const s32 fw = static_cast<s32>(GB_W * g_win_scale);
+            const s32 fh = static_cast<s32>(GB_H * g_win_scale);
+            const u8  al = s_focus_flash > 15
+                ? static_cast<u8>(0xF)
+                : static_cast<u8>(s_focus_flash * 0xF / 15);
+            const tsl::Color fc = s_focus_flash_red
+                ? tsl::Color{0xF, 0x0, 0x0, al}
+                : tsl::Color{0x0, 0xF, 0x0, al};
+            static constexpr int B = 4;
+            renderer->drawRect(0,      0,       fw, B,           fc);
+            renderer->drawRect(0,      fh - B,  fw, B,           fc);
+            renderer->drawRect(0,      B,       B,  fh - B * 2,  fc);
+            renderer->drawRect(fw - B, B,       B,  fh - B * 2,  fc);
+            --s_focus_flash;
         }
 
         // ── Reposition overlay ────────────────────────────────────────────────
@@ -436,6 +464,7 @@ public:
         tsl::gfx::Renderer::get().setLayerPos(
             static_cast<u32>(g_win_pos_x),
             static_cast<u32>(g_win_pos_y));
+        sync_notif_touch_offsets();
 
         // Minimal frame: no chrome, owns GBWindowedElement.
         auto* frame = new GBWindowedFrame();
@@ -523,7 +552,9 @@ public:
                     // Second press within the window — commit the toggle.
                     m_pass_through = !m_pass_through;
                     tsl::hlp::requestForeground(!m_pass_through);
-                    m_zl_first_seen = false;
+                    m_zl_first_seen  = false;
+                    s_focus_flash_red = m_pass_through; // true=lost focus, false=gained
+                    s_focus_flash     = 45;
                 } else {
                     // First press — record it and wait.
                     m_zl_first_seen  = true;
@@ -693,6 +724,8 @@ public:
                             tsl::gfx::Renderer::get().setLayerPos(
                                 static_cast<u32>(g_win_pos_x),
                                 static_cast<u32>(g_win_pos_y));
+                            sync_notif_touch_offsets();
+                        sync_notif_touch_offsets();
                         }
                     }
                 }
@@ -763,6 +796,8 @@ public:
     void exitServices() override {
         tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
         tsl::disableHiding = false;  // restore default for any subsequent overlay
+        ult::layerEdge  = 0;       // restore for normal overlay hit-tests
+        tsl::layerEdgeY = 0;
         gb_unload_rom();             // saves quick-resume state + SRAM
         gb_audio_free_dma();
         free_lcd_ghosting();

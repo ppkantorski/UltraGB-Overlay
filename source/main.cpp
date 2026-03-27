@@ -186,13 +186,18 @@ static void load_config() {
         parse_pos(ult::parseValueFromIniSection(path, "config", "win_pos_y"), g_win_pos_y);
     }
 
-    // win_scale — windowed display scale: 1, 2, or 3 (default 1).
+    // win_scale — windowed display scale: 1, 2, 3, or 4 (default 1).
     // Any absent or unrecognised value falls back to 1.
+    // 4× is clamped to 3× at runtime on limitedMemory without touching the
+    // saved value — so switching back to a normal-memory session restores 4×.
     {
         const std::string sv = ult::parseValueFromIniSection(path, "config", "win_scale");
         if      (sv == "2") g_win_scale = 2;
         else if (sv == "3") g_win_scale = 3;
+        else if (sv == "4") g_win_scale = 4;
         else                g_win_scale = 1;
+        if (ult::limitedMemory && g_win_scale == 4)
+            g_win_scale = 3;  // runtime clamp only — config keeps "4"
     }
 }
 
@@ -248,7 +253,8 @@ static void save_win_pos() {
 // The new scale takes effect the next time the user launches a ROM in
 // windowed mode (setNextOverlay reads it before Tesla initialises the layer).
 static void save_win_scale() {
-    const char* s = (g_win_scale == 3) ? "3"
+    const char* s = (g_win_scale == 4) ? "4"
+                  : (g_win_scale == 3) ? "3"
                   : (g_win_scale == 2) ? "2"
                   :                      "1";
     ult::setIniFileValue(kConfigFile, "config", "win_scale", s, "");
@@ -2756,19 +2762,25 @@ public:
         list->addItem(win_item);
 
         // ── Windowed Scale ────────────────────────────────────────────────────
-        // Cycles 1× → 2× → 3× → 1× on each A press.
+        // Cycles 1× → 2× → 3× → 4× → 1× on each A press.
+        // On limitedMemory, 4× is unavailable: the cycle caps at 3× and the
+        // label shows 3× even if the saved config value is 4×.  The config is
+        // NOT overwritten — switching back to a normal-memory session restores 4×.
         // Only takes effect on the next windowed launch (the VI layer size is
         // fixed at overlay startup).  Shown regardless of windowed mode state
         // so the user can configure it before enabling windowed mode.
         {
-            const char* scale_labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97" };
+            const char* scale_labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
+            const int maxScale     = ult::limitedMemory ? 3 : 4;
+            const int displayScale = std::min(g_win_scale, maxScale);
             auto* scale_item = new tsl::elm::ListItem("Windowed Scale",
-                                                       scale_labels[g_win_scale - 1]);
-            scale_item->setClickListener([scale_item](u64 keys) -> bool {
+                                                       scale_labels[displayScale - 1]);
+            scale_item->setClickListener([scale_item, maxScale](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                // Cycle: 1 → 2 → 3 → 1
-                g_win_scale = (g_win_scale % 3) + 1;
-                const char* labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97" };
+                // Cycle from the effective (possibly clamped) display value.
+                const int cur = std::min(g_win_scale, maxScale);
+                g_win_scale = (cur % maxScale) + 1;
+                const char* labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
                 scale_item->setValue(labels[g_win_scale - 1]);
                 save_win_scale();
                 triggerNavigationFeedback();
@@ -3134,7 +3146,17 @@ int main(int argc, char* argv[]) {
                     kConfigFile, "config", "win_scale");
                 if      (sv == "2") g_win_scale = 2;
                 else if (sv == "3") g_win_scale = 3;
+                else if (sv == "4") g_win_scale = 4;
                 else                g_win_scale = 1;
+
+                // Mirror Tesla's heap check (tsl::loop does the same at startup).
+                // If we are on a 4 MB heap and the saved scale is 4×, clamp it
+                // to 3× now — before the VI layer is sized — but do NOT save,
+                // so switching back to a normal-memory session restores 4×.
+                const bool earlyLimitedMemory =
+                    (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
+                if (earlyLimitedMemory && g_win_scale == 4)
+                    g_win_scale = 3;  // runtime clamp only — config keeps "4"
             }
             ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
             ult::DefaultFramebufferHeight = GB_H * g_win_scale;
