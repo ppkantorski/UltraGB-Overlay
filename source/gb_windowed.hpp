@@ -120,7 +120,7 @@ public:
 
         // ── Emulation clock ───────────────────────────────────────────────────
         ++g_frame_count;
-        {
+        if (!s_win_dragging) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
@@ -189,18 +189,32 @@ public:
             }
         }
 
-        // ── Drag reposition indicator ─────────────────────────────────────────
-        // Draw a 4-pixel red border on the inside of the frame while the user
-        // is hold-dragging to reposition the window.
+        // ── Reposition overlay ────────────────────────────────────────────────
+        // While dragging: dim the frozen frame and show "Paused" centred.
         if (s_win_dragging) {
             const s32 fw = static_cast<s32>(GB_W * g_win_scale);
             const s32 fh = static_cast<s32>(GB_H * g_win_scale);
+
+            // Semi-transparent black veil (~50 % opacity in RGBA4444).
+            static constexpr tsl::Color DIM = {0x0, 0x0, 0x0, 0x8};
+            renderer->drawRect(0, 0, fw, fh, DIM);
+
+            // Red border (4 px) so the window boundary is obvious.
             static constexpr int        BORD = 4;
             static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
-            renderer->drawRect(0,        0,        fw,   BORD, RED);  // top
-            renderer->drawRect(0,        fh - BORD, fw,  BORD, RED);  // bottom
-            renderer->drawRect(0,        BORD,     BORD, fh - BORD * 2, RED);  // left
-            renderer->drawRect(fw - BORD, BORD,    BORD, fh - BORD * 2, RED);  // right
+            renderer->drawRect(0,         0,          fw,   BORD,              RED);
+            renderer->drawRect(0,         fh - BORD,  fw,   BORD,              RED);
+            renderer->drawRect(0,         BORD,       BORD, fh - BORD * 2,     RED);
+            renderer->drawRect(fw - BORD, BORD,       BORD, fh - BORD * 2,     RED);
+
+            // "Paused" centred in white.
+            static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
+            const u32 fontSize = static_cast<u32>(14 * g_win_scale);
+            const auto [tw, th] = renderer->getTextDimensions("Paused", false, fontSize);
+            renderer->drawString("Paused", false,
+                (fw - static_cast<s32>(tw)) / 2,
+                (fh + static_cast<s32>(th)) / 2,
+                fontSize, WHITE);
         }
     }
 
@@ -529,6 +543,7 @@ public:
                 if (!m_dragging && m_hold_frames >= HOLD_FRAMES) {
                     m_dragging      = true;
                     s_win_dragging  = true;
+                    gb_audio_pause();
                     // Re-anchor to wherever the finger is right now so the
                     // window doesn't jump from any drift during the hold period.
                     m_touch_start_x = tx;
@@ -568,6 +583,8 @@ public:
                 if (m_dragging) {
                     save_win_pos();        // persist VI coords to config.ini
                     triggerExitFeedback(); // haptic: position locked
+                    gb_audio_resume();
+                    g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                 }
                 s_win_dragging = false;
                 m_hold_armed  = false;
@@ -599,6 +616,7 @@ public:
                     if (ult::nowNs() - m_plus_hold_start_ns >= PLUS_HOLD_NS) {
                         m_plus_dragging = true;
                         s_win_dragging  = true;
+                        gb_audio_pause();
                         m_joy_acc_x     = 0.f;
                         m_joy_acc_y     = 0.f;
                         triggerNavigationFeedback(); // haptic: drag started
@@ -646,6 +664,8 @@ public:
                     if (m_plus_dragging) {
                         save_win_pos();        // persist VI coords to config.ini
                         triggerExitFeedback(); // haptic: position locked
+                        gb_audio_resume();
+                        g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                         s_win_dragging  = false;
                         m_plus_dragging = false;
                     }
