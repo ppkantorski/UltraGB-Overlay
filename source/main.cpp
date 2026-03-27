@@ -80,7 +80,8 @@ static u8 g_vol_backup = 100;
 // ── Windowed mode ─────────────────────────────────────────────────────────────
 // When true the ROM selector relaunches this overlay with -windowed <path>,
 // rendering the Game Boy screen as a small draggable window with no UI chrome.
-static bool g_windowed_mode = false;
+static bool g_windowed_mode  = false;
+static bool g_ingame_haptics = true;
 
 // Full path to this .ovl — captured from argv[0] so WindowedOverlay can
 // pass it to setNextOverlay when the launch combo is pressed to return here.
@@ -170,6 +171,10 @@ static void load_config() {
     if (!win_val.empty())
         g_windowed_mode = (win_val == "1");
 
+    const std::string hap_val = ult::parseValueFromIniSection(path, "config", "ingame_haptics");
+    if (!hap_val.empty())
+        g_ingame_haptics = (hap_val != "0");
+
     // win_pos_x / win_pos_y — persisted VI-space window position
     {
         // Digit-safe integer parser (no std::stoi — exceptions disabled).
@@ -215,6 +220,7 @@ static void write_default_config_if_missing() {
     set_if_missing("vol_backup",    "100");
     set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
+    set_if_missing("ingame_haptics", "1");
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
@@ -2014,7 +2020,7 @@ public:
 
         // Trigger rumble ONLY on new touch presses (not holds)
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
-        if (newTouchPresses) {
+        if (newTouchPresses && g_ingame_haptics) {
             triggerRumbleClick.store(true, std::memory_order_release);
         }
         m_prevTouchKeys = g_touch_keys;
@@ -2050,8 +2056,9 @@ public:
         gb_set_input(keysHeld | keysDown | g_touch_keys);
 
         // Trigger rumble on ANY new button press
-        if (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
-                        KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)) {
+        if (g_ingame_haptics &&
+            (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
+                         KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT))) {
             triggerRumbleClick.store(true, std::memory_order_release);
         }
 
@@ -2788,6 +2795,18 @@ public:
             });
             list->addItem(scale_item);
         }
+
+        // ── Input ────────────────────────────────────
+        list->addItem(new tsl::elm::CategoryHeader("Input"));
+
+        auto* haptics_item = new tsl::elm::ToggleListItem(
+            "In-Game Haptics", g_ingame_haptics, ult::ON, ult::OFF);
+        haptics_item->setStateChangedListener([](bool state) {
+            g_ingame_haptics = state;
+            ult::setIniFileValue(kConfigFile, "config", "ingame_haptics",
+                                 state ? "1" : "0", "");
+        });
+        list->addItem(haptics_item);
 
         // Footer: left-arrow "Games" button.
         // frame takes ownership of list; Tesla takes ownership of frame.

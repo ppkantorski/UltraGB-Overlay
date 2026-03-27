@@ -533,8 +533,13 @@ public:
         // joystick drag) so the game never sees buttons held during repositioning.
         // Also suppress when pass-through is active: foreground has been released
         // so the background app owns HID natively; we must not double-route input.
-        if (!m_dragging && !m_plus_dragging && !m_pass_through)
+        if (!m_dragging && !m_plus_dragging && !m_pass_through) {
             gb_set_input(keysHeld | keysDown);
+            if (g_ingame_haptics &&
+                (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
+                             KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
+                triggerRumbleClick.store(true, std::memory_order_release);
+        }
 
         // ── ZL double-click-hold: toggle background pass-through ──────────────
         // Double-clicking ZL (second press within ZL_DCLICK_WINDOW frames) toggles
