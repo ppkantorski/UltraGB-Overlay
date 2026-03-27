@@ -313,6 +313,8 @@ class GBWindowedGui : public tsl::Gui {
     static constexpr int      HOLD_FRAMES      = 60;
     // ZR double-click window for fast-forward toggle.
     static constexpr int      ZR_DCLICK_WINDOW = 20;
+    // ZL double-click window for background pass-through toggle.
+    static constexpr int      ZL_DCLICK_WINDOW = 20;
     // KEY_PLUS must be held alone for this long before joystick drag activates.
     static constexpr uint64_t PLUS_HOLD_NS     = 2'000'000'000ULL;  // 2 seconds
     // Joystick deadzone (HidAnalogStickState range: –32767..32767).
@@ -321,6 +323,11 @@ class GBWindowedGui : public tsl::Gui {
     
     bool     m_zr_first_seen  = false;
     uint32_t m_zr_first_frame = 0;
+
+    // ZL double-click-hold: background pass-through toggle.
+    bool     m_zl_first_seen  = false;
+    uint32_t m_zl_first_frame = 0;
+    bool     m_pass_through   = false;  // true = foreground released; background gets HID
 
     // True until the first frame where no keys AND no touch are active.
     // Prevents the ROM-tap touch (or any button held at launch) from
@@ -495,8 +502,39 @@ public:
         // ── Physical buttons → GB joypad ──────────────────────────────────────
         // Suppress all input while any reposition mode is active (touch drag or
         // joystick drag) so the game never sees buttons held during repositioning.
-        if (!m_dragging && !m_plus_dragging)
+        // Also suppress when pass-through is active: foreground has been released
+        // so the background app owns HID natively; we must not double-route input.
+        if (!m_dragging && !m_plus_dragging && !m_pass_through)
             gb_set_input(keysHeld | keysDown);
+
+        // ── ZL double-click-hold: toggle background pass-through ──────────────
+        // Double-clicking ZL (second press within ZL_DCLICK_WINDOW frames) toggles
+        // pass-through mode.  In pass-through mode requestForeground(false) releases
+        // HID ownership so the Switch routes controller input natively to whatever
+        // app/game is running underneath.  requestForeground(true) reclaims it so
+        // gb_set_input can drive the emulator again.
+        // Note: ZL reaching handleInput means the overlay is still shown — Tesla
+        // continues drawing the game frame, but controller input bypasses us.
+        {
+            const bool zl_down = (keysDown & KEY_ZL) != 0;
+            if (zl_down) {
+                if (m_zl_first_seen &&
+                    (g_frame_count - m_zl_first_frame) <= static_cast<uint32_t>(ZL_DCLICK_WINDOW)) {
+                    // Second press within the window — commit the toggle.
+                    m_pass_through = !m_pass_through;
+                    tsl::hlp::requestForeground(!m_pass_through);
+                    m_zl_first_seen = false;
+                } else {
+                    // First press — record it and wait.
+                    m_zl_first_seen  = true;
+                    m_zl_first_frame = g_frame_count;
+                }
+            }
+            // Expire a stale first-press that was never followed up.
+            if (m_zl_first_seen &&
+                (g_frame_count - m_zl_first_frame) > static_cast<uint32_t>(ZL_DCLICK_WINDOW))
+                m_zl_first_seen = false;
+        }
 
         // ── Touch hold-to-drag (via direct HID poll) ──────────────────────────
         // Coordinate spaces:
@@ -723,6 +761,7 @@ public:
     }
 
     void exitServices() override {
+        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
         tsl::disableHiding = false;  // restore default for any subsequent overlay
         gb_unload_rom();             // saves quick-resume state + SRAM
         gb_audio_free_dma();
@@ -730,6 +769,7 @@ public:
     }
 
     void onHide() override {
+        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
         g_gb.running   = false;
         g_emu_active   = false;
         gb_audio_pause();
