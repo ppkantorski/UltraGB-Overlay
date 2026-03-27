@@ -344,7 +344,7 @@ class GBWindowedGui : public tsl::Gui {
     // ZL double-click window for background pass-through toggle.
     static constexpr int      ZL_DCLICK_WINDOW = 20;
     // KEY_PLUS must be held alone for this long before joystick drag activates.
-    static constexpr uint64_t PLUS_HOLD_NS     = 2'000'000'000ULL;  // 2 seconds
+    static constexpr uint64_t PLUS_HOLD_NS     = 1'000'000'000ULL;  // 1 second — matches HOLD_FRAMES (~60 frames at 60 fps)
     // Joystick deadzone (HidAnalogStickState range: –32767..32767).
     static constexpr int      JOY_DEADZONE     = 20;
     // Mask of all physical buttons — used to confirm KEY_PLUS is held *alone*.

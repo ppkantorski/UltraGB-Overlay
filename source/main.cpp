@@ -2783,7 +2783,7 @@ public:
                 const char* labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
                 scale_item->setValue(labels[g_win_scale - 1]);
                 save_win_scale();
-                triggerNavigationFeedback();
+                //triggerNavigationFeedback();
                 return true;
             });
             list->addItem(scale_item);
