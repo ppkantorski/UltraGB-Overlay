@@ -775,7 +775,8 @@ extern PaletteMode g_palette_mode;
 
 // ── Global emulator state ─────────────────────────────────────────────────────
 struct GBState {
-    struct gb_s gb;          // Peanut-GB core state (~8 KB, on BSS)
+    struct gb_s* gb = nullptr;  // Peanut-GB core state — heap-allocated on game load,
+                                // freed on unload (~49 KB WRAM+VRAM off BSS when idle)
 
     uint8_t*    rom       = nullptr;
     size_t      romSize   = 0;
@@ -793,7 +794,8 @@ extern GBState   g_gb;
 // g_gb_fb stores RGB555 for CGB games and pre-packed RGBA4444 for DMG games
 // (when g_fb_is_prepacked is true).  The renderer checks this flag to skip
 // the per-run colour conversion entirely in the DMG hot path.
-extern uint16_t  g_gb_fb[GB_W * GB_H];
+// Heap-allocated in gb_load_rom, freed in gb_unload_rom (~45 KB off BSS when idle).
+extern uint16_t* g_gb_fb;
 extern bool      g_fb_is_prepacked;  // true → g_gb_fb already contains RGBA4444
 
 // ── RGB555 → RGBA4444 packer ─────────────────────────────────────────────────
@@ -958,8 +960,8 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
 // s_prev_fb (raw previous frame).  See gb_renderer.h for details.
 static void gb_lcd_draw_line(struct gb_s* gb,
                               const uint8_t* pixels,
-                              const uint_fast8_t line)
-{
+                              const uint_fast8_t line) {
+    
     if ((int)line >= GB_H) return;
     uint16_t* row = g_gb_fb + (int)line * GB_W;
 
@@ -1063,8 +1065,8 @@ inline void gb_run_one_frame() {
         // delta_ns = (audio_write time) - (frame start time) is proportional
         // to T-cycles elapsed in the frame.
         gb_audio_mark_frame_start();
-        gb_run_frame_dualfetch(&g_gb.gb);
-        //gb_run_frame(&g_gb.gb);
+        gb_run_frame_dualfetch(g_gb.gb);
+        //gb_run_frame(g_gb.gb);
     }
 }
 
