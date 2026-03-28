@@ -2184,22 +2184,41 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			gb->hram_io[IO_BOOT] = 0x01;
 			return;
 #if WALNUT_FULL_GBC_SUPPORT
-		/* DMA Register */
+		/* HDMA Source High */
 		case 0x51:
-			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF) + (val << 8);
+			if(!gb->cgb.cgbMode) return;
+			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0x00F0) | ((uint16_t)val << 8);
+			/* Addresses in the 0xEXXX range alias to 0xFXXX on hardware. */
+			if(gb->cgb.dmaSource >= 0xE000) gb->cgb.dmaSource |= 0xF000;
 			return;
+		/* HDMA Source Low — hardware forces 16-byte alignment */
 		case 0x52:
-			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF00) + val;
+			if(!gb->cgb.cgbMode) return;
+			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF00) | (val & 0xF0);
 			return;
+		/* HDMA Dest High */
 		case 0x53:
-			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF) + (val << 8);
+			if(!gb->cgb.cgbMode) return;
+			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0x00F0) | ((uint16_t)val << 8);
 			return;
+		/* HDMA Dest Low — hardware forces 16-byte alignment */
 		case 0x54:
-			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF00) + val;
+			if(!gb->cgb.cgbMode) return;
+			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF00) | (val & 0xF0);
 			return;
 
 		/* DMA Register*/
 		case 0x55:
+			/* Cancel a running HBlank DMA: bit7=0 written while in
+			 * progress (dmaMode=1, dmaActive=0).  Return before touching
+			 * dmaSize so FF55 readback still reports the correct
+			 * remaining block count.                                    */
+			if(!(val & 0x80) && gb->cgb.dmaMode && !gb->cgb.dmaActive)
+			{
+				gb->cgb.dmaMode   = 0;
+				gb->cgb.dmaActive = 1;  /* mark idle/cancelled */
+				return;
+			}
 			gb->cgb.dmaSize = (val & 0x7F) + 1;
 			gb->cgb.dmaMode = val >> 7;
 			//DMA GBC
@@ -2272,22 +2291,29 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 				}
 #endif			
 			}
-			/* Pan Docs: if LCD is off and HDMA requested, complete immediately. */
-			/* HDMA started while LCD is already off never fires (per-HBlank path */
-			/* is skipped in lcd_off timing loop), so game polls FF55 forever.   */
-			if(gb->cgb.dmaMode && !(gb->hram_io[IO_LCDC] & LCDC_ENABLE) && gb->cgb.dmaActive)
+			/* Set the active flag before the LCD-off flush check so the
+			 * check always sees the correct in-progress state regardless
+			 * of the previous dmaActive value.
+			 * Convention: dmaActive=0 = HBlank DMA in progress,
+			 *              dmaActive=1 = idle / GDMA done.             */
+			gb->cgb.dmaActive = gb->cgb.dmaMode ^ 1;
+
+			/* Pan Docs: if LCD is off and HBlank DMA is requested, fire
+			 * all remaining blocks immediately (CPU is not running the
+			 * display state machine, so per-HBlank triggers never come).
+			 * dmaActive==0 here because we just set it above for a new
+			 * HBlank DMA (dmaMode==1 → dmaActive = 1^1 = 0).           */
+			if(gb->cgb.dmaMode && !(gb->hram_io[IO_LCDC] & LCDC_ENABLE) && !gb->cgb.dmaActive)
 			{
 				for(uint16_t i = 0; i < ((uint16_t)gb->cgb.dmaSize << 4); i++)
 					__gb_write(gb,
 						((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
 						__gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
-				gb->cgb.dmaSource += (gb->cgb.dmaSize << 4);
-				gb->cgb.dmaDest   += (gb->cgb.dmaSize << 4);
+				gb->cgb.dmaSource += ((uint16_t)gb->cgb.dmaSize << 4);
+				gb->cgb.dmaDest   += ((uint16_t)gb->cgb.dmaSize << 4);
 				gb->cgb.dmaSize    = 0;
-				gb->cgb.dmaActive  = 1;
-				return;
+				gb->cgb.dmaActive  = 1;  /* mark done */
 			}
-			gb->cgb.dmaActive = gb->cgb.dmaMode ^ 1;  // set active if it's an HBlank DMA
 			return;
 
 		/* IR Register*/
@@ -2875,10 +2901,14 @@ void __gb_draw_line(struct gb_s *gb)
 		if(cgbMode)
 		{
 			if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
-			if(idxAtt & 0x40) tile += 2 * (7 - py);
+			if(idxAtt & 0x40)
+				tile += 2 * (7 - py); //Y-flip
+			else
+				tile += 2 * py;
 		}
-		if(!(idxAtt & 0x40))
+		else
 		{
+			/* DMG / DMG-compat: no attribute bytes, always forward row */
 			tile += 2 * py;
 		}
 
@@ -2923,10 +2953,14 @@ void __gb_draw_line(struct gb_s *gb)
 				if(cgbMode)
 				{
 					if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
-					if(idxAtt & 0x40) tile += 2 * (7 - py);
+					if(idxAtt & 0x40)
+						tile += 2 * (7 - py); //Y-flip
+					else
+						tile += 2 * py;
 				}
-				if(!(idxAtt & 0x40))
+				else
 				{
+					/* DMG / DMG-compat: no attribute bytes, always forward row */
 					tile += 2 * py;
 				}
 #else
@@ -2956,7 +2990,13 @@ void __gb_draw_line(struct gb_s *gb)
 				}
 				else
 				{
-					pixels[disp_x] = gb->display.bg_palette[c];
+					/* Encode raw colour index c in bits[3:2].
+					 * bits[1:0] = palette-mapped shade (for lcd_draw_line).
+					 * bits[3:2] = raw colour index (for sprite-behind-BG priority).
+					 * lcd_draw_line masks with 0x33 so bits[3:2] are invisible to it.
+					 * On real hardware, OBJ-behind-BG priority tests the raw colour
+					 * index (0 = transparent), not the palette-mapped shade. */
+					pixels[disp_x] = gb->display.bg_palette[c] | (c << 2);
 #if WALNUT_GB_12_COLOUR
 					pixels[disp_x] |= LCD_PALETTE_BG;
 #endif
@@ -2966,7 +3006,7 @@ void __gb_draw_line(struct gb_s *gb)
 			}
 #else
 			c = (t1 & 0x1) | ((t2 & 0x1) << 1);
-			pixels[disp_x] = gb->display.bg_palette[c];
+			pixels[disp_x] = gb->display.bg_palette[c] | (c << 2);
 #if WALNUT_GB_12_COLOUR
 			pixels[disp_x] |= LCD_PALETTE_BG;
 #endif
@@ -3010,10 +3050,14 @@ void __gb_draw_line(struct gb_s *gb)
 		if(cgbMode)
 		{
 			if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
-			if(idxAtt & 0x40) tile += 2 * (7 - py);
+			if(idxAtt & 0x40)
+				tile += 2 * (7 - py); //Y-flip
+			else
+				tile += 2 * py;
 		}
-		if(!(idxAtt & 0x40))
+		else
 		{
+			/* DMG / DMG-compat: no attribute bytes, always forward row */
 			tile += 2 * py;
 		}
 
@@ -3061,10 +3105,14 @@ void __gb_draw_line(struct gb_s *gb)
 				if(cgbMode)
 				{
 					if(idxAtt & 0x08) tile += 0x2000; //VRAM bank 2
-					if(idxAtt & 0x40) tile += 2 * (7 - py);
+					if(idxAtt & 0x40)
+						tile += 2 * (7 - py); //Y-flip
+					else
+						tile += 2 * py;
 				}
-				if(!(idxAtt & 0x40))
+				else
 				{
+					/* DMG / DMG-compat: no attribute bytes, always forward row */
 					tile += 2 * py;
 				}
 #else
@@ -3094,7 +3142,7 @@ void __gb_draw_line(struct gb_s *gb)
 				}
 				else
 				{
-					pixels[disp_x] = gb->display.bg_palette[c];
+					pixels[disp_x] = gb->display.bg_palette[c] | (c << 2);
 #if WALNUT_GB_12_COLOUR
 					pixels[disp_x] |= LCD_PALETTE_BG;
 #endif
@@ -3104,7 +3152,7 @@ void __gb_draw_line(struct gb_s *gb)
 			}
 #else
 			c = (t1 & 0x1) | ((t2 & 0x1) << 1);
-			pixels[disp_x] = gb->display.bg_palette[c];
+			pixels[disp_x] = gb->display.bg_palette[c] | (c << 2);
 #if WALNUT_GB_12_COLOUR
 			pixels[disp_x] |= LCD_PALETTE_BG;
 #endif
@@ -3118,32 +3166,15 @@ void __gb_draw_line(struct gb_s *gb)
 	}
 
 	// draw sprites
-#if WALNUT_FULL_GBC_SUPPORT
 	/* FIX (sprite-on-sprite + sprite-behind-BG priority):
 	 * Snapshot the background pixel buffer before any sprite can overwrite it.
-	 * The priority checks (pixelsPrio / OBJ_PRIORITY) must always be evaluated
-	 * against the ORIGINAL BG colour index, not the colour written by a
-	 * previously-drawn lower-priority sprite.  Without this, two bugs arise:
-	 *
-	 *   1. BG tile has priority-bit=1, BG colour=0 (transparent).
-	 *      Lower-priority sprite (high OAM index, drawn first) correctly draws
-	 *      because BG is transparent.  Higher-priority sprite (low OAM index,
-	 *      drawn later) checks pixels[disp_x] & 0x3 == first-sprite's c != 0,
-	 *      mistakes it for a non-zero BG colour, and is incorrectly blocked.
-	 *      Result: wrong sprite tile visible, or stale sprite "wins."
-	 *
-	 *   2. BG colour is non-zero, higher-priority sprite has OBJ_PRIORITY=1
-	 *      (behind BG).  Lower-priority sprite already drew there (OBJ_PRIORITY=0,
-	 *      legitimately in front of BG).  Without restoring the BG value, the
-	 *      lower-priority sprite colour stays even though the winning (higher-
-	 *      priority) sprite should cause the BG to show.
-	 *
-	 * The snapshot costs one 160-byte memcpy per scanline and zero extra branches
-	 * in the hot pixel loop (bgColors[] replaces the pixels[] reads in the checks
-	 * directly). */
+	 * The priority checks must always be evaluated against the ORIGINAL BG
+	 * pixel, not a pixel written by a previously-drawn lower-priority sprite.
+	 * This applies to both CGB (pixelsPrio / OBJ_PRIORITY checks against
+	 * bgColors[]) and DMG (raw-index priority check against bgColors[]).
+	 * The snapshot costs one 160-byte memcpy per scanline. */
 	uint8_t bgColors[160];
-	if(cgbMode) memcpy(bgColors, pixels, sizeof(bgColors));
-#endif
+	memcpy(bgColors, pixels, sizeof(bgColors));
 	if(gb->hram_io[IO_LCDC] & LCDC_OBJ_ENABLE)
 	{
 		uint8_t sprite_number;
@@ -3328,7 +3359,29 @@ void __gb_draw_line(struct gb_s *gb)
 				}
 				else
 #endif
-				if(c && !(OF & OBJ_PRIORITY && !((pixels[disp_x] & 0x3) == gb->display.bg_palette[0])))
+				/* FIX (DMG sprite-behind-BG priority):
+				 *
+				 * Two corrections from the original expression:
+				 *
+				 *   1. Read bgColors[] (pre-sprite snapshot) instead of pixels[]
+				 *      so the check sees the real BG, not a pixel already written
+				 *      by a lower-priority sprite.
+				 *
+				 *   2. Test the raw BG colour index, not the palette-mapped shade.
+				 *      Real hardware hides an OBJ_PRIORITY sprite behind BG when
+				 *      the BG colour INDEX is non-zero (i.e. BG is opaque),
+				 *      regardless of what shade the palette maps it to.  The old
+				 *      shade comparison broke whenever a game mapped multiple
+				 *      colour indices to the same shade (palette animation,
+				 *      fading, artistic choice) — non-transparent BG pixels
+				 *      whose shade matched bg_palette[0] would be wrongly treated
+				 *      as transparent, letting sprite pixels bleed through.
+				 *
+				 *      The raw index is now encoded in bits[3:2] of each BG pixel
+				 *      (set during BG/window tile rendering).  Extract it with
+				 *      (bgColors[disp_x] >> 2) & 0x3.  Zero = BG colour 0
+				 *      (transparent on real HW), non-zero = opaque BG. */
+				if(c && !((OF & OBJ_PRIORITY) && ((bgColors[disp_x] >> 2) & 0x3)))
 				{
 					/* Set pixel colour. */
 					pixels[disp_x] = (OF & OBJ_PALETTE)
@@ -3342,6 +3395,34 @@ void __gb_draw_line(struct gb_s *gb)
 					/* Deselect BG palette. */
 					pixels[disp_x] &= ~LCD_PALETTE_BG;
 #endif
+				}
+				else if(c)
+				{
+					/* FIX (DMG missing BG-restore):
+					 *
+					 * This sprite has OBJ_PRIORITY=1 and the BG colour index is
+					 * non-zero, so the BG wins over this sprite — correct.  But
+					 * if a lower-priority sprite already drew its pixel here
+					 * (it runs earlier in the render loop, painting first), that
+					 * stale sprite pixel would remain visible.  On real hardware
+					 * the BG always beats every sprite at this pixel, not just
+					 * the highest-priority one.
+					 *
+					 * Restore the pre-sprite BG snapshot so any lower-priority
+					 * sprite pixel is evicted and the BG shows through correctly.
+					 * This mirrors the identical else-if block in the CGB path
+					 * (above) and fixes:
+					 *   - "pixels appearing above character heads" (low-priority
+					 *     sprite at wrong Y bleeding through BG-deferred position)
+					 *   - Sprite fragments appearing at incorrect screen positions
+					 *   - Corrupted glyph rendering in DKL2, Test Drive Le Mans
+					 *
+					 * bgColors[disp_x] holds the full encoded BG pixel
+					 * (bg_palette[c] | (c<<2) | LCD_PALETTE_BG) captured before
+					 * any sprite was drawn.  lcd_draw_line masks with &0x33,
+					 * correctly zeroing the raw-index bits before palette lookup.
+					 */
+					pixels[disp_x] = bgColors[disp_x];
 				}
 				t1 = t1 >> 1;
 				t2 = t2 >> 1;
@@ -5568,7 +5649,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				gb->hram_io[IO_IF] |= VBLANK_INTR;
 				gb->lcd_blank = false;
 
+				/* Mode-1 STAT interrupt at VBlank entry. */
 				if(gb->hram_io[IO_STAT] & STAT_MODE_1_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				/* On real hardware the STAT line also pulses for Mode-2
+				 * (OAM scan) enable at the LY=144 boundary when Mode-1
+				 * did not already raise it.  Both share the LCDC vector;
+				 * only raise once (the line is level-triggered).        */
+				else if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 #if ENABLE_LCD
@@ -5607,60 +5695,21 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
-				gb->counter.lcd_count = 0;
+				/* Do NOT reset lcd_count here — preserve carry from the
+				 * previous line boundary subtraction so sub-mode
+				 * transitions fire at the correct absolute cycle. */
 
-#if WALNUT_FULL_GBC_SUPPORT
-				//DMA GBC
-				if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
-				{
-#if WALNUT_GB_32BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 4)
-					{
-							uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 2, val >> 16);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 3, val >> 24);
-					}
-#elif WALNUT_GB_16BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 2)
-					{
-							uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val & 0xFF);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-					}
-#else
-			    // Original 8-bit path
-					for (uint8_t i = 0; i < 0x10; i++)
-					{
-						__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
-										__gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
-					}
-#endif
-
-					gb->cgb.dmaSource += 0x10;
-					gb->cgb.dmaDest += 0x10;
-					if(!(--gb->cgb.dmaSize)) {gb->cgb.dmaActive = 1;
-					}
-#if WALNUT_GB_SAFE_DUALFETCH_DMA
-					gb->prefetch_invalid=true;
-#endif
-				}
-#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 				/* If halted immediately jump to next LCD mode.
 				 * From OAM Search to LCD Draw. */
-				//if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-				//	inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				inst_cycles = LCD_MODE2_OAM_SCAN_DURATION;
+				/* Advance to Mode-2 end, accounting for any carry already
+				 * accumulated this line from the boundary subtraction.   */
+				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
+					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+				else
+					inst_cycles = 4; /* already past; fire ASAP */
 			}
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
@@ -5672,6 +5721,40 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
 				gb->hram_io[IO_IF] |= LCDC_INTR;
 
+
+			/* HBlank HDMA: one 16-byte block transfers at Mode3->Mode0.
+			 * Firing here (HBlank start) instead of Mode2 start means the
+			 * data is in VRAM for the very next scanline, matching hardware. */
+#if WALNUT_FULL_GBC_SUPPORT
+			if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
+			{
+#if WALNUT_GB_32BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 4)
+				{
+					uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#elif WALNUT_GB_16BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 2)
+				{
+					uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#else
+				for(uint8_t i = 0; i < 0x10; i++)
+				{
+					__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
+					           __gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
+				}
+#endif
+				gb->cgb.dmaSource += 0x10;
+				gb->cgb.dmaDest   += 0x10;
+				if(!(--gb->cgb.dmaSize)) { gb->cgb.dmaActive = 1; }
+#if WALNUT_GB_SAFE_DUALFETCH_DMA
+				gb->prefetch_invalid = true;
+#endif
+			}
+#endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
 			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
 				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
@@ -7567,7 +7650,14 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				gb->hram_io[IO_IF] |= VBLANK_INTR;
 				gb->lcd_blank = false;
 
+				/* Mode-1 STAT interrupt at VBlank entry. */
 				if(gb->hram_io[IO_STAT] & STAT_MODE_1_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				/* On real hardware the STAT line also pulses for Mode-2
+				 * (OAM scan) enable at the LY=144 boundary when Mode-1
+				 * did not already raise it.  Both share the LCDC vector;
+				 * only raise once (the line is level-triggered).        */
+				else if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 #if ENABLE_LCD
@@ -7606,58 +7696,22 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
-				gb->counter.lcd_count = 0;
+				/* Do NOT reset lcd_count here — preserve carry from the
+				 * previous line boundary subtraction so sub-mode
+				 * transitions fire at the correct absolute cycle. */
 
 
-#if WALNUT_FULL_GBC_SUPPORT
-				//DMA GBC
-				if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
-				{
-#if WALNUT_GB_32BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 4)
-					{
-							uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 2, val >> 16);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 3, val >> 24);
-					}
-#elif WALNUT_GB_16BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 2)
-					{
-							uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val & 0xFF);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-					}
-#else
-			    // Original 8-bit path
-					for (uint8_t i = 0; i < 0x10; i++)
-					{
-						__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
-										__gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
-					}
-#endif
-
-					gb->cgb.dmaSource += 0x10;
-					gb->cgb.dmaDest += 0x10;
-					if(!(--gb->cgb.dmaSize)) {gb->cgb.dmaActive = 1;
-					}
-				}
-#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 				/* If halted immediately jump to next LCD mode.
 				 * From OAM Search to LCD Draw. */
-				//if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-				//	inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				inst_cycles = LCD_MODE2_OAM_SCAN_DURATION;
+				/* Advance to Mode-2 end, accounting for any carry already
+				 * accumulated this line from the boundary subtraction.   */
+				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
+					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+				else
+					inst_cycles = 4; /* already past; fire ASAP */
 			}
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
@@ -7669,6 +7723,40 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
 				gb->hram_io[IO_IF] |= LCDC_INTR;
 
+
+			/* HBlank HDMA: one 16-byte block transfers at Mode3->Mode0.
+			 * Firing here (HBlank start) instead of Mode2 start means the
+			 * data is in VRAM for the very next scanline, matching hardware. */
+#if WALNUT_FULL_GBC_SUPPORT
+			if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
+			{
+#if WALNUT_GB_32BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 4)
+				{
+					uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#elif WALNUT_GB_16BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 2)
+				{
+					uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#else
+				for(uint8_t i = 0; i < 0x10; i++)
+				{
+					__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
+					           __gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
+				}
+#endif
+				gb->cgb.dmaSource += 0x10;
+				gb->cgb.dmaDest   += 0x10;
+				if(!(--gb->cgb.dmaSize)) { gb->cgb.dmaActive = 1; }
+#if WALNUT_GB_SAFE_DUALFETCH_DMA
+				gb->prefetch_invalid = true;
+#endif
+			}
+#endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
 			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
 				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
@@ -10160,7 +10248,14 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				gb->hram_io[IO_IF] |= VBLANK_INTR;
 				gb->lcd_blank = false;
 
+				/* Mode-1 STAT interrupt at VBlank entry. */
 				if(gb->hram_io[IO_STAT] & STAT_MODE_1_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				/* On real hardware the STAT line also pulses for Mode-2
+				 * (OAM scan) enable at the LY=144 boundary when Mode-1
+				 * did not already raise it.  Both share the LCDC vector;
+				 * only raise once (the line is level-triggered).        */
+				else if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 #if ENABLE_LCD
@@ -10199,57 +10294,21 @@ void __gb_step_cpu_x(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
-				gb->counter.lcd_count = 0;
+				/* Do NOT reset lcd_count here — preserve carry from the
+				 * previous line boundary subtraction so sub-mode
+				 * transitions fire at the correct absolute cycle. */
 
-#if WALNUT_FULL_GBC_SUPPORT
-				//DMA GBC
-				if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
-				{
-#if WALNUT_GB_32BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 4)
-					{
-							uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 2, val >> 16);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 3, val >> 24);
-					}
-#elif WALNUT_GB_16BIT_DMA
-					// Optimized 16-bit path
-					for (uint8_t i = 0; i < 0x10; i += 2)
-					{
-							uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
-							__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
-							// 8-bit logic if there is some cause to fall back
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val & 0xFF);
-							// __gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i + 1, val >> 8);
-					}
-#else
-			    // Original 8-bit path
-					for (uint8_t i = 0; i < 0x10; i++)
-					{
-						__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
-										__gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
-					}
-#endif
-
-					gb->cgb.dmaSource += 0x10;
-					gb->cgb.dmaDest += 0x10;
-					if(!(--gb->cgb.dmaSize)) {gb->cgb.dmaActive = 1;
-					}
-				}
-#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 
 				/* If halted immediately jump to next LCD mode.
 				 * From OAM Search to LCD Draw. */
-				//if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-				//	inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				inst_cycles = LCD_MODE2_OAM_SCAN_DURATION;
+				/* Advance to Mode-2 end, accounting for any carry already
+				 * accumulated this line from the boundary subtraction.   */
+				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
+					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+				else
+					inst_cycles = 4; /* already past; fire ASAP */
 			}
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
@@ -10261,6 +10320,40 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			if(gb->hram_io[IO_STAT] & STAT_MODE_0_INTR)
 				gb->hram_io[IO_IF] |= LCDC_INTR;
 
+
+			/* HBlank HDMA: one 16-byte block transfers at Mode3->Mode0.
+			 * Firing here (HBlank start) instead of Mode2 start means the
+			 * data is in VRAM for the very next scanline, matching hardware. */
+#if WALNUT_FULL_GBC_SUPPORT
+			if(gb->cgb.cgbMode && !gb->cgb.dmaActive && gb->cgb.dmaMode)
+			{
+#if WALNUT_GB_32BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 4)
+				{
+					uint32_t val = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#elif WALNUT_GB_16BIT_DMA
+				for(uint8_t i = 0; i < 0x10; i += 2)
+				{
+					uint16_t val = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, val);
+				}
+#else
+				for(uint8_t i = 0; i < 0x10; i++)
+				{
+					__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
+					           __gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
+				}
+#endif
+				gb->cgb.dmaSource += 0x10;
+				gb->cgb.dmaDest   += 0x10;
+				if(!(--gb->cgb.dmaSize)) { gb->cgb.dmaActive = 1; }
+#if WALNUT_GB_SAFE_DUALFETCH_DMA
+				gb->prefetch_invalid = true;
+#endif
+			}
+#endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
 			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
 				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
