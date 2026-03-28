@@ -482,7 +482,7 @@ static inline uint16_t bgr555_to_rgb565BE_accurate(uint16_t c)
 	uint16_t g = (c >> 5) & 0x001F;        // bits 9–5
 	uint16_t b = (c >> 10) & 0x001F;        // bits 14–10
 
-	g = (g << 1) | (g >> 4);                // 5 → 6-bit expansion
+	g = (g << 1) | (g >> 4);                // 5 -> 6-bit expansion
 
 	uint16_t tempRGB565 = (r << 11) | (g << 5) | b;
     	return (tempRGB565 << 8) | (tempRGB565 >> 8); // swap bytes
@@ -494,14 +494,14 @@ static inline uint16_t bgr555_to_rgb565_accurate(uint16_t c)
 	uint16_t g = (c >> 5) & 0x001F;        // bits 9–5
 	uint16_t b = (c >> 10) & 0x001F;        // bits 14–10
 
-	g = (g << 1) | (g >> 4);                // 5 → 6-bit expansion
+	g = (g << 1) | (g >> 4);                // 5 -> 6-bit expansion
 
 	return (r << 11) | (g << 5) | b;
 }
 
 static inline uint16_t bgr555_to_rgb565_fast(uint16_t c)
 {
-    return ((c & 0x7C00) >> 10) | ((c & 0x03E0) << 1) | ((c & 0x001F) << 11); // Green → middle 6 bits (shift left by 1), loose 1.56% brightness fidelity loss on the green channel in exchange for faster conversion, can replace with more accurate conversion if desired - this is faster but may cause issues for gamma filters
+    return ((c & 0x7C00) >> 10) | ((c & 0x03E0) << 1) | ((c & 0x001F) << 11); // Green -> middle 6 bits (shift left by 1), loose 1.56% brightness fidelity loss on the green channel in exchange for faster conversion, can replace with more accurate conversion if desired - this is faster but may cause issues for gamma filters
 }
 
 struct cpu_registers_s
@@ -745,6 +745,12 @@ struct gb_s
 		bool lcd_blank	: 1;
 		/* Set if MBC3O cart is used. */
 		bool cart_is_mbc3O : 1;
+		/* Latched once per frame when WY == LY (exact equality), matching
+		 * SameBoy's wy_triggered behaviour. Using a live IO_WY >= LY check
+		 * instead causes the window to activate on wrong scanlines when a
+		 * game writes WY mid-frame (e.g. DKL2 HUD setup), producing
+		 * horizontal lines through sprites/characters. */
+		bool wy_triggered : 1;
 	};
 
 	/* Cartridge information:
@@ -2302,7 +2308,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			 * all remaining blocks immediately (CPU is not running the
 			 * display state machine, so per-HBlank triggers never come).
 			 * dmaActive==0 here because we just set it above for a new
-			 * HBlank DMA (dmaMode==1 → dmaActive = 1^1 = 0).           */
+			 * HBlank DMA (dmaMode==1 -> dmaActive = 1^1 = 0).           */
 			if(gb->cgb.dmaMode && !(gb->hram_io[IO_LCDC] & LCDC_ENABLE) && !gb->cgb.dmaActive)
 			{
 				for(uint16_t i = 0; i < ((uint16_t)gb->cgb.dmaSize << 4); i++)
@@ -2836,9 +2842,15 @@ void __gb_draw_line(struct gb_s *gb)
 				|| (gb->display.interlace_count
 				    && (hram_io_ly & 1) == 1))
 		{
+			/* Latch wy_triggered for this scanline before skipping.
+			 * Must mirror the equality check done in the draw path. */
+			if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
+					&& hram_io_ly == gb->hram_io[IO_WY])
+				gb->wy_triggered = true;
+
 			/* Compensate for missing window draw if required. */
 			if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
-					&& hram_io_ly >= gb->display.WY
+					&& gb->wy_triggered
 					&& gb->hram_io[IO_WX] <= 166)
 				gb->display.window_clear++;
 
@@ -3018,8 +3030,16 @@ void __gb_draw_line(struct gb_s *gb)
 	}
 
 	/* draw window */
+	/* SameBoy-accurate window trigger: wy_triggered is set (once per frame)
+	 * the first scanline where WY == LY (exact equality). Once latched it
+	 * stays true for the rest of the frame.  Using a live IO_WY >= LY check
+	 * here caused mid-frame WY writes (e.g. DKL2 HUD) to re-activate the
+	 * window on wrong scanlines, writing window tiles over sprite pixels. */
+	if(hram_io_ly == gb->hram_io[IO_WY])
+		gb->wy_triggered = true;
+
 	if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
-			&& hram_io_ly >= gb->display.WY
+			&& gb->wy_triggered
 			&& gb->hram_io[IO_WX] <= 166)
 	{
 		uint16_t win_line, tile;
@@ -3201,46 +3221,43 @@ void __gb_draw_line(struct gb_s *gb)
 					|| hram_io_ly + 16 < OY)
 				continue;
 
-#if WALNUT_FULL_GBC_SUPPORT
-			if (!cgbMode)
-			{
-#endif
-			struct sprite_data current;
-
-			current.sprite_number = sprite_number;
-			current.x = OX;
-
-			uint8_t place;
-			for (place = number_of_sprites; place != 0; place--)
-			{
-				if(compare_sprites(&sprites_to_render[place - 1], &current) < 0)
-					break;
-			}
-			if(place >= MAX_SPRITES_LINE)
-				continue;
-			for (uint8_t i = number_of_sprites; i > place; --i) {
-				sprites_to_render[i] = sprites_to_render[i - 1];
-			}
-			if(number_of_sprites < MAX_SPRITES_LINE)
-				number_of_sprites++;
-			sprites_to_render[place] = current;
-#if WALNUT_FULL_GBC_SUPPORT
-			}
-			else
-			{
-				// CGB does not care about the X coordinate of the sprite when it comes to render priority, only the OAM order.
-				// Skip the reordering and just fill sprites_to_render until it is full.
-				if (number_of_sprites >= MAX_SPRITES_LINE) continue;
-				sprites_to_render[number_of_sprites].sprite_number = sprite_number;
-				sprites_to_render[number_of_sprites].x = OX;
-				number_of_sprites++;
-			}
-#endif
+			/* Both DMG and CGB: collect the first 10 sprites that land on
+			 * this line in OAM order (0..39). Real hardware's OAM scan
+			 * selects by OAM order, not X position. X is only used for
+			 * pixel priority during rendering (lower X wins; lower OAM
+			 * index breaks ties). The previous DMG path sorted during
+			 * collection, keeping the 10 lowest-X sprites and dropping
+			 * valid OAM-order sprites — the root cause of horizontal
+			 * gaps ("lines through characters") in DKL2 and similar. */
+			if (number_of_sprites >= MAX_SPRITES_LINE) continue;
+			sprites_to_render[number_of_sprites].sprite_number = sprite_number;
+			sprites_to_render[number_of_sprites].x = OX;
+			number_of_sprites++;
 		}
 #endif
 
 		/* Render each sprite, from low priority to high priority. */
 #if WALNUT_GB_HIGH_LCD_ACCURACY
+#if WALNUT_FULL_GBC_SUPPORT
+		/* DMG mode: sort the OAM-order selected sprites by X then OAM
+		 * index so the render loop (high->low index) draws the highest-
+		 * priority sprite (lowest X, lowest OAM index) last = on top. */
+		if (!cgbMode)
+#endif
+		{
+			for (uint8_t si = 1; si < number_of_sprites; si++)
+			{
+				struct sprite_data key = sprites_to_render[si];
+				int sj = (int)si - 1;
+				while (sj >= 0 &&
+				       compare_sprites(&sprites_to_render[sj], &key) > 0)
+				{
+					sprites_to_render[sj + 1] = sprites_to_render[sj];
+					sj--;
+				}
+				sprites_to_render[sj + 1] = key;
+			}
+		}
 		/* Render the top ten prioritised sprites on this scanline. */
 		for(sprite_number = number_of_sprites - 1;
 				sprite_number != 0xFF;
@@ -5691,6 +5708,7 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 					/* Clear Screen */
 					gb->display.WY = gb->hram_io[IO_WY];
 					gb->display.window_clear = 0;
+					gb->wy_triggered = false; /* reset window-trigger latch each frame */
 				}
 
 				/* OAM Search occurs at the start of the line. */
@@ -7692,6 +7710,7 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 					/* Clear Screen */
 					gb->display.WY = gb->hram_io[IO_WY];
 					gb->display.window_clear = 0;
+					gb->wy_triggered = false; /* reset window-trigger latch each frame */
 				}
 
 				/* OAM Search occurs at the start of the line. */
@@ -7699,7 +7718,6 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				/* Do NOT reset lcd_count here — preserve carry from the
 				 * previous line boundary subtraction so sub-mode
 				 * transitions fire at the correct absolute cycle. */
-
 
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
@@ -8170,6 +8188,7 @@ void gb_init_lcd(struct gb_s *gb,
 
 	gb->display.window_clear = 0;
 	gb->display.WY = 0;
+	gb->wy_triggered = false;
 
 	return;
 }
@@ -10290,6 +10309,7 @@ void __gb_step_cpu_x(struct gb_s *gb)
 					/* Clear Screen */
 					gb->display.WY = gb->hram_io[IO_WY];
 					gb->display.window_clear = 0;
+					gb->wy_triggered = false; /* reset window-trigger latch each frame */
 				}
 
 				/* OAM Search occurs at the start of the line. */
