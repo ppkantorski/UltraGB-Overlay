@@ -536,6 +536,14 @@ static struct GACtrl {
     // ch.enabled, so every channel stays silent after a save-state resume.
     GBAPU snapshot{};
     bool  snapshot_valid{false};
+
+    // Channel-active bits (NR52 bits 3-0) written by the audio thread after
+    // every generate_samples() call and read by audio_read(0x26) on the
+    // emulation thread.  Without this, NR52 always returns 0 in the channel
+    // bits because ch.enabled lives only inside the audio thread's local GBAPU.
+    // Games that poll NR52 to confirm a trigger (e.g. Oracle of Seasons/Ages
+    // logo-sequence jingle) would spin forever on a white screen.
+    std::atomic<uint8_t> nr52_ch_bits{0};
 } s_ctrl;
 
 // Set to true by the CGB cold-boot bounce in main.cpp around the
@@ -594,6 +602,15 @@ void audio_write(const uint8_t addr, const uint8_t val) {
 uint8_t audio_read(const uint8_t addr) {
     if (addr>=0x30&&addr<=0x3F) return s_ctrl.regs[addr-0x10];
     if (addr<0x10||addr>0x4F)   return 0xFFu;
+    // NR52 (0xFF26): bits 7 (power) and 6-4 (always 1) come from regs[];
+    // bits 3-0 (channel active) must come from the audio thread's live state.
+    // regs[0x16] only tracks what the game wrote to NR52, not the runtime
+    // ch.enabled flags — so without this special case every channel always
+    // reads as inactive, causing games that poll NR52 after triggering a
+    // channel (e.g. Oracle of Seasons/Ages) to spin forever.
+    if (addr == 0x26u)
+        return (s_ctrl.regs[0x16] & 0x80u) | 0x70u |
+               s_ctrl.nr52_ch_bits.load(std::memory_order_acquire);
     static constexpr uint8_t MASK[0x17]={
         0x80,0x3F,0x00,0xFF,0xBF,
         0xFF,0x3F,0x00,0xFF,0xBF,
@@ -681,6 +698,7 @@ static void gb_audio_thread_fn(void*) {
                 s_ctrl.evt_w.load(std::memory_order_acquire),
                 std::memory_order_release);
             memset(s_ctrl.dma[s_ctrl.cur],0,n_data);
+            s_ctrl.nr52_ch_bits.store(0, std::memory_order_release);
 
         } else {
             // ── Active path ───────────────────────────────────────────────────
@@ -702,6 +720,15 @@ static void gb_audio_thread_fn(void*) {
 
             generate_samples(local, s_ctrl.dma[s_ctrl.cur], n_samp,
                              s_local_evts, n_evts);
+
+            // Publish the channel-active state so audio_read(0x26) can return
+            // correct NR52 bits 3-0 to the emulation thread.
+            s_ctrl.nr52_ch_bits.store(
+                (local.ch1.enabled ? 0x01u : 0u) |
+                (local.ch2.enabled ? 0x02u : 0u) |
+                (local.ch3.enabled ? 0x04u : 0u) |
+                (local.ch4.enabled ? 0x08u : 0u),
+                std::memory_order_release);
         }
 
         // ── Submit ────────────────────────────────────────────────────────────
