@@ -77,6 +77,35 @@ static const char* vol_to_str(u8 v, char (&buf)[4]) {
 // Always > 0; initialized to 100 as a safe default.
 static u8 g_vol_backup = 100;
 
+// ── Windowed mode ─────────────────────────────────────────────────────────────
+// When true the ROM selector relaunches this overlay with -windowed <path>,
+// rendering the Game Boy screen as a small draggable window with no UI chrome.
+static bool g_windowed_mode  = false;
+static bool g_ingame_haptics = true;
+
+// Full path to this .ovl — captured from argv[0] so WindowedOverlay can
+// pass it to setNextOverlay when the launch combo is pressed to return here.
+static char g_self_path[256] = {};
+
+// ROM path received via the -windowed <path> argument.
+// Set in main(), consumed by WindowedOverlay::loadInitialGui().
+static char g_win_rom_path[256] = {};
+
+// Window position in VI-space (1920×1080).
+// WIN_VI_W = 1920*160/1280 = 240, WIN_VI_H = 1080*144/720 = 216.
+// Default: centred on the display.
+static int g_win_pos_x = (1920 - 240) / 2;   // 840  (1× default centre)
+static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
+
+// Windowed display scale: 1, 2, or 3 (integer pixel scale factor).
+// 1× = 160×144 VI layer (240×216 in VI space)
+// 2× = 320×288 VI layer (480×432 in VI space)
+// 3× = 480×432 VI layer (720×648 in VI space)
+// Read from config.ini as "win_scale"; default 1.
+// g_win_scale is read directly in main() before tsl::loop so the
+// framebuffer is sized correctly before Tesla initialises.
+static int g_win_scale = 1;
+
 static void save_vol_backup() {
     char buf[4];
     ult::setIniFileValue(kConfigFile, "config", "vol_backup",
@@ -136,6 +165,45 @@ static void load_config() {
     const std::string pp_val = ult::parseValueFromIniSection(path, "config", "pixel_perfect");
     if (!pp_val.empty())
         g_vp_2x = (pp_val == "1");
+
+    // windowed — 0 = normal (default), 1 = windowed mode
+    const std::string win_val = ult::parseValueFromIniSection(path, "config", "windowed");
+    if (!win_val.empty())
+        g_windowed_mode = (win_val == "1");
+
+    const std::string hap_val = ult::parseValueFromIniSection(path, "config", "ingame_haptics");
+    if (!hap_val.empty())
+        g_ingame_haptics = (hap_val != "0");
+
+    // win_pos_x / win_pos_y — persisted VI-space window position
+    {
+        // Digit-safe integer parser (no std::stoi — exceptions disabled).
+        const auto parse_pos = [](const std::string& s, int& out) {
+            if (s.empty()) return;
+            int v = 0;
+            for (char c : s) {
+                if (c < '0' || c > '9') return;
+                v = v * 10 + (c - '0');
+            }
+            out = v;
+        };
+        parse_pos(ult::parseValueFromIniSection(path, "config", "win_pos_x"), g_win_pos_x);
+        parse_pos(ult::parseValueFromIniSection(path, "config", "win_pos_y"), g_win_pos_y);
+    }
+
+    // win_scale — windowed display scale: 1, 2, 3, or 4 (default 1).
+    // Any absent or unrecognised value falls back to 1.
+    // 4× is clamped to 3× at runtime on limitedMemory without touching the
+    // saved value — so switching back to a normal-memory session restores 4×.
+    {
+        const std::string sv = ult::parseValueFromIniSection(path, "config", "win_scale");
+        if      (sv == "2") g_win_scale = 2;
+        else if (sv == "3") g_win_scale = 3;
+        else if (sv == "4") g_win_scale = 4;
+        else                g_win_scale = 1;
+        if (ult::limitedMemory && g_win_scale == 4)
+            g_win_scale = 3;  // runtime clamp only — config keeps "4"
+    }
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -151,6 +219,11 @@ static void write_default_config_if_missing() {
     set_if_missing("volume",        "100");
     set_if_missing("vol_backup",    "100");
     set_if_missing("pixel_perfect", "0");
+    set_if_missing("windowed",      "0");
+    set_if_missing("ingame_haptics", "1");
+    set_if_missing("win_pos_x",     "840");
+    set_if_missing("win_pos_y",     "432");
+    set_if_missing("win_scale",     "1");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -165,6 +238,32 @@ static void save_last_rom(const char* fullPath) {
 static void save_pixel_perfect() {
     ult::setIniFileValue(kConfigFile, "config", "pixel_perfect",
                          g_vp_2x ? "1" : "0", "");
+}
+
+// Persist the windowed mode toggle to config.ini.
+static void save_windowed_mode() {
+    ult::setIniFileValue(kConfigFile, "config", "windowed",
+                         g_windowed_mode ? "1" : "0", "");
+}
+
+// Persist the dragged window position (VI coordinates) to config.ini.
+// Called by GBWindowedGui on touch release after a successful drag.
+static void save_win_pos() {
+    ult::setIniFileValue(kConfigFile, "config", "win_pos_x",
+                         std::to_string(g_win_pos_x), "");
+    ult::setIniFileValue(kConfigFile, "config", "win_pos_y",
+                         std::to_string(g_win_pos_y), "");
+}
+
+// Persist the windowed scale (1/2/3) to config.ini.
+// The new scale takes effect the next time the user launches a ROM in
+// windowed mode (setNextOverlay reads it before Tesla initialises the layer).
+static void save_win_scale() {
+    const char* s = (g_win_scale == 4) ? "4"
+                  : (g_win_scale == 3) ? "3"
+                  : (g_win_scale == 2) ? "2"
+                  :                      "1";
+    ult::setIniFileValue(kConfigFile, "config", "win_scale", s, "");
 }
 
 // =============================================================================
@@ -1186,7 +1285,8 @@ void gb_unload_rom() {
     // re-mallocing 68 KB every game creates heap holes on the 6 MB tier.
     // reset_lcd_ghosting() clears the valid flag so the first frame of the
     // next game seeds s_prev_fb fresh (no inter-game pixel bleed).
-    //reset_lcd_ghosting(); // WRONG
+
+    //reset_lcd_ghosting(); // WRONG WE MUST TO FREE IT NOT RESET
 
     free_lcd_ghosting();
 
@@ -1740,8 +1840,10 @@ public:
             if (m_vp_tap_pending) {
                 if (!touching) {
                     // Finger lifted — it was a quick tap, fire the toggle.
-                    if (m_vp_tap_frames < 20)
+                    if (m_vp_tap_frames < 20) {
                         toggle_vp_scale();
+                        save_pixel_perfect();
+                    }
                     m_vp_tap_pending = false;
                 } else if (!in_vp) {
                     // Finger dragged out of the VP without releasing — not a tap.
@@ -1918,7 +2020,7 @@ public:
 
         // Trigger rumble ONLY on new touch presses (not holds)
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
-        if (newTouchPresses) {
+        if (newTouchPresses && g_ingame_haptics) {
             triggerRumbleClick.store(true, std::memory_order_release);
         }
         m_prevTouchKeys = g_touch_keys;
@@ -1954,8 +2056,9 @@ public:
         gb_set_input(keysHeld | keysDown | g_touch_keys);
 
         // Trigger rumble on ANY new button press
-        if (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
-                        KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)) {
+        if (g_ingame_haptics &&
+            (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
+                         KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT))) {
             triggerRumbleClick.store(true, std::memory_order_release);
         }
 
@@ -2032,6 +2135,17 @@ public:
             // Launch the game — gb_load_rom will find the internal state and resume
             if (ult::useSoundEffects && !ult::limitedMemory)
                 ult::Audio::exit();
+            // Mark as last-played so the ROM selector shows the inProgress
+            // indicator and scrolls to this game when we return via X.
+            save_last_rom(romPath.c_str());
+            // Windowed mode: relaunch self with -windowed so the game runs in
+            // the small draggable window, matching what the ROM selector does.
+            if (g_windowed_mode && g_self_path[0]) {
+                ult::setIniFileValue(kConfigFile, "config", "windowed_rom", romPath.c_str(), "");
+                tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+                tsl::Overlay::get()->close();
+                return true;
+            }
             strncpy(g_pending_rom_path, romPath.c_str(), sizeof(g_pending_rom_path) - 1);
             g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
             tsl::swapTo<GBEmulatorGui>();
@@ -2393,9 +2507,20 @@ public:
             // Launch the game — no state file means cold boot
             if (ult::useSoundEffects && !ult::limitedMemory)
                 ult::Audio::exit();
+            // Mark as last-played so the ROM selector shows the inProgress
+            // indicator and scrolls to this game when we return via X.
+            save_last_rom(romPath.c_str());
+            triggerEnterFeedback();
+            // Windowed mode: relaunch self with -windowed so the game runs in
+            // the small draggable window, matching what the ROM selector does.
+            if (g_windowed_mode && g_self_path[0]) {
+                ult::setIniFileValue(kConfigFile, "config", "windowed_rom", romPath.c_str(), "");
+                tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+                tsl::Overlay::get()->close();
+                return true;
+            }
             strncpy(g_pending_rom_path, romPath.c_str(), sizeof(g_pending_rom_path) - 1);
             g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            triggerEnterFeedback();
             tsl::swapTo<GBEmulatorGui>();
             return true;
         });
@@ -2631,6 +2756,58 @@ public:
         });
         list->addItem(pp_item);
 
+        // ── Windowed Mode ─────────────────────────────────────────────────────
+        // When ON, launching a ROM relaunches this overlay with -windowed <path>
+        // so the game runs as a small draggable 160×144 window with no UI chrome.
+        // Tap-hold (1 s) inside the window to reposition; launch combo to return.
+        auto* win_item = new tsl::elm::ToggleListItem("Windowed Mode", g_windowed_mode,
+                                                       ult::ON, ult::OFF);
+        win_item->setStateChangedListener([](bool state) {
+            g_windowed_mode = state;
+            save_windowed_mode();
+        });
+        list->addItem(win_item);
+
+        // ── Windowed Scale ────────────────────────────────────────────────────
+        // Cycles 1× → 2× → 3× → 4× → 1× on each A press.
+        // On limitedMemory, 4× is unavailable: the cycle caps at 3× and the
+        // label shows 3× even if the saved config value is 4×.  The config is
+        // NOT overwritten — switching back to a normal-memory session restores 4×.
+        // Only takes effect on the next windowed launch (the VI layer size is
+        // fixed at overlay startup).  Shown regardless of windowed mode state
+        // so the user can configure it before enabling windowed mode.
+        {
+            const char* scale_labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
+            const int maxScale     = ult::limitedMemory ? 3 : 4;
+            const int displayScale = std::min(g_win_scale, maxScale);
+            auto* scale_item = new tsl::elm::ListItem("Windowed Scale",
+                                                       scale_labels[displayScale - 1]);
+            scale_item->setClickListener([scale_item, maxScale](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                // Cycle from the effective (possibly clamped) display value.
+                const int cur = std::min(g_win_scale, maxScale);
+                g_win_scale = (cur % maxScale) + 1;
+                const char* labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
+                scale_item->setValue(labels[g_win_scale - 1]);
+                save_win_scale();
+                //triggerNavigationFeedback();
+                return true;
+            });
+            list->addItem(scale_item);
+        }
+
+        // ── Input ────────────────────────────────────
+        list->addItem(new tsl::elm::CategoryHeader("Input"));
+
+        auto* haptics_item = new tsl::elm::ToggleListItem(
+            "In-Game Haptics", g_ingame_haptics, ult::ON, ult::OFF);
+        haptics_item->setStateChangedListener([](bool state) {
+            g_ingame_haptics = state;
+            ult::setIniFileValue(kConfigFile, "config", "ingame_haptics",
+                                 state ? "1" : "0", "");
+        });
+        list->addItem(haptics_item);
+
         // Footer: left-arrow "Games" button.
         // frame takes ownership of list; Tesla takes ownership of frame.
         auto* frame = new UltraGBOverlayFrame("Games", "");
@@ -2798,6 +2975,21 @@ public:
                         gb_load_rom(p);  // shows "too large" notification
                         return false;
                     }
+                    // ── Windowed mode: relaunch self with -windowed <path> ────
+                    if (g_windowed_mode && g_self_path[0]) {
+                        save_last_rom(p);
+                        if (ult::useSoundEffects && !ult::limitedMemory)
+                            ult::Audio::exit();
+                        // Write the ROM path to config.ini BEFORE relaunching.
+                        // Game names can contain spaces; passing the path as an
+                        // argument would have it split by the C runtime into
+                        // broken argv tokens.  The ini key is read and cleared
+                        // by WindowedOverlay::initServices().
+                        ult::setIniFileValue(kConfigFile, "config", "windowed_rom", p, "");
+                        tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+                        tsl::Overlay::get()->close();
+                        return true;
+                    }
                     // Audio::exit() shuts down UI sound before the game takes over.
                     // Audio::initialize() is called by createUI() when user returns.
                     if (ult::useSoundEffects && !ult::limitedMemory)
@@ -2883,6 +3075,13 @@ public:
 
 
 // =============================================================================
+// Windowed mode — GBWindowedElement / GBWindowedGui / WindowedOverlay.
+// Included here so it has access to all globals, helpers, and gb_load_rom/
+// gb_unload_rom defined above.  Must come before class Overlay below.
+// =============================================================================
+#include "gb_windowed.hpp"
+
+// =============================================================================
 // Overlay
 // =============================================================================
 class Overlay : public tsl::Overlay {
@@ -2940,5 +3139,50 @@ public:
 };
 
 int main(int argc, char* argv[]) {
+    // Build the full path to this overlay so setNextOverlay can relaunch us.
+    // argv[0] on NX is just the bare filename (e.g. "gbemu.ovl"), NOT a full
+    // path.  All overlays live in sdmc:/switch/.overlays/ — prepend that prefix
+    // exactly as Status Monitor does with (folderpath + filename).
+    if (argc > 0) {
+        const std::string full_path = std::string("sdmc:/switch/.overlays/") + argv[0];
+        strncpy(g_self_path, full_path.c_str(), sizeof(g_self_path) - 1);
+        g_self_path[sizeof(g_self_path) - 1] = '\0';
+    }
+
+    // ── Windowed launch ───────────────────────────────────────────────────────
+    // The ROM path is in config.ini under "windowed_rom" (written by the ROM
+    // click listener before calling setNextOverlay).  We only detect the flag
+    // here and set the framebuffer size; the path is read in initServices().
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-windowed") == 0) {
+            // load_config() has not run yet at this point (it runs inside
+            // WindowedOverlay::initServices(), which tsl::loop calls after
+            // the framebuffer is already created).  We must read win_scale
+            // directly so we can size the VI layer correctly before Tesla
+            // initialises.  Absent / invalid key → safe default of 1×.
+            {
+                const std::string sv = ult::parseValueFromIniSection(
+                    kConfigFile, "config", "win_scale");
+                if      (sv == "2") g_win_scale = 2;
+                else if (sv == "3") g_win_scale = 3;
+                else if (sv == "4") g_win_scale = 4;
+                else                g_win_scale = 1;
+
+                // Mirror Tesla's heap check (tsl::loop does the same at startup).
+                // If we are on a 4 MB heap and the saved scale is 4×, clamp it
+                // to 3× now — before the VI layer is sized — but do NOT save,
+                // so switching back to a normal-memory session restores 4×.
+                const bool earlyLimitedMemory =
+                    (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
+                if (earlyLimitedMemory && g_win_scale == 4)
+                    g_win_scale = 3;  // runtime clamp only — config keeps "4"
+            }
+            ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
+            ult::DefaultFramebufferHeight = GB_H * g_win_scale;
+            return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+        }
+    }
+
+    // ── Normal launch ─────────────────────────────────────────────────────────
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }
