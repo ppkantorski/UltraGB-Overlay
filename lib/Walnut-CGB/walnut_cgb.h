@@ -822,6 +822,17 @@ struct gb_s
 		/* Only support 30fps frame skip. */
 		bool frame_skip_count : 1;
 		bool interlace_count : 1;
+		/* FIX (Kirby / raster-SCX): SameBoy sets IO_LY=0 ~4 cycles
+		 * into VBlank line 153, giving the CPU ~448 cycles to handle
+		 * LYC=0 before Mode 2 of the real line 0 begins. Walnut sets
+		 * LY=0 at the 153->154 boundary and immediately enters Mode 2,
+		 * giving only ~80 cycles. Games that write SCX in the LYC=0
+		 * handler (e.g. Kirby Dream Land 2 intro slide) see the stale
+		 * value latched for line 0.
+		 * Fix: when LY wraps to 0, stay in VBlank for one more line
+		 * (ly0_preload=true), then enter Mode 2 on the next boundary.
+		 * Three bools share one byte - sizeof(gb_s) unchanged. */
+		bool ly0_preload : 1;
 	} display;
 
 #if WALNUT_FULL_GBC_SUPPORT
@@ -2190,41 +2201,21 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			gb->hram_io[IO_BOOT] = 0x01;
 			return;
 #if WALNUT_FULL_GBC_SUPPORT
-		/* HDMA Source High */
 		case 0x51:
-			if(!gb->cgb.cgbMode) return;
-			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0x00F0) | ((uint16_t)val << 8);
-			/* Addresses in the 0xEXXX range alias to 0xFXXX on hardware. */
-			if(gb->cgb.dmaSource >= 0xE000) gb->cgb.dmaSource |= 0xF000;
+			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF) + (val << 8);
 			return;
-		/* HDMA Source Low — hardware forces 16-byte alignment */
 		case 0x52:
-			if(!gb->cgb.cgbMode) return;
-			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF00) | (val & 0xF0);
+			gb->cgb.dmaSource = (gb->cgb.dmaSource & 0xFF00) + val;
 			return;
-		/* HDMA Dest High */
 		case 0x53:
-			if(!gb->cgb.cgbMode) return;
-			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0x00F0) | ((uint16_t)val << 8);
+			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF) + (val << 8);
 			return;
-		/* HDMA Dest Low — hardware forces 16-byte alignment */
 		case 0x54:
-			if(!gb->cgb.cgbMode) return;
-			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF00) | (val & 0xF0);
+			gb->cgb.dmaDest = (gb->cgb.dmaDest & 0xFF00) + val;
 			return;
 
 		/* DMA Register*/
 		case 0x55:
-			/* Cancel a running HBlank DMA: bit7=0 written while in
-			 * progress (dmaMode=1, dmaActive=0).  Return before touching
-			 * dmaSize so FF55 readback still reports the correct
-			 * remaining block count.                                    */
-			if(!(val & 0x80) && gb->cgb.dmaMode && !gb->cgb.dmaActive)
-			{
-				gb->cgb.dmaMode   = 0;
-				gb->cgb.dmaActive = 1;  /* mark idle/cancelled */
-				return;
-			}
 			gb->cgb.dmaSize = (val & 0x7F) + 1;
 			gb->cgb.dmaMode = val >> 7;
 			//DMA GBC
@@ -2297,29 +2288,22 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 				}
 #endif			
 			}
-			/* Set the active flag before the LCD-off flush check so the
-			 * check always sees the correct in-progress state regardless
-			 * of the previous dmaActive value.
-			 * Convention: dmaActive=0 = HBlank DMA in progress,
-			 *              dmaActive=1 = idle / GDMA done.             */
-			gb->cgb.dmaActive = gb->cgb.dmaMode ^ 1;
-
-			/* Pan Docs: if LCD is off and HBlank DMA is requested, fire
-			 * all remaining blocks immediately (CPU is not running the
-			 * display state machine, so per-HBlank triggers never come).
-			 * dmaActive==0 here because we just set it above for a new
-			 * HBlank DMA (dmaMode==1 -> dmaActive = 1^1 = 0).           */
-			if(gb->cgb.dmaMode && !(gb->hram_io[IO_LCDC] & LCDC_ENABLE) && !gb->cgb.dmaActive)
+			/* Pan Docs: if LCD is off and HDMA requested, complete immediately. */
+			/* HDMA started while LCD is already off never fires (per-HBlank path */
+			/* is skipped in lcd_off timing loop), so game polls FF55 forever.   */
+			if(gb->cgb.dmaMode && !(gb->hram_io[IO_LCDC] & LCDC_ENABLE) && gb->cgb.dmaActive)
 			{
 				for(uint16_t i = 0; i < ((uint16_t)gb->cgb.dmaSize << 4); i++)
 					__gb_write(gb,
 						((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
 						__gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
-				gb->cgb.dmaSource += ((uint16_t)gb->cgb.dmaSize << 4);
-				gb->cgb.dmaDest   += ((uint16_t)gb->cgb.dmaSize << 4);
+				gb->cgb.dmaSource += (gb->cgb.dmaSize << 4);
+				gb->cgb.dmaDest   += (gb->cgb.dmaSize << 4);
 				gb->cgb.dmaSize    = 0;
-				gb->cgb.dmaActive  = 1;  /* mark done */
+				gb->cgb.dmaActive  = 1;
+				return;
 			}
+			gb->cgb.dmaActive = gb->cgb.dmaMode ^ 1;  // set active if it's an HBlank DMA
 			return;
 
 		/* IR Register*/
@@ -2848,8 +2832,10 @@ void __gb_draw_line(struct gb_s *gb)
 					&& hram_io_ly == gb->hram_io[IO_WY])
 				gb->wy_triggered = true;
 
-			/* Compensate for missing window draw if required. */
+			/* Compensate for missing window draw if required.
+			 * Same LCDC.0 gate as the real window draw path. */
 			if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
+					&& (cgbMode || (gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE))
 					&& gb->wy_triggered
 					&& gb->hram_io[IO_WX] <= 166)
 				gb->display.window_clear++;
@@ -3038,7 +3024,10 @@ void __gb_draw_line(struct gb_s *gb)
 	if(hram_io_ly == gb->hram_io[IO_WY])
 		gb->wy_triggered = true;
 
+	/* FIX: On DMG, LCDC bit 0 disables both BG and Window.
+	 * Only on CGB is it a sprite-priority master switch. */
 	if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
+			&& (cgbMode || (gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE))
 			&& gb->wy_triggered
 			&& gb->hram_io[IO_WX] <= 166)
 	{
@@ -3144,7 +3133,7 @@ void __gb_draw_line(struct gb_s *gb)
 
 			// copy window
 #if WALNUT_FULL_GBC_SUPPORT
-			if(idxAtt & 0x20)
+			if(cgbMode && (idxAtt & 0x20))
 			{  //Horizantal Flip
 				c = (((t1 & 0x80) >> 1) | (t2 & 0x80)) >> 6;
 				pixels[disp_x] = ((idxAtt & 0x07) << 2) + c;
@@ -3673,6 +3662,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		{
 			gb->cgb.doubleSpeedPrep = 0;
 			gb->cgb.doubleSpeed ^= 1;
+			/* Hardware resets DIV on any speed switch. */
+			gb->hram_io[IO_DIV] = 0x00;
+			gb->counter.div_count = 0;
 		}
 #endif
 		opcode = (uint8_t)(oppair >> 8);
@@ -5642,9 +5634,51 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->counter.lcd_count -= LCD_LINE_CYCLES;
 
 			/* Next line */
+			/* FIX (LY=0 preload): if we are completing the ly0_preload
+			 * warm-up, skip LY++ and go straight to Mode 2 for line 0.
+			 * This gives the CPU a full extra line (~444 cycles) after
+			 * seeing LY=0 before SCX is latched, matching SameBoy. */
+			if(gb->display.ly0_preload)
+			{
+				gb->display.ly0_preload = false;
+				/* Clear screen state now (deferred from the wrap). */
+				gb->display.WY = gb->hram_io[IO_WY];
+				gb->display.window_clear = 0;
+				gb->wy_triggered = false;
+				/* Enter Mode 2 (OAM scan) for the real line 0. */
+				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+			}
+			else
+			{
+
 			gb->hram_io[IO_LY] = gb->hram_io[IO_LY] + 1;
 			if (gb->hram_io[IO_LY] == LCD_VERT_LINES)
+			{
+				/* FIX (Kirby SCX): Set LY=0 now but stay in VBlank for
+				 * one more line. The CPU sees LY=0 and can handle LYC=0
+				 * with ~444 cycles to spare before Mode 2 begins. */
 				gb->hram_io[IO_LY] = 0;
+				gb->display.ly0_preload = true;
+				/* LYC=0 check */
+				if(gb->hram_io[IO_LYC] == 0)
+				{
+					gb->hram_io[IO_STAT] |= STAT_LYC_COINC;
+					if(gb->hram_io[IO_STAT] & STAT_LYC_INTR)
+						gb->hram_io[IO_IF] |= LCDC_INTR;
+				}
+				else
+					gb->hram_io[IO_STAT] &= 0xFB;
+				/* Stay in VBlank; give CPU a full line before Mode 2. */
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
+				if(inst_cycles == 0) inst_cycles = 4;
+			}
+			else
+			{
 
 			/* LYC Update */
 			if(gb->hram_io[IO_LY] == gb->hram_io[IO_LYC])
@@ -5724,11 +5758,12 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				 * From OAM Search to LCD Draw. */
 				/* Advance to Mode-2 end, accounting for any carry already
 				 * accumulated this line from the boundary subtraction.   */
-				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				else
-					inst_cycles = 4; /* already past; fire ASAP */
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count; /* already past; fire ASAP */
 			}
+			} /* end else: LY != LCD_VERT_LINES */
+			} /* end else: !ly0_preload */
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW &&
@@ -5774,8 +5809,8 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
-			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
-				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_LINE_CYCLES)
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
 		}
 		/* Go from Mode 2 (OAM Scan) to Mode 3 (LCD Draw). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_OAM_SCAN &&
@@ -5793,8 +5828,8 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
-			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
-				inst_cycles = LCD_MODE3_LCD_DRAW_MIN_DURATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_END)
+				inst_cycles = LCD_MODE3_LCD_DRAW_END - gb->counter.lcd_count;
 		}
 	} while(gb->gb_halt && (gb->hram_io[IO_IF] & gb->hram_io[IO_IE]) == 0);
 	/* If halted, loop until an interrupt occurs. */
@@ -5963,6 +5998,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		{
 			gb->cgb.doubleSpeedPrep = 0;
 			gb->cgb.doubleSpeed ^= 1;
+			/* Hardware resets DIV on any speed switch. */
+			gb->hram_io[IO_DIV] = 0x00;
+			gb->counter.div_count = 0;
 		}
 #endif
 		break;
@@ -7644,9 +7682,51 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			gb->counter.lcd_count -= LCD_LINE_CYCLES;
 
 			/* Next line */
+			/* FIX (LY=0 preload): if we are completing the ly0_preload
+			 * warm-up, skip LY++ and go straight to Mode 2 for line 0.
+			 * This gives the CPU a full extra line (~444 cycles) after
+			 * seeing LY=0 before SCX is latched, matching SameBoy. */
+			if(gb->display.ly0_preload)
+			{
+				gb->display.ly0_preload = false;
+				/* Clear screen state now (deferred from the wrap). */
+				gb->display.WY = gb->hram_io[IO_WY];
+				gb->display.window_clear = 0;
+				gb->wy_triggered = false;
+				/* Enter Mode 2 (OAM scan) for the real line 0. */
+				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+			}
+			else
+			{
+
 			gb->hram_io[IO_LY] = gb->hram_io[IO_LY] + 1;
 			if (gb->hram_io[IO_LY] == LCD_VERT_LINES)
+			{
+				/* FIX (Kirby SCX): Set LY=0 now but stay in VBlank for
+				 * one more line. The CPU sees LY=0 and can handle LYC=0
+				 * with ~444 cycles to spare before Mode 2 begins. */
 				gb->hram_io[IO_LY] = 0;
+				gb->display.ly0_preload = true;
+				/* LYC=0 check */
+				if(gb->hram_io[IO_LYC] == 0)
+				{
+					gb->hram_io[IO_STAT] |= STAT_LYC_COINC;
+					if(gb->hram_io[IO_STAT] & STAT_LYC_INTR)
+						gb->hram_io[IO_IF] |= LCDC_INTR;
+				}
+				else
+					gb->hram_io[IO_STAT] &= 0xFB;
+				/* Stay in VBlank; give CPU a full line before Mode 2. */
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
+				if(inst_cycles == 0) inst_cycles = 4;
+			}
+			else
+			{
 
 			/* LYC Update */
 			if(gb->hram_io[IO_LY] == gb->hram_io[IO_LYC])
@@ -7726,11 +7806,12 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				 * From OAM Search to LCD Draw. */
 				/* Advance to Mode-2 end, accounting for any carry already
 				 * accumulated this line from the boundary subtraction.   */
-				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				else
-					inst_cycles = 4; /* already past; fire ASAP */
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count; /* already past; fire ASAP */
 			}
+			} /* end else: LY != LCD_VERT_LINES */
+			} /* end else: !ly0_preload */
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW &&
@@ -7776,8 +7857,8 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
-			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
-				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_LINE_CYCLES)
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
 		}
 		/* Go from Mode 2 (OAM Scan) to Mode 3 (LCD Draw). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_OAM_SCAN &&
@@ -7795,8 +7876,8 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
-			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
-				inst_cycles = LCD_MODE3_LCD_DRAW_MIN_DURATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_END)
+				inst_cycles = LCD_MODE3_LCD_DRAW_END - gb->counter.lcd_count;
 		}
 	} while(gb->gb_halt && (gb->hram_io[IO_IF] & gb->hram_io[IO_IE]) == 0);
 }
@@ -7948,7 +8029,10 @@ void gb_reset(struct gb_s *gb)
 			gb->cpu_reg.bc.reg = 0x0000;
 			gb->cpu_reg.de.reg = 0x0008;
 			gb->cpu_reg.hl.reg = 0x007C;
-			gb->hram_io[IO_DIV] = 0xFF;
+			/* CGB boot ROM always performs a STOP (speed switch) before
+			 * handing off. Hardware resets DIV on every speed switch,
+			 * so the correct synthesised post-boot value is 0x00. */
+			gb->hram_io[IO_DIV] = 0x00;
 		}
 #endif
 
@@ -8564,6 +8648,9 @@ void __gb_step_cpu_x(struct gb_s *gb)
 		{
 			gb->cgb.doubleSpeedPrep = 0;
 			gb->cgb.doubleSpeed ^= 1;
+			/* Hardware resets DIV on any speed switch. */
+			gb->hram_io[IO_DIV] = 0x00;
+			gb->counter.div_count = 0;
 		}
 #endif
 		break;
@@ -10243,9 +10330,51 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			gb->counter.lcd_count -= LCD_LINE_CYCLES;
 
 			/* Next line */
+			/* FIX (LY=0 preload): if we are completing the ly0_preload
+			 * warm-up, skip LY++ and go straight to Mode 2 for line 0.
+			 * This gives the CPU a full extra line (~444 cycles) after
+			 * seeing LY=0 before SCX is latched, matching SameBoy. */
+			if(gb->display.ly0_preload)
+			{
+				gb->display.ly0_preload = false;
+				/* Clear screen state now (deferred from the wrap). */
+				gb->display.WY = gb->hram_io[IO_WY];
+				gb->display.window_clear = 0;
+				gb->wy_triggered = false;
+				/* Enter Mode 2 (OAM scan) for the real line 0. */
+				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
+					gb->hram_io[IO_IF] |= LCDC_INTR;
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
+			}
+			else
+			{
+
 			gb->hram_io[IO_LY] = gb->hram_io[IO_LY] + 1;
 			if (gb->hram_io[IO_LY] == LCD_VERT_LINES)
+			{
+				/* FIX (Kirby SCX): Set LY=0 now but stay in VBlank for
+				 * one more line. The CPU sees LY=0 and can handle LYC=0
+				 * with ~444 cycles to spare before Mode 2 begins. */
 				gb->hram_io[IO_LY] = 0;
+				gb->display.ly0_preload = true;
+				/* LYC=0 check */
+				if(gb->hram_io[IO_LYC] == 0)
+				{
+					gb->hram_io[IO_STAT] |= STAT_LYC_COINC;
+					if(gb->hram_io[IO_STAT] & STAT_LYC_INTR)
+						gb->hram_io[IO_IF] |= LCDC_INTR;
+				}
+				else
+					gb->hram_io[IO_STAT] &= 0xFB;
+				/* Stay in VBlank; give CPU a full line before Mode 2. */
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
+				if(inst_cycles == 0) inst_cycles = 4;
+			}
+			else
+			{
 
 			/* LYC Update */
 			if(gb->hram_io[IO_LY] == gb->hram_io[IO_LYC])
@@ -10325,11 +10454,12 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				 * From OAM Search to LCD Draw. */
 				/* Advance to Mode-2 end, accounting for any carry already
 				 * accumulated this line from the boundary subtraction.   */
-				if(gb->counter.lcd_count < LCD_MODE2_OAM_SCAN_END)
-					inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count;
-				else
-					inst_cycles = 4; /* already past; fire ASAP */
+				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
+					gb->counter.lcd_count = 0; /* clamp excess carry; prevents 4-cycle halt-loop spin */
+				inst_cycles = LCD_MODE2_OAM_SCAN_END - gb->counter.lcd_count; /* already past; fire ASAP */
 			}
+			} /* end else: LY != LCD_VERT_LINES */
+			} /* end else: !ly0_preload */
 		}
 		/* Go from Mode 3 (LCD Draw) to Mode 0 (HBLANK). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_LCD_DRAW &&
@@ -10375,8 +10505,8 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately, jump from OAM Scan to LCD Draw. */
-			if (gb->counter.lcd_count < LCD_MODE0_HBLANK_MAX_DRUATION)
-				inst_cycles = LCD_MODE0_HBLANK_MAX_DRUATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_LINE_CYCLES)
+				inst_cycles = LCD_LINE_CYCLES - gb->counter.lcd_count;
 		}
 		/* Go from Mode 2 (OAM Scan) to Mode 3 (LCD Draw). */
 		else if((gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_OAM_SCAN &&
@@ -10394,8 +10524,8 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			}
 #endif
 			/* If halted immediately jump to next LCD mode. */
-			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_MIN_DURATION)
-				inst_cycles = LCD_MODE3_LCD_DRAW_MIN_DURATION - gb->counter.lcd_count;
+			if (gb->counter.lcd_count < LCD_MODE3_LCD_DRAW_END)
+				inst_cycles = LCD_MODE3_LCD_DRAW_END - gb->counter.lcd_count;
 		}
 	} while(gb->gb_halt && (gb->hram_io[IO_IF] & gb->hram_io[IO_IE]) == 0);
 	/* If halted, loop until an interrupt occurs. */
