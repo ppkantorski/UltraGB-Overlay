@@ -2307,15 +2307,12 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 
 			/* ── Fix: fire first HDMA block immediately when PPU is already in HBlank ──
 			 *
-			 * SameBoy equivalent (memory.c:1729):
+			 * SameBoy equivalent (memory.c:1729): (needs validation, kept for now)
 			 *   if (gb->hdma_on_hblank &&
 			 *       (gb->io_registers[GB_IO_STAT] & 3) == 0 &&
 			 *       gb->display_state != 7) { gb->hdma_on = true; }
 			 *
-			 * Root cause of the Pokémon Pinball save-resume white-screen freeze:
-			 * When the game's resume sequence arms an HDMA transfer it does so
-			 * while the PPU is already sitting in Mode 0 (HBlank). The normal
-			 * per-scanline HDMA path (line ~10481) only fires at the Mode3→Mode0
+			 * The normal per-scanline HDMA path (line ~10481) only fires at the Mode3→Mode0
 			 * *transition*, so if HDMA is armed mid-HBlank the first 16-byte block
 			 * was never transferred during that HBlank. The game then polls FF55
 			 * waiting for the block to complete, the block never starts, the poll
