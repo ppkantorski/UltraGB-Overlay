@@ -1541,9 +1541,14 @@ static const char* rom_playability_message(const char* path) {
     const size_t sz = static_cast<size_t>(ftell(f));
     fclose(f);
     if (!sz) return nullptr;
-    if (ult::limitedMemory          && sz >= kROM_2MB) return "Requires at least 6MB.";
-    if (!ult::expandedMemory        && sz >= kROM_4MB) return "Requires at least 8MB.";
-    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return "Requires at least 10MB.";
+    // Each check is bounded to its exact tier range so the correct message is
+    // returned regardless of ROM size.  Mirrors gb_load_rom() exactly:
+    //   4 MB heap  (limitedMemory)           — 2 MB+ ROMs blocked; 4 MB+ fall through
+    //   6 MB heap  (!expandedMemory)         — 4 MB+ ROMs blocked; 6 MB+ fall through
+    //   10 MB+ heap (furtherExpandedMemory)  — all ROMs pass
+    if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return "Requires at least 6MB.";
+    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return "Requires at least 8MB.";
+    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return "Requires at least 10MB.";
     return nullptr;  // playable
 }
 
@@ -3055,7 +3060,7 @@ public:
                 strncpy(g_settings_scroll, "Quick Combo",
                         sizeof(g_settings_scroll) - 1);
                 g_settings_scroll[sizeof(g_settings_scroll) - 1] = '\0';
-                tsl::swapTo<QuickComboSelectorGui>(m_rom_scroll, m_settings_scroll);
+                tsl::swapTo<QuickComboSelectorGui>(m_rom_scroll, std::string("Quick Combo"));
                 return true;
             });
             list->addItem(qc_item);
@@ -3328,7 +3333,7 @@ public:
         // ── ROM list ─────────────────────────────────────────────────────
         auto* list = new tsl::elm::List();
         list->addItem(new tsl::elm::CategoryHeader(
-            "Games " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure"));
+            "Game Boy Games " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure"));
 
         // ── ROM list via scandir — no std::vector, no full-path string per entry ──
         // scandir returns a sorted dirent**; each entry is freed immediately after use.
@@ -3625,6 +3630,9 @@ int main(int argc, char* argv[]) {
                  "sdmc:/switch/.overlays/%s", argv[0]);
     }
 
+    // logging directionry (for debugging)
+    //ult::logFilePath = "sdmc:/config/ultragb/log.txt";
+
     // ── Windowed launch ───────────────────────────────────────────────────────
     // The ROM path is in config.ini under "windowed_rom" (written by the ROM
     // click listener before calling setNextOverlay).  We only detect the flag
@@ -3664,8 +3672,36 @@ int main(int argc, char* argv[]) {
                     // cycle.  Fall through to tsl::loop<Overlay> instead so the
                     // ROM selector opens cleanly; loadInitialGui() will show the
                     // appropriate notify message.
-                    if (rom_playability_message(fullPath.c_str()) != nullptr)
-                        goto normal_overlay_launch;
+                    //
+                    // IMPORTANT: rom_playability_message() reads ult::limitedMemory,
+                    // ult::expandedMemory, and ult::furtherExpandedMemory — all of
+                    // which are set by Tesla inside tsl::loop(), which has NOT run
+                    // yet at this point in main().  They are all false by default,
+                    // so the check would incorrectly block a 4 MB ROM on an 8 MB
+                    // heap (!expandedMemory=true) and fall through to normal_overlay_
+                    // launch, causing the brief menu flash before windowed starts.
+                    // Use getCurrentHeapSize() directly instead — it queries the
+                    // real heap tier before Tesla initialises.
+                    {
+                        const auto heapSz = ult::getCurrentHeapSize();
+                        const bool earlyLimited         = (heapSz == ult::OverlayHeapSize::Size_4MB);
+                        const bool earlyExpanded        = (heapSz >= ult::OverlayHeapSize::Size_8MB);
+                        const bool earlyFurtherExpanded = (heapSz >  ult::OverlayHeapSize::Size_8MB);
+
+                        FILE* fsz = fopen(fullPath.c_str(), "rb");
+                        bool tooLarge = false;
+                        if (fsz) {
+                            fseek(fsz, 0, SEEK_END);
+                            const size_t rsz = static_cast<size_t>(ftell(fsz));
+                            fclose(fsz);
+                            tooLarge =
+                                ( earlyLimited         && rsz >= kROM_2MB && rsz < kROM_4MB) ||
+                                (!earlyExpanded        && rsz >= kROM_4MB && rsz < kROM_6MB) ||
+                                (!earlyFurtherExpanded && rsz >= kROM_6MB);
+                        }
+                        if (tooLarge)
+                            goto normal_overlay_launch;
+                    }
 
                     // Read win_scale with the same early-limited-memory clamp
                     // used in the -windowed block below.

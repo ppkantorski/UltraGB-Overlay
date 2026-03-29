@@ -69,8 +69,18 @@ public:
         renderer->drawWidget();
 #endif
 
-        // --- Animated title ---
-        draw_ultragb_title(renderer, 20, 67, 50);
+        // --- Animated title — matches IS_LAUNCHER_DIRECTIVE Ultrahand menu exactly:
+        //     y=50, offset=6 → baseline 56; fontSize=42 ---
+        draw_ultragb_title(renderer, 20, 56, 42);
+
+        // --- Version label subtitle — matches Ultrahand main menu: y+25=75, fontSize=15 ---
+        // ult::versionLabel carries the full "vX.X.X ▸ loaderTitle" string with the
+        // DIVIDER_SYMBOL coloured by textSeparatorColor, exactly as OverlayFrame does.
+
+        static const std::string versionLabel = ult::cleanVersionLabel(APP_VERSION) + " " + ult::DIVIDER_SYMBOL + " " + ult::loaderTitle + " " + ult::cleanVersionLabel(ult::loaderInfo);
+        renderer->drawStringWithColoredSections(versionLabel, false,
+            tsl::s_dividerSpecialChars, 20, 75, 15,
+            tsl::bannerVersionTextColor, tsl::textSeparatorColor);
 
         // --- Bottom separator ---
         renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73,

@@ -330,6 +330,8 @@ class GBWindowedGui : public tsl::Gui {
     static constexpr int      ZR_DCLICK_WINDOW = 20;
     // ZL double-click window for background pass-through toggle.
     static constexpr int      ZL_DCLICK_WINDOW = 20;
+    // Frames the second ZL tap must be held before the toggle fires (~0.5 s at 60 fps).
+    static constexpr int      ZL_HOLD_FRAMES   = 18;
     // KEY_PLUS must be held alone for this long before joystick drag activates.
     static constexpr uint64_t PLUS_HOLD_NS     = 1'000'000'000ULL;  // 1 second — matches HOLD_FRAMES (~60 frames at 60 fps)
     // Joystick deadzone (HidAnalogStickState range: –32767..32767).
@@ -340,9 +342,11 @@ class GBWindowedGui : public tsl::Gui {
     uint32_t m_zr_first_frame = 0;
 
     // ZL double-click-hold: background pass-through toggle.
-    bool     m_zl_first_seen  = false;
-    uint32_t m_zl_first_frame = 0;
-    bool     m_pass_through   = false;  // true = foreground released; background gets HID
+    bool     m_zl_first_seen   = false;
+    uint32_t m_zl_first_frame  = 0;
+    bool     m_zl_second_seen  = false; // second tap detected; waiting for 0.5 s hold
+    uint32_t m_zl_second_frame = 0;    // frame when second tap began
+    bool     m_pass_through    = false; // true = foreground released; background gets HID
 
     // True until the first frame where no keys AND no touch are active.
     // Prevents the ROM-tap touch (or any button held at launch) from
@@ -390,7 +394,16 @@ class GBWindowedGui : public tsl::Gui {
     //   2×: max_x=1440  max_y=648
     //   3×: max_x=1200  max_y=432
     //   4×: max_x= 960  max_y=216
-    static int vi_max_x() { return 1920 - GB_W * g_win_scale * 3 / 2; }
+    // The VI layer is wider than the raw 1.5× scale when underscan correction
+    // is active (tesla.hpp adds a proportional fraction of horizontalUnderscanPixels
+    // to cfg::LayerWidth).  Subtract the same correction from the max-x bound so
+    // the right edge of the corrected layer can never exceed 1920 VI units.
+    static int vi_max_x() {
+        const int hcorr = static_cast<int>(
+            tsl::impl::currentUnderscanPixels.first *
+            (float(GB_W * g_win_scale) / float(tsl::cfg::LayerMaxWidth)) + 0.5f);
+        return 1920 - GB_W * g_win_scale * 3 / 2 - hcorr;
+    }
     static int vi_max_y() { return 1080 - GB_H * g_win_scale * 3 / 2; }
 
     // Window footprint in HID touch space (0–1279 × 0–719):
@@ -501,6 +514,7 @@ public:
             // directMode=true and launchComboHasTriggered=false — session 1
             // gets directMode from Ultrahand's --direct flag).  We fire our
             // own exit feedback above, so we don't want a second one.
+            gb_audio_pause();
             launchComboHasTriggered.store(true, std::memory_order_release);
             if (!g_win_quick_exit && g_self_path[0])
                 tsl::setNextOverlay(std::string(g_self_path), "-returning");
@@ -550,31 +564,49 @@ public:
                 triggerRumbleClick.store(true, std::memory_order_release);
         }
 
-        // ── ZL double-click-hold: toggle background pass-through ──────────────
-        // Double-clicking ZL (second press within ZL_DCLICK_WINDOW frames) toggles
-        // pass-through mode.  In pass-through mode requestForeground(false) releases
-        // HID ownership so the Switch routes controller input natively to whatever
-        // app/game is running underneath.  requestForeground(true) reclaims it so
-        // gb_set_input can drive the emulator again.
-        // Note: ZL reaching handleInput means the overlay is still shown — Tesla
-        // continues drawing the game frame, but controller input bypasses us.
+        // ── ZL double-tap-hold: toggle background pass-through ────────────────
+        // Phase 1 — first tap: arm m_zl_first_seen and record the frame.
+        // Phase 2 — second tap within ZL_DCLICK_WINDOW: enter hold phase.
+        // Phase 3 — ZL held for ZL_HOLD_FRAMES (≈0.5 s): commit the toggle.
+        //           Releasing ZL early cancels without toggling.
+        // In pass-through mode requestForeground(false) releases HID ownership
+        // so the Switch routes controller input natively to whatever app/game is
+        // running underneath.  requestForeground(true) reclaims it.
         {
-            const bool zl_down = (keysDown & KEY_ZL) != 0;
+            const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT))) != 0;
+            const bool zl_held = ((keysHeld & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT))) != 0;
+
             if (zl_down) {
                 if (m_zl_first_seen &&
                     (g_frame_count - m_zl_first_frame) <= static_cast<uint32_t>(ZL_DCLICK_WINDOW)) {
-                    // Second press within the window — commit the toggle.
-                    m_pass_through = !m_pass_through;
-                    tsl::hlp::requestForeground(!m_pass_through);
-                    m_zl_first_seen  = false;
-                    s_focus_flash_red = m_pass_through; // true=lost focus, false=gained
-                    s_focus_flash     = 45;
+                    // Second tap within the window — enter hold phase.
+                    m_zl_first_seen   = false;
+                    m_zl_second_seen  = true;
+                    m_zl_second_frame = g_frame_count;
                 } else {
-                    // First press — record it and wait.
-                    m_zl_first_seen  = true;
-                    m_zl_first_frame = g_frame_count;
+                    // First tap — record it; cancel any stale hold phase.
+                    m_zl_first_seen   = true;
+                    m_zl_first_frame  = g_frame_count;
+                    m_zl_second_seen  = false;
                 }
             }
+
+            // Hold phase: commit once the threshold is reached.
+            if (m_zl_second_seen) {
+                if (!zl_held) {
+                    // Released before threshold — cancel.
+                    m_zl_second_seen = false;
+                } else if ((g_frame_count - m_zl_second_frame) >=
+                           static_cast<uint32_t>(ZL_HOLD_FRAMES)) {
+                    // Held long enough — commit the toggle.
+                    m_pass_through = !m_pass_through;
+                    tsl::hlp::requestForeground(!m_pass_through);
+                    m_zl_second_seen  = false;
+                    s_focus_flash_red = m_pass_through; // true=lost focus, false=gained
+                    s_focus_flash     = 45;
+                }
+            }
+
             // Expire a stale first-press that was never followed up.
             if (m_zl_first_seen &&
                 (g_frame_count - m_zl_first_frame) > static_cast<uint32_t>(ZL_DCLICK_WINDOW))
@@ -744,7 +776,7 @@ public:
         // the position and exits, identical to the touch-drag path.
         {
             const bool plus_only = (keysHeld & KEY_PLUS)
-                && !(keysHeld & ~static_cast<u64>(KEY_PLUS) & ALL_KEYS_MASK);
+                && !(keysHeld & ~KEY_PLUS & ALL_KEYS_MASK);
 
             if (plus_only) {
                 if (!m_plus_armed) {
@@ -882,7 +914,6 @@ public:
         tsl::disableHiding = false;  // restore default for any subsequent overlay
         ult::layerEdge  = 0;       // restore for normal overlay hit-tests
         tsl::layerEdgeY = 0;
-        gb_audio_pause();
         gb_unload_rom();             // saves quick-resume state + SRAM
         gb_audio_free_dma();
         free_lcd_ghosting();
