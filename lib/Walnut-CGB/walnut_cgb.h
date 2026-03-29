@@ -2304,6 +2304,63 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 				return;
 			}
 			gb->cgb.dmaActive = gb->cgb.dmaMode ^ 1;  // set active if it's an HBlank DMA
+
+			/* ── Fix: fire first HDMA block immediately when PPU is already in HBlank ──
+			 *
+			 * SameBoy equivalent (memory.c:1729):
+			 *   if (gb->hdma_on_hblank &&
+			 *       (gb->io_registers[GB_IO_STAT] & 3) == 0 &&
+			 *       gb->display_state != 7) { gb->hdma_on = true; }
+			 *
+			 * Root cause of the Pokémon Pinball save-resume white-screen freeze:
+			 * When the game's resume sequence arms an HDMA transfer it does so
+			 * while the PPU is already sitting in Mode 0 (HBlank). The normal
+			 * per-scanline HDMA path (line ~10481) only fires at the Mode3→Mode0
+			 * *transition*, so if HDMA is armed mid-HBlank the first 16-byte block
+			 * was never transferred during that HBlank. The game then polls FF55
+			 * waiting for the block to complete, the block never starts, the poll
+			 * loops forever, gb_run_frame never returns → white-screen freeze.
+			 *
+			 * The guard IO_LY < LCD_HEIGHT replicates SameBoy's display_state != 7
+			 * exclusion: STAT can read Mode 0 during VBlank on some edge cases, and
+			 * we must not fire an HDMA block during VBlank. */
+#if WALNUT_FULL_GBC_SUPPORT
+			if (gb->cgb.dmaMode &&                                              /* HDMA (not GDMA) requested   */
+			    !gb->cgb.dmaActive &&                                           /* transfer is now in-progress */
+			    (gb->hram_io[IO_LCDC] & LCDC_ENABLE) &&                        /* LCD is on                   */
+			    (gb->hram_io[IO_STAT] & STAT_MODE) == IO_STAT_MODE_HBLANK &&   /* PPU currently in HBlank     */
+			    gb->hram_io[IO_LY] < LCD_HEIGHT)                                /* not in VBlank               */
+			{
+				/* Transfer one 16-byte block right now, identical to the
+				 * per-scanline HBlank HDMA path (walnut_cgb.h ~line 10481). */
+#if WALNUT_GB_32BIT_DMA
+				for (uint8_t i = 0; i < 0x10; i += 4)
+				{
+					uint32_t v = __gb_read32(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write32(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, v);
+				}
+#elif WALNUT_GB_16BIT_DMA
+				for (uint8_t i = 0; i < 0x10; i += 2)
+				{
+					uint16_t v = __gb_read16(gb, (gb->cgb.dmaSource & 0xFFF0) + i);
+					__gb_write16(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i, v);
+				}
+#else
+				for (uint8_t i = 0; i < 0x10; i++)
+				{
+					__gb_write(gb, ((gb->cgb.dmaDest & 0x1FF0) | 0x8000) + i,
+					           __gb_read(gb, (gb->cgb.dmaSource & 0xFFF0) + i));
+				}
+#endif
+				gb->cgb.dmaSource += 0x10;
+				gb->cgb.dmaDest   += 0x10;
+				if (!(--gb->cgb.dmaSize)) { gb->cgb.dmaActive = 1; }
+#if WALNUT_GB_SAFE_DUALFETCH_DMA
+				gb->prefetch_invalid = true;
+#endif
+			}
+#endif /* WALNUT_FULL_GBC_SUPPORT */
+
 			return;
 
 		/* IR Register*/
