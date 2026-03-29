@@ -530,11 +530,6 @@ static uint32_t g_frame_count = 0;
 uint16_t g_dmg_flat_pal[64]  = {};   // filled by gb_select_dmg_palette()
 int  g_gbc_pal_idx   = -1;           // index into GBC_TITLE_TABLE (-1 = not found)
 bool g_gbc_pal_found = false;        // true if ROM was recognised in GBC_TITLE_TABLE
-// On a CGB cold boot, counts frames until the bounce reload fires.
-// -1 = inactive.  Set to 0 on cold boot, incremented each frame,
-// reload triggered when it reaches 60 (~1 second of game time).
-static int g_cgb_bounce_frames = -1;
-
 // =============================================================================
 // Virtual on-screen button layout (Game GB skin)
 // All coordinates are in overlay pixels (448 × 720).
@@ -1437,14 +1432,6 @@ bool gb_load_rom(const char* path) {
     //gb_reset(g_gb.gb);
     (void)resumed;
 
-    // On a CGB cold boot (no existing state file), start the bounce counter.
-    // After 60 frames (~1 s) the draw loop does a full gb_unload_rom + gb_load_rom,
-    // replicating "exit at the Nintendo/Capcom logo + re-enter" which fixes
-    // Oracle of Seasons' intro freeze.  Applies whenever cgbMode=1 (regardless of
-    // whether the display is in CGB-colour or DMG-palette mode); DMG cold boots
-    // and all resumed states stay -1.
-    g_cgb_bounce_frames = (!resumed && g_gb.gb->cgb.cgbMode) ? 0 : -1;
-
     g_gb_frame_next_ns = 0;  // anchor clock on first draw()
     reset_lcd_ghosting();    // don't bleed prev-game pixels into first frame
     g_gb.running = true;
@@ -1691,7 +1678,6 @@ public:
                 // catch-up burst of normal frames.
                 g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
             } else if (now_ns >= g_gb_frame_next_ns) {
-                // ── Normal path ───────────────────────────────────────────────
                 gb_run_one_frame();
                 apply_lcd_ghosting();   // 50/50 blend of raw current vs raw prev frame
                 gb_audio_submit();
@@ -1699,45 +1685,6 @@ public:
                 g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
                 if (g_gb_frame_next_ns < now_ns)
                     g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-
-                // ── CGB cold-boot bounce ──────────────────────────────────────
-                // After 60 frames of a CGB cold boot, do a full unload + reload.
-                // gb_unload_rom saves the post-60-frame CPU state and shuts audio
-                // properly; gb_load_rom calls gb_init() (resets timing counters)
-                // then load_state() (restores CPU).  Identical to pressing X at
-                // the Nintendo/Capcom logo then re-entering — the manual fix for
-                // Oracle of Seasons' intro freeze.
-                if (g_cgb_bounce_frames >= 0) {
-                    if (++g_cgb_bounce_frames >= 60) {
-                        g_cgb_bounce_frames = -1;  // disarm before reload
-                        char path[256] = {};
-                        strncpy(path, g_gb.romPath, sizeof(path) - 1);
-
-                        // Keep the audio thread alive through the bounce.
-                        // s_bounce_keepalive causes gb_audio_shutdown (inside
-                        // gb_unload_rom) to pause the thread rather than kill it,
-                        // and gb_audio_init (inside gb_load_rom) to unpause it
-                        // rather than restart the hardware session.  The thread
-                        // feeds silence into the hardware queue throughout —
-                        // eliminating the audible gap the full teardown caused.
-                        s_bounce_keepalive = true;
-
-                        const bool bounce_evicted = g_wallpaper_evicted;
-                        if (bounce_evicted) g_wallpaper_evicted = false;
-                        gb_unload_rom();
-                        if (bounce_evicted) g_wallpaper_evicted = true;
-
-                        if (gb_load_rom(path))
-                            g_emu_active = true;
-
-                        s_bounce_keepalive = false;
-                        // No return here — g_gb_fb was restored from the state
-                        // file with the exact pre-bounce pixels, so we fall
-                        // through and render that frame normally.  Removing the
-                        // early-return eliminates the one-frame blank flash that
-                        // caused buttons and screen to blink on the bounce.
-                    }
-                }
             }
         }
 
@@ -2944,9 +2891,9 @@ public:
     // to Settings restores the cursor to wherever the user left it.
     virtual void update() override {
         if      (m_vol_slider     && m_vol_slider->hasFocus())          m_settings_scroll = "Game Boy";
-        else if (m_scale_item     && m_scale_item->hasFocus())          m_settings_scroll = "Overlay Scale";
         else if (m_win_mode_item  && m_win_mode_item->hasFocus())       m_settings_scroll = "Windowed Mode";
         else if (m_win_scale_item && m_win_scale_item->hasFocus())      m_settings_scroll = "Windowed Scale";
+        else if (m_scale_item     && m_scale_item->hasFocus())          m_settings_scroll = "Overlay Scale";
         else if (m_quick_combo_item && m_quick_combo_item->hasFocus())  m_settings_scroll = "Quick Combo";
         else if (m_haptics_item   && m_haptics_item->hasFocus())        m_settings_scroll = "In-Game Haptics";
     }
@@ -2989,27 +2936,6 @@ public:
         list->addItem(new tsl::elm::CategoryHeader("Display"));
 
 
-        // ── Overlay Scale ─────────────────────────────────────────────────────
-        // Cycles 2.5× (default, fills overlay width) ↔ 2× (integer pixel-perfect)
-        // on each A press.  Also togglable in-game by tapping the screen or RS.
-        // Uses set_vp_scale() to invalidate the swizzle/coord LUTs together with
-        // the flag — direct assignment to g_vp_2x alone would leave stale LUTs.
-        {
-            const char* scale_labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
-            auto* scale_item = new tsl::elm::ListItem("Overlay Scale",
-                                                       scale_labels[g_vp_2x ? 1 : 0]);
-            scale_item->setClickListener([scale_item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                set_vp_scale(!g_vp_2x);
-                save_pixel_perfect();
-                const char* labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
-                scale_item->setValue(labels[g_vp_2x ? 1 : 0]);
-                return true;
-            });
-            list->addItem(scale_item);
-            m_scale_item = scale_item;
-        }
-
         // ── Windowed Mode ─────────────────────────────────────────────────────
         // When ON, launching a ROM relaunches this overlay with -windowed <path>
         // so the game runs as a small draggable 160×144 window with no UI chrome.
@@ -3051,6 +2977,28 @@ public:
             list->addItem(scale_item);
             m_win_scale_item = scale_item;
         }
+
+        // ── Overlay Scale ─────────────────────────────────────────────────────
+        // Cycles 2.5× (default, fills overlay width) ↔ 2× (integer pixel-perfect)
+        // on each A press.  Also togglable in-game by tapping the screen or RS.
+        // Uses set_vp_scale() to invalidate the swizzle/coord LUTs together with
+        // the flag — direct assignment to g_vp_2x alone would leave stale LUTs.
+        {
+            const char* scale_labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
+            auto* scale_item = new tsl::elm::ListItem("Overlay Scale",
+                                                       scale_labels[g_vp_2x ? 1 : 0]);
+            scale_item->setClickListener([scale_item](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                set_vp_scale(!g_vp_2x);
+                save_pixel_perfect();
+                const char* labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
+                scale_item->setValue(labels[g_vp_2x ? 1 : 0]);
+                return true;
+            });
+            list->addItem(scale_item);
+            m_scale_item = scale_item;
+        }
+
 
         // ── Input ────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader("Input"));
@@ -3545,6 +3493,7 @@ public:
     }
 
     virtual void exitServices() override {
+        gb_audio_pause();
         gb_unload_rom();   // save state, write SRAM, shut down audio, free ROM buffer
         gb_audio_free_dma();  // release DMA buffers held across sessions (see gb_audio.h)
         free_lcd_ghosting();  // release ghosting heap held across sessions

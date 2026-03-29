@@ -148,21 +148,6 @@ public:
                 g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
                 if (g_gb_frame_next_ns < now_ns)
                     g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-
-                if (g_cgb_bounce_frames >= 0) {
-                    if (++g_cgb_bounce_frames >= 60) {
-                        g_cgb_bounce_frames = -1;
-                        char path[256] = {};
-                        strncpy(path, g_gb.romPath, sizeof(path) - 1);
-                        s_bounce_keepalive = true;
-                        const bool was_evicted = g_wallpaper_evicted;
-                        if (was_evicted) g_wallpaper_evicted = false;
-                        gb_unload_rom();
-                        if (was_evicted) g_wallpaper_evicted = true;
-                        if (gb_load_rom(path)) g_emu_active = true;
-                        s_bounce_keepalive = false;
-                    }
-                }
             }
         }
 
@@ -897,6 +882,7 @@ public:
         tsl::disableHiding = false;  // restore default for any subsequent overlay
         ult::layerEdge  = 0;       // restore for normal overlay hit-tests
         tsl::layerEdgeY = 0;
+        gb_audio_pause();
         gb_unload_rom();             // saves quick-resume state + SRAM
         gb_audio_free_dma();
         free_lcd_ghosting();

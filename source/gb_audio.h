@@ -546,28 +546,6 @@ static struct GACtrl {
     std::atomic<uint8_t> nr52_ch_bits{0};
 } s_ctrl;
 
-// Set to true by the CGB cold-boot bounce in main.cpp around the
-// gb_unload_rom() + gb_load_rom() call pair.  The bounce reloads the exact
-// same ROM — there is no reason to tear down and rebuild the audio session.
-//
-// Effect on gb_audio_shutdown():
-//   Instead of killing the thread and calling audoutStopAudioOut(), returns
-//   immediately after setting ready=false.  The thread keeps running and
-//   generating samples from its frozen APU state (SPSC runs dry naturally
-//   because gb_run_frame is not called during the bounce).  DMA buffers and
-//   the hardware audout session remain live.  Injecting silence here would
-//   produce a hard amplitude discontinuity (audible crackle) at the
-//   silence→real-audio transition — continuous generation avoids it entirely.
-//
-// Effect on gb_audio_init():
-//   Resets the SPSC queue (discards stale events from the old session) and
-//   sets ready=true.  No stop/start/thread-create — the thread was running
-//   the whole time.
-//
-// Result: unbroken audio through the bounce — no silence, no crackle.
-static bool s_bounce_keepalive = false;
-
-
 // ─────────────────────────────────────────────────────────────────────────────
 // audio_write / audio_read — called by peanut_gb on the render thread.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -794,17 +772,6 @@ static u8 gb_audio_get_volume() {
 static bool gb_audio_init(gb_s*) {
     if(s_ctrl.ready) return true;
 
-    if (s_bounce_keepalive) {
-        // Keepalive path: thread never paused, so just reset the SPSC (clears
-        // stale events from the old session) and mark ready.  paused is not
-        // touched — it was never set to true, so the thread was generating audio
-        // continuously throughout the ROM cycle.
-        s_ctrl.evt_w.store(0, std::memory_order_relaxed);
-        s_ctrl.evt_r.store(0, std::memory_order_relaxed);
-        s_ctrl.ready = true;
-        return true;
-    }
-
     s_ctrl.evt_w.store(0,std::memory_order_relaxed);
     s_ctrl.evt_r.store(0,std::memory_order_relaxed);
     // Do NOT zero s_ctrl.regs or s_ctrl.hp_ch — they hold state from the
@@ -907,19 +874,6 @@ static void gb_audio_resume() {
 static void gb_audio_shutdown() {
     if(!s_ctrl.ready) return;
     s_ctrl.ready=false;
-
-    if (s_bounce_keepalive) {
-        // Keepalive path: thread has no dependency on the ROM buffer, so let it
-        // keep running generate_samples() with its frozen APU state throughout
-        // the unload/reload.  The SPSC runs dry naturally (no gb_run_frame calls
-        // during the bounce), so the thread just re-generates from its last known
-        // state — audio continues unbroken.  Setting paused=true here would inject
-        // silence buffers which produce a hard amplitude discontinuity (crackle)
-        // at the silence→real transition.  DMA buffers and audout session stay live.
-        // ready is already false (set above); gb_audio_submit() won't fire during
-        // the bounce, so no stale sentinels can reach the thread.
-        return;
-    }
 
     // Signal the thread to stop.  The thread skips its sleep when thread_run
     // is false, so threadWaitForExit returns in < 1 ms.  The thread writes
