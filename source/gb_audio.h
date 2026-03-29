@@ -122,6 +122,7 @@ static constexpr uint16_t GB_NDIV[8] = {8,16,32,48,64,80,96,112};
 // eliminating the periodic dip/hum on sustained notes caused by the DC
 // tracker permanently lagging behind the changing envelope DC level.
 static constexpr float HP_R = 0.99634f;
+static constexpr float HP_C = 1.0f - HP_R;  // complement; avoids recomputing each sample
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GBAPU — full APU state, owned exclusively by the audio thread.
@@ -337,15 +338,23 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
 
     uint32_t evt_idx = 0;   // next event to apply
 
+    // Hoist master gain: one atomic load per frame-call, not per sample.
+    // A one-frame lag on a slider drag is imperceptible.
+    const float mg = s_master_gain.load(std::memory_order_relaxed);
+
+    // Precompute sample-index due values so the inner event loop pays
+    // only an integer compare instead of a 64-bit multiply+divide each sample.
+    static uint32_t due_arr[LOC_CAP];
+    for (uint32_t k = 0; k < n_evts; ++k)
+        due_arr[k] = static_cast<uint32_t>(
+            static_cast<uint64_t>(evts[k].cycle) * n_samp / GB_FRAME_CYC);
+
     for (uint32_t i=0; i<n_samp; ++i) {
         // ── Cycle-accurate event distribution ────────────────────────────────
         // Apply every event whose T-cycle timestamp maps to sample index <= i.
         // event.cycle is 0..GB_FRAME_CYC-1; due = cycle * n_samp / GB_FRAME_CYC.
         // n_evts==0 is safe: the while guard ensures the body never executes.
-        while (evt_idx < n_evts) {
-            const uint32_t due = static_cast<uint32_t>(
-                static_cast<uint64_t>(evts[evt_idx].cycle) * n_samp / GB_FRAME_CYC);
-            if (due > i) break;
+        while (evt_idx < n_evts && due_arr[evt_idx] <= i) {
             apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
             ++evt_idx;
         }
@@ -399,35 +408,47 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
         float d1;
         {
             int rem=cyc, t=a.ch1.timer, dp=a.ch1.duty_pos, hi=0;
-            while(rem>0){
-                if(t<=0){dp=(dp+1)&7;const int p=ch1_p(a);t+=p>0?p:1;}
-                const int step=rem<t?rem:t;
-                if(a.ch1.enabled&&GB_DUTY[a.ch1.duty][dp]) hi+=step;
-                rem-=step; t-=step;
+            if(t>rem){
+                // Fast path: no duty-position crossing this sample
+                if(a.ch1.enabled&&GB_DUTY[a.ch1.duty][dp]) hi=rem;
+                t-=rem;
+            } else {
+                while(rem>0){
+                    if(t<=0){dp=(dp+1)&7;const int p=ch1_p(a);t+=p>0?p:1;}
+                    const int step=rem<t?rem:t;
+                    if(a.ch1.enabled&&GB_DUTY[a.ch1.duty][dp]) hi+=step;
+                    rem-=step; t-=step;
+                }
             }
             a.ch1.timer=t; a.ch1.duty_pos=dp;
             const float avg=a.ch1.enabled
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch1.vol):0.0f;
             d1=a.ch1.dac_on?avg*DAC_SCALE-1.0f:0.0f;
         }
-        { const float _h=HP_R*a.hp_ch[0]+(1.0f-HP_R)*d1; d1-=_h; a.hp_ch[0]=_h; }
+        { const float _h=HP_R*a.hp_ch[0]+HP_C*d1; d1-=_h; a.hp_ch[0]=_h; }
 
         // ── CH2 — integrate square wave ───────────────────────────────────────
         float d2;
         {
             int rem=cyc, t=a.ch2.timer, dp=a.ch2.duty_pos, hi=0;
-            while(rem>0){
-                if(t<=0){dp=(dp+1)&7;const int p=ch2_p(a);t+=p>0?p:1;}
-                const int step=rem<t?rem:t;
-                if(a.ch2.enabled&&GB_DUTY[a.ch2.duty][dp]) hi+=step;
-                rem-=step; t-=step;
+            if(t>rem){
+                // Fast path: no duty-position crossing this sample
+                if(a.ch2.enabled&&GB_DUTY[a.ch2.duty][dp]) hi=rem;
+                t-=rem;
+            } else {
+                while(rem>0){
+                    if(t<=0){dp=(dp+1)&7;const int p=ch2_p(a);t+=p>0?p:1;}
+                    const int step=rem<t?rem:t;
+                    if(a.ch2.enabled&&GB_DUTY[a.ch2.duty][dp]) hi+=step;
+                    rem-=step; t-=step;
+                }
             }
             a.ch2.timer=t; a.ch2.duty_pos=dp;
             const float avg=a.ch2.enabled
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch2.vol):0.0f;
             d2=a.ch2.dac_on?avg*DAC_SCALE-1.0f:0.0f;
         }
-        { const float _h=HP_R*a.hp_ch[1]+(1.0f-HP_R)*d2; d2-=_h; a.hp_ch[1]=_h; }
+        { const float _h=HP_R*a.hp_ch[1]+HP_C*d2; d2-=_h; a.hp_ch[1]=_h; }
 
         // ── CH3 — integrate wave table ────────────────────────────────────────
         // Accumulate (nibble_value × cycles_at_that_position) / cyc.
@@ -435,20 +456,30 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
         {
             int rem=cyc, t=a.ch3.timer, pos=a.ch3.pos;
             float acc=0.0f;
-            while(rem>0){
-                if(t<=0){pos=(pos+1)&31;const int p=ch3_p(a);t+=p>0?p:1;}
-                const int step=rem<t?rem:t;
+            if(t>rem){
+                // Fast path: wave-table position does not advance this sample
                 if(a.ch3.enabled&&a.ch3.vol_shift>0){
                     const uint8_t b=a.ch3.ram[pos>>1];
                     const int nib=((pos&1)?(b&0xFu):(b>>4))>>(a.ch3.vol_shift-1);
-                    acc+=static_cast<float>(nib)*static_cast<float>(step);
+                    acc=static_cast<float>(nib)*static_cast<float>(rem);
                 }
-                rem-=step; t-=step;
+                t-=rem;
+            } else {
+                while(rem>0){
+                    if(t<=0){pos=(pos+1)&31;const int p=ch3_p(a);t+=p>0?p:1;}
+                    const int step=rem<t?rem:t;
+                    if(a.ch3.enabled&&a.ch3.vol_shift>0){
+                        const uint8_t b=a.ch3.ram[pos>>1];
+                        const int nib=((pos&1)?(b&0xFu):(b>>4))>>(a.ch3.vol_shift-1);
+                        acc+=static_cast<float>(nib)*static_cast<float>(step);
+                    }
+                    rem-=step; t-=step;
+                }
             }
             a.ch3.timer=t; a.ch3.pos=pos;
             d3=a.ch3.dac_on?acc*rcyc*DAC_SCALE-1.0f:0.0f;
         }
-        { const float _h=HP_R*a.hp_ch[2]+(1.0f-HP_R)*d3; d3-=_h; a.hp_ch[2]=_h; }
+        { const float _h=HP_R*a.hp_ch[2]+HP_C*d3; d3-=_h; a.hp_ch[2]=_h; }
 
         // ── CH4 — integrate LFSR noise ────────────────────────────────────────
         // The LFSR state is valid for `t` cycles; when t expires the LFSR shifts.
@@ -457,23 +488,29 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
         {
             int rem=cyc, t=a.ch4.timer, hi=0;
             uint16_t lfsr=a.ch4.lfsr;
-            while(rem>0){
-                if(t<=0){
-                    const int p=ch4_p(a);t+=p>0?p:1;
-                    const uint16_t xb=(lfsr^(lfsr>>1))&1u;
-                    lfsr=(lfsr>>1)|(xb<<14);
-                    if(a.ch4.width7)lfsr=(lfsr&~(1u<<6))|(xb<<6);
+            if(t>rem){
+                // Fast path: LFSR does not shift this sample
+                if(a.ch4.enabled&&(~lfsr&1u)) hi=rem;
+                t-=rem;
+            } else {
+                while(rem>0){
+                    if(t<=0){
+                        const int p=ch4_p(a);t+=p>0?p:1;
+                        const uint16_t xb=(lfsr^(lfsr>>1))&1u;
+                        lfsr=(lfsr>>1)|(xb<<14);
+                        if(a.ch4.width7)lfsr=(lfsr&~(1u<<6))|(xb<<6);
+                    }
+                    const int step=rem<t?rem:t;
+                    if(a.ch4.enabled&&(~lfsr&1u)) hi+=step;
+                    rem-=step; t-=step;
                 }
-                const int step=rem<t?rem:t;
-                if(a.ch4.enabled&&(~lfsr&1u)) hi+=step;
-                rem-=step; t-=step;
             }
             a.ch4.timer=t; a.ch4.lfsr=lfsr;
             const float avg=a.ch4.enabled
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch4.vol):0.0f;
             d4=a.ch4.dac_on?avg*DAC_SCALE-1.0f:0.0f;
         }
-        { const float _h=HP_R*a.hp_ch[3]+(1.0f-HP_R)*d4; d4-=_h; a.hp_ch[3]=_h; }
+        { const float _h=HP_R*a.hp_ch[3]+HP_C*d4; d4-=_h; a.hp_ch[3]=_h; }
 
         // ── NR51 panning + NR50 volume ────────────────────────────────────────
         float ls=0.0f,rs=0.0f;
@@ -485,7 +522,6 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
 
         // ── Scale, clamp, write ──────────────────────────────────────────────
         // DC removed per-channel above; no combined-mix HP needed.
-        const float mg=s_master_gain.load(std::memory_order_relaxed);
         const float sl=ls*MIX_SCALE*mg, sr=rs*MIX_SCALE*mg;
         *dst++=sl> 32767.f? 32767:sl<-32767.f?-32767:static_cast<int16_t>(sl);
         *dst++=sr> 32767.f? 32767:sr<-32767.f?-32767:static_cast<int16_t>(sr);

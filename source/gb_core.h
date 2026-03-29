@@ -38,8 +38,8 @@
 #ifndef WALNUT_FULL_GBC_SUPPORT
 #  define WALNUT_FULL_GBC_SUPPORT     1  // enables gb_s::cgb — full GBC colour
 #endif
-//#ifndef PEANUT_GB_HIGH_LCD_ACCURACY
-//#  define PEANUT_GB_HIGH_LCD_ACCURACY 0
+//#ifndef WALNUT_GB_HIGH_LCD_ACCURACY
+//#  define WALNUT_GB_HIGH_LCD_ACCURACY 1
 //#endif
 #ifndef GB_INTERNAL
 #  define GB_INTERNAL

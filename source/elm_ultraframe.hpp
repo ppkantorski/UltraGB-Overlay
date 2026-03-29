@@ -4,7 +4,7 @@
  *   UltraGBOverlayFrame — single-page overlay frame for UltraGB.
  *
  *   Used by RomSelectorGui (ROMs page) and SettingsGui (Settings page).
- *     • Draws the animated "UltraGB" wave title (via draw_ultraboy_title)
+ *     • Draws the animated "UltraGB" wave title (via draw_ultragb_title)
  *     • Shows a left-page ("ROMs") or right-page ("Settings") footer button
  *       to signal the other page; navigation is handled by swapTo<> in each
  *       Gui's handleInput — no in-place list swapping, no dual list ownership.
@@ -20,6 +20,16 @@
  *
  *   NO mutex — Tesla's UI path (draw/layout/requestFocus/onTouch) is
  *   single-threaded.
+ *
+ * Performance notes:
+ *   Static-local caching (s_dimsReady / s_*) avoids three getTextDimensions
+ *   calls and their associated temporary string constructions on every frame.
+ *   These strings (GAP_1, GAP_2, BACK, OK) never change at runtime so their
+ *   pixel widths are permanent once measured.
+ *
+ *   Instance-level dirty-flag caching (m_footerDirty) avoids rebuilding the
+ *   footer string and re-measuring the page-label width every frame; those
+ *   values only change when setPageNames() is called.
  ********************************************************************************/
 
 #pragma once
@@ -28,10 +38,10 @@
 #include <string>
 #include <cmath>
 
-// draw_ultraboy_title is defined in main.cpp (static, visible here because
+// draw_ultragb_title is defined in main.cpp (static, visible here because
 // this header is included after the definition).
 // Forward-declare the signature so the compiler is happy if included earlier.
-static s32 draw_ultraboy_title(tsl::gfx::Renderer*, s32, s32, u32);
+static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32);
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
@@ -45,6 +55,7 @@ public:
         ult::loadWallpaperFileWhenSafe();
         m_isItem = false;
         disableSound.store(false, std::memory_order_release);
+        // m_footerDirty = true by default — first draw() will populate the cache.
     }
 
     ~UltraGBOverlayFrame() override { delete m_contentElement; }
@@ -59,81 +70,115 @@ public:
 #endif
 
         // --- Animated title ---
-        draw_ultraboy_title(renderer, 20, 67, 50);
+        draw_ultragb_title(renderer, 20, 67, 50);
 
         // --- Bottom separator ---
         renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73,
                            tsl::cfg::FramebufferWidth - 30, 1,
                            a(tsl::bottomSeparatorColor));
 
-        // --- Footer width calculations (mirrors SysTuneOverlayFrame) ---
+        // -----------------------------------------------------------------------
+        // Static footer dimension cache.
+        //
+        // GAP_1, GAP_2, BACK, OK are runtime constants — their pixel widths
+        // never change, so we measure them exactly once across all frames and
+        // all instances.  The derived half-gap and button widths are stored
+        // alongside so we never recompute them either.
+        // -----------------------------------------------------------------------
+        static bool  s_dimsReady   = false;
+        static float s_gapWidth    = 0.f;
+        static float s_halfGap     = 0.f;
+        static float s_backWidth   = 0.f;   // backTextWidth + gapWidth
+        static float s_selectWidth = 0.f;   // selTextWidth  + gapWidth
+
+        if (!s_dimsReady) {
+            s_gapWidth    = renderer->getTextDimensions(ult::GAP_1,                        false, 23).first;
+            s_backWidth   = renderer->getTextDimensions("\uE0E1" + ult::GAP_2 + ult::BACK, false, 23).first + s_gapWidth;
+            s_selectWidth = renderer->getTextDimensions("\uE0E0" + ult::GAP_2 + ult::OK,   false, 23).first + s_gapWidth;
+            s_halfGap     = s_gapWidth * 0.5f;
+            s_dimsReady   = true;
+        }
+
+        // Sync shared atomics — updateAtomic short-circuits after the first
+        // frame once the values stabilise, so this is just 3 atomic loads.
         const auto updateAtomic = [](std::atomic<float>& atom, float val) {
             if (val != atom.load(std::memory_order_acquire))
                 atom.store(val, std::memory_order_release);
         };
+        updateAtomic(ult::halfGap,     s_halfGap);
+        updateAtomic(ult::backWidth,   s_backWidth);
+        updateAtomic(ult::selectWidth, s_selectWidth);
 
-        const float gapWidth      = renderer->getTextDimensions(ult::GAP_1,                        false, 23).first;
-        const float backTextWidth = renderer->getTextDimensions("\uE0E1" + ult::GAP_2 + ult::BACK, false, 23).first;
-        const float selTextWidth  = renderer->getTextDimensions("\uE0E0" + ult::GAP_2 + ult::OK,   false, 23).first;
-
-        const float _halfGap     = gapWidth * 0.5f;
-        const float _backWidth   = backTextWidth + gapWidth;
-        const float _selectWidth = selTextWidth  + gapWidth;
-
-        updateAtomic(ult::halfGap,     _halfGap);
-        updateAtomic(ult::backWidth,   _backWidth);
-        updateAtomic(ult::selectWidth, _selectWidth);
-
+        // buttonY is derived from FramebufferHeight which never changes.
+        static const float s_buttonY =
+            static_cast<float>(tsl::cfg::FramebufferHeight - 73 + 1);
         static constexpr float buttonStartX = 30.f;
-        const float buttonY = static_cast<float>(tsl::cfg::FramebufferHeight - 73 + 1);
+
+        // -----------------------------------------------------------------------
+        // Instance-level footer cache.
+        //
+        // Rebuilt only when setPageNames() is called (or on the very first
+        // draw).  Avoids per-frame string concatenation and an additional
+        // getTextDimensions call for the page label.
+        // -----------------------------------------------------------------------
+        if (m_footerDirty) {
+            m_hasNextPage = !m_pageLeftName.empty() || !m_pageRightName.empty();
+
+            if (m_hasNextPage) {
+                m_cachedPageLabel = !m_pageLeftName.empty()
+                    ? ("\uE0ED" + ult::GAP_2 + m_pageLeftName)
+                    : ("\uE0EE" + ult::GAP_2 + m_pageRightName);
+                // Page label width requires the renderer — measure it once here.
+                m_cachedPageLabelWidth =
+                    renderer->getTextDimensions(m_cachedPageLabel, false, 23).first + s_gapWidth;
+
+                m_cachedFooterString =
+                    "\uE0E1" + ult::GAP_2 + ult::BACK + ult::GAP_1 +
+                    "\uE0E0" + ult::GAP_2 + ult::OK   + ult::GAP_1 +
+                    m_cachedPageLabel + ult::GAP_1;
+            } else {
+                m_cachedPageLabel      = {};
+                m_cachedPageLabelWidth = 0.f;
+                m_cachedFooterString   =
+                    "\uE0E1" + ult::GAP_2 + ult::BACK + ult::GAP_1 +
+                    "\uE0E0" + ult::GAP_2 + ult::OK   + ult::GAP_1;
+            }
+
+            // Sync page-related atomics while we already know the new values.
+            ult::hasNextPageButton.store(m_hasNextPage, std::memory_order_release);
+            ult::nextPageWidth.store(m_cachedPageLabelWidth, std::memory_order_release);
+
+            m_footerDirty = false;
+        }
 
         // --- Page navigation button ---
-        const bool hasNextPage = !m_pageLeftName.empty() || !m_pageRightName.empty();
-        if (hasNextPage != ult::hasNextPageButton.load(std::memory_order_acquire))
-            ult::hasNextPageButton.store(hasNextPage, std::memory_order_release);
-
-        if (hasNextPage) {
-            const std::string pageLabel = !m_pageLeftName.empty()
-                ? ("\uE0ED" + ult::GAP_2 + m_pageLeftName)
-                : ("\uE0EE" + ult::GAP_2 + m_pageRightName);
-
-            const float _nextPageWidth =
-                renderer->getTextDimensions(pageLabel, false, 23).first + gapWidth;
-            updateAtomic(ult::nextPageWidth, _nextPageWidth);
-
+        if (m_hasNextPage) {
+            // nextPageWidth is already up to date (set in the dirty block above).
             if (ult::touchingNextPage.load(std::memory_order_acquire)) {
-                const float nextX = buttonStartX + 2.f - _halfGap + _backWidth + 1.f + _selectWidth;
-                renderer->drawRoundedRect(nextX, buttonY, _nextPageWidth - 2.f, 73.0f, 12.0f,
+                const float nextX = buttonStartX + 2.f - s_halfGap + s_backWidth + 1.f + s_selectWidth;
+                renderer->drawRoundedRect(nextX, s_buttonY, m_cachedPageLabelWidth - 2.f, 73.0f, 12.0f,
                                           a(tsl::clickColor));
             }
-        } else {
-            ult::nextPageWidth.store(0.0f, std::memory_order_release);
         }
 
         // --- Touch highlights ---
         if (ult::touchingBack)
-            renderer->drawRoundedRect(buttonStartX + 2.f - _halfGap, buttonY,
-                                      _backWidth - 1.f, 73.0f, 12.0f, a(tsl::clickColor));
+            renderer->drawRoundedRect(buttonStartX + 2.f - s_halfGap, s_buttonY,
+                                      s_backWidth - 1.f, 73.0f, 12.0f, a(tsl::clickColor));
         if (ult::touchingSelect.load(std::memory_order_acquire))
-            renderer->drawRoundedRect(buttonStartX + 2.f - _halfGap + _backWidth + 1.f,
-                                      buttonY, _selectWidth - 2.f, 73.0f, 12.0f,
+            renderer->drawRoundedRect(buttonStartX + 2.f - s_halfGap + s_backWidth + 1.f,
+                                      s_buttonY, s_selectWidth - 2.f, 73.0f, 12.0f,
                                       a(tsl::clickColor));
 
         // --- Footer text ---
-        const std::string currentBottomLine =
-            "\uE0E1" + ult::GAP_2 + ult::BACK  + ult::GAP_1 +
-            "\uE0E0" + ult::GAP_2 + ult::OK    + ult::GAP_1 +
-            (!m_pageLeftName.empty()  ? "\uE0ED" + ult::GAP_2 + m_pageLeftName  + ult::GAP_1 :
-             !m_pageRightName.empty() ? "\uE0EE" + ult::GAP_2 + m_pageRightName + ult::GAP_1 : "");
-
-        renderer->drawStringWithColoredSections(currentBottomLine, false,
+        renderer->drawStringWithColoredSections(m_cachedFooterString, false,
             tsl::s_footerSpecialChars, buttonStartX, 693, 23,
             tsl::bottomTextColor, tsl::buttonColor);
 
         if (!usingUnfocusedColor) {
             static const std::string okOverdraw = "\uE0E0" + ult::GAP_2 + ult::OK + ult::GAP_1;
             renderer->drawStringWithColoredSections(okOverdraw, false, tsl::s_footerSpecialChars,
-                buttonStartX + _backWidth, 693, 23,
+                buttonStartX + s_backWidth, 693, 23,
                 tsl::unfocusedColor, tsl::unfocusedColor);
         }
 
@@ -193,6 +238,7 @@ public:
     void setPageNames(std::string left, std::string right) {
         m_pageLeftName  = std::move(left);
         m_pageRightName = std::move(right);
+        m_footerDirty   = true;   // trigger cache rebuild on next draw()
     }
 
     tsl::elm::Element* getContent() const { return m_contentElement; }
@@ -201,4 +247,13 @@ private:
     tsl::elm::Element* m_contentElement = nullptr;  ///< Owning — deleted in destructor.
     std::string        m_pageLeftName;
     std::string        m_pageRightName;
+
+    // -----------------------------------------------------------------------
+    // Instance footer cache — rebuilt whenever m_footerDirty is true.
+    // -----------------------------------------------------------------------
+    bool        m_footerDirty         = true;  ///< True on construction and after setPageNames().
+    bool        m_hasNextPage         = false;
+    std::string m_cachedPageLabel;              ///< "\uE0ED/<\uE0EE> GAP_2 <name>", or empty.
+    std::string m_cachedFooterString;           ///< Full bottom-line string passed to drawStringWithColoredSections.
+    float       m_cachedPageLabelWidth = 0.f;   ///< getTextDimensions(m_cachedPageLabel) + gapWidth.
 };
