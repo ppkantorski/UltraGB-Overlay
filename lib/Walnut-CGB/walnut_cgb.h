@@ -2893,7 +2893,7 @@ void __gb_draw_line(struct gb_s *gb)
 		if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
 			tile = VRAM_TILES_1 + idx * 0x10;
 		else
-			tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
+			tile = VRAM_TILES_2 + ((uint8_t)(idx + 0x80)) * 0x10;
 
 #if WALNUT_FULL_GBC_SUPPORT
 		if(cgbMode)
@@ -2945,7 +2945,7 @@ void __gb_draw_line(struct gb_s *gb)
 				if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
 					tile = VRAM_TILES_1 + idx * 0x10;
 				else
-					tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
+					tile = VRAM_TILES_2 + ((uint8_t)(idx + 0x80)) * 0x10;
 
 #if WALNUT_FULL_GBC_SUPPORT
 				if(cgbMode)
@@ -3053,7 +3053,7 @@ void __gb_draw_line(struct gb_s *gb)
 		if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
 			tile = VRAM_TILES_1 + idx * 0x10;
 		else
-			tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
+			tile = VRAM_TILES_2 + ((uint8_t)(idx + 0x80)) * 0x10;
 
 #if WALNUT_FULL_GBC_SUPPORT
 		if(cgbMode)
@@ -3108,7 +3108,7 @@ void __gb_draw_line(struct gb_s *gb)
 				if(gb->hram_io[IO_LCDC] & LCDC_TILE_SELECT)
 					tile = VRAM_TILES_1 + idx * 0x10;
 				else
-					tile = VRAM_TILES_2 + ((idx + 0x80) % 0x100) * 0x10;
+					tile = VRAM_TILES_2 + ((uint8_t)(idx + 0x80)) * 0x10;
 
 #if WALNUT_FULL_GBC_SUPPORT
 				if(cgbMode)
@@ -5445,11 +5445,11 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		 * the EI instruction itself. */
 		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
-		gb->counter.div_count += inst_cycles;
-		while(gb->counter.div_count >= DIV_CYCLES)
+		/* DIV_CYCLES == 256 (power of 2): branchless increment. */
 		{
-			gb->hram_io[IO_DIV]++;
-			gb->counter.div_count -= DIV_CYCLES;
+			const uint_fast16_t new_div = gb->counter.div_count + inst_cycles;
+			gb->hram_io[IO_DIV] += (uint8_t)(new_div >> 8);
+			gb->counter.div_count = new_div & 0xFF;
 		}
 
 		/* Check for RTC tick. */
@@ -5562,11 +5562,12 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		{
 			gb->counter.tima_count += inst_cycles;
 
-			while(gb->counter.tima_count >=
-				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK])
+			/* Cache rate: IO_TAC cannot change inside this single-threaded loop. */
+			const uint_fast16_t tac_rate =
+				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+			while(gb->counter.tima_count >= tac_rate)
 			{
-				gb->counter.tima_count -=
-					TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+				gb->counter.tima_count -= tac_rate;
 
 				if(++gb->hram_io[IO_TIMA] == 0)
 				{
@@ -7493,11 +7494,11 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		 * the EI instruction itself. */
 		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
-		gb->counter.div_count += inst_cycles;
-		while(gb->counter.div_count >= DIV_CYCLES)
+		/* DIV_CYCLES == 256 (power of 2): branchless increment. */
 		{
-			gb->hram_io[IO_DIV]++;
-			gb->counter.div_count -= DIV_CYCLES;
+			const uint_fast16_t new_div = gb->counter.div_count + inst_cycles;
+			gb->hram_io[IO_DIV] += (uint8_t)(new_div >> 8);
+			gb->counter.div_count = new_div & 0xFF;
 		}
 
 		/* Check for RTC tick. */
@@ -7610,11 +7611,12 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 		{
 			gb->counter.tima_count += inst_cycles;
 
-			while(gb->counter.tima_count >=
-				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK])
+			/* Cache rate: IO_TAC cannot change inside this single-threaded loop. */
+			const uint_fast16_t tac_rate =
+				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+			while(gb->counter.tima_count >= tac_rate)
 			{
-				gb->counter.tima_count -=
-					TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+				gb->counter.tima_count -= tac_rate;
 
 				if(++gb->hram_io[IO_TIMA] == 0)
 				{
@@ -10141,11 +10143,11 @@ void __gb_step_cpu_x(struct gb_s *gb)
 		 * the EI instruction itself. */
 		if(gb->gb_ime_pending) { gb->gb_ime = true; gb->gb_ime_pending = false; }
 		/* DIV register timing */
-		gb->counter.div_count += inst_cycles;
-		while(gb->counter.div_count >= DIV_CYCLES)
+		/* DIV_CYCLES == 256 (power of 2): branchless increment. */
 		{
-			gb->hram_io[IO_DIV]++;
-			gb->counter.div_count -= DIV_CYCLES;
+			const uint_fast16_t new_div = gb->counter.div_count + inst_cycles;
+			gb->hram_io[IO_DIV] += (uint8_t)(new_div >> 8);
+			gb->counter.div_count = new_div & 0xFF;
 		}
 
 		/* Check for RTC tick. */
@@ -10258,11 +10260,12 @@ void __gb_step_cpu_x(struct gb_s *gb)
 		{
 			gb->counter.tima_count += inst_cycles;
 
-			while(gb->counter.tima_count >=
-				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK])
+			/* Cache rate: IO_TAC cannot change inside this single-threaded loop. */
+			const uint_fast16_t tac_rate =
+				TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+			while(gb->counter.tima_count >= tac_rate)
 			{
-				gb->counter.tima_count -=
-					TAC_CYCLES[gb->hram_io[IO_TAC] & IO_TAC_RATE_MASK];
+				gb->counter.tima_count -= tac_rate;
 
 				if(++gb->hram_io[IO_TIMA] == 0)
 				{
