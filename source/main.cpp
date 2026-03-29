@@ -130,14 +130,28 @@ static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
 // framebuffer is sized correctly before Tesla initialises.
 static int g_win_scale = 1;
 
-// true  = windowed mode targets 1080p output.  On a 1080p display the VI space
-//         maps 1:1 to physical pixels, so only even scale factors (2× and 4×)
-//         produce integer multiples (×3 and ×6 display pixels per GB source pixel).
-//         Odd scales (1× → ×1.5, 3× → ×4.5) land on half-pixels and blur.
-// false = targets standard 720p output (default).  The compositor downscales VI
-//         ×2/3, which cancels the 1.5× FB→VI mapping exactly — all four scales
-//         (1×/2×/3×/4×) are pixel-perfect on 720p.
+// Tri-state screen mode:
+//   0 = Auto  — resolves to 1080p if consoleIsDocked(), else 720p
+//   1 = 720p  — VI is downscaled x2/3; all four scales pixel-perfect
+//   2 = 1080p — VI maps 1:1; only even scales (2x/4x) are pixel-perfect
+// Persisted to config.ini as "auto" / "0" / "1". Default: auto (0).
+static int  g_win_hd_mode = 0;   // 0=Auto, 1=720p, 2=1080p
+
+// Resolved boolean: true = 1080p, false = 720p.
+// Set by resolve_win_hd() from g_win_hd_mode (+ consoleIsDocked() for Auto).
+// All existing logic that reads the HD flag reads this bool unchanged.
 static bool g_win_hd = false;
+
+// Set g_win_hd from g_win_hd_mode.
+// Auto (0): queries whether the Switch is currently docked; resolves to true
+//           (1080p) when docked, false (720p) when handheld.
+// Must be called any time g_win_hd_mode is written, and in both windowed
+// launch paths inside main() before the pixel-perfect scale clamps run.
+static void resolve_win_hd() {
+    if      (g_win_hd_mode == 2) g_win_hd = true;
+    else if (g_win_hd_mode == 1) g_win_hd = false;
+    else                          g_win_hd = ult::consoleIsDocked();  // Auto
+}
 
 static void save_vol_backup() {
     char buf[4];
@@ -218,12 +232,16 @@ static void load_config() {
         else                g_win_scale = 1;
     }
 
-    // win_hd — 1080p pixel-perfect windowed mode: 0 = 720p (default), 1 = 1080p.
-    // In 1080p mode only even scales (2x / 4x) are pixel-perfect; odd scales are
-    // clamped below without overwriting the saved config value.
+    // win_hd — screen mode: "auto" (default), "0" = 720p, "1" = 1080p.
+    // Resolved to g_win_hd bool via resolve_win_hd() below.
+    // In 1080p mode only even scales (2x / 4x) are pixel-perfect; odd scales
+    // are clamped below without overwriting the saved config value.
     {
         const std::string hd = ult::parseValueFromIniSection(path, "config", "win_hd");
-        if (!hd.empty()) g_win_hd = (hd == "1");
+        if      (hd == "1")    g_win_hd_mode = 2;
+        else if (hd == "0")    g_win_hd_mode = 1;
+        else                   g_win_hd_mode = 0;  // "auto" or absent
+        resolve_win_hd();
     }
 
     // Apply runtime clamps to g_win_scale now that both win_scale and win_hd
@@ -257,7 +275,7 @@ static void write_default_config_if_missing() {
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
-    set_if_missing("win_hd",        "0");
+    set_if_missing("win_hd",        "auto");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -300,12 +318,13 @@ static void save_win_scale() {
     ult::setIniFileValue(kConfigFile, "config", "win_scale", s, "");
 }
 
-// Persist the 1080p windowed mode flag.
-// win_hd=1 means the user has told us the Switch is docked at 1080p output.
-// Only even scales (2× / 4×) are pixel-perfect in that case.
+// Persist the screen mode tri-state to config.ini.
+// "auto" = detect via consoleIsDocked(), "0" = force 720p, "1" = force 1080p.
 static void save_win_hd() {
-    ult::setIniFileValue(kConfigFile, "config", "win_hd",
-                         g_win_hd ? "1" : "0", "");
+    const char* val = (g_win_hd_mode == 2) ? "1"
+                    : (g_win_hd_mode == 1) ? "0"
+                    :                        "auto";
+    ult::setIniFileValue(kConfigFile, "config", "win_hd", val, "");
 }
 
 // =============================================================================
@@ -3031,11 +3050,12 @@ public:
                 return lbs[s - 1];
             };
 
-            // Create Screen Mode item first — listener wired below after scale_item exists.
-            auto* hd_item = new tsl::elm::ListItem("Screen Mode",
-                                                    g_win_hd ? "1080p" : "720p");
-            list->addItem(hd_item);
-            m_screen_mode_item = hd_item;
+            // Label string for the current Screen Mode tri-state.
+            auto make_hd_label = []() -> std::string {
+                if (g_win_hd_mode == 2) return "1080p";
+                if (g_win_hd_mode == 1) return "720p";
+                return "Auto";  // 0 = Auto
+            };
 
             // Create Windowed Scale item and wire its listener immediately.
             auto* scale_item = new tsl::elm::ListItem("Windowed Scale", make_label());
@@ -3062,26 +3082,37 @@ public:
             list->addItem(scale_item);
             m_win_scale_item = scale_item;
 
+
+            // Create Screen Mode item first — listener wired below after scale_item exists.
+            auto* hd_item = new tsl::elm::ListItem("Screen Mode", make_hd_label());
+            list->addItem(hd_item);
+            m_screen_mode_item = hd_item;
+
             // Wire Screen Mode listener now that scale_item is valid.
             // Captures scale_item by value so it can call setValue immediately,
             // keeping the Windowed Scale label in sync without a page flip.
+            // Cycle: Auto (0) -> 720p (1) -> 1080p (2) -> Auto (0) -> ...
             hd_item->setClickListener([hd_item, scale_item,
-                                       make_label](u64 keys) -> bool {
+                                       make_hd_label, make_label](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                g_win_hd = !g_win_hd;
-                hd_item->setValue(g_win_hd ? "1080p" : "720p");
+                g_win_hd_mode = (g_win_hd_mode + 1) % 3;
+                resolve_win_hd();
+                hd_item->setValue(make_hd_label());
                 save_win_hd();
                 // Refresh Windowed Scale label immediately to reflect the new mode.
-                // g_win_scale is intentionally left untouched here — effective_scale()
-                // maps stored scale to the nearest pixel-perfect value (stored < 3 → 2×,
-                // stored >= 3 → 4×) without overwriting the saved value.  The user's
+                // g_win_scale is intentionally left untouched here - effective_scale()
+                // maps stored scale to the nearest pixel-perfect value (stored < 3 -> 2x,
+                // stored >= 3 -> 4x) without overwriting the saved value.  The user's
                 // original scale is preserved so switching back to 720p restores it
                 // exactly.  g_win_scale is only written when the user explicitly presses
                 // A on Windowed Scale.
                 scale_item->setValue(make_label());
-                show_notify(g_win_hd
-                    ? "1080p2x / 4x are pixel-perfect"
-                    : "720pall scales pixel-perfect");
+                if (g_win_hd_mode == 0)
+                    show_notify("Auto: detects docked/handheld at launch");
+                else if (g_win_hd_mode == 2)
+                    show_notify("1080p: 2x / 4x are pixel-perfect");
+                else
+                    show_notify("720p: all scales pixel-perfect");
                 return true;
             });
         }
@@ -3726,7 +3757,10 @@ int main(int argc, char* argv[]) {
                         {
                             const std::string hd = ult::parseValueFromIniSection(
                                 kConfigFile, "config", "win_hd");
-                            g_win_hd = (hd == "1");
+                            if      (hd == "1") g_win_hd_mode = 2;
+                            else if (hd == "0") g_win_hd_mode = 1;
+                            else                g_win_hd_mode = 0;  // "auto" or absent
+                            resolve_win_hd();
                         }
                         if (g_win_hd && g_win_scale % 2 != 0)
                             g_win_scale = (g_win_scale == 1) ? 2 : 4;
@@ -3776,7 +3810,10 @@ int main(int argc, char* argv[]) {
                 {
                     const std::string hd = ult::parseValueFromIniSection(
                         kConfigFile, "config", "win_hd");
-                    g_win_hd = (hd == "1");
+                    if      (hd == "1") g_win_hd_mode = 2;
+                    else if (hd == "0") g_win_hd_mode = 1;
+                    else                g_win_hd_mode = 0;  // "auto" or absent
+                    resolve_win_hd();
                 }
                 // In 1080p mode only even scales are pixel-perfect (the 1.5× FB→VI
                 // mapping combined with the 1:1 VI→display mapping at 1080p means
