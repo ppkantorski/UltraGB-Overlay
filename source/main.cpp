@@ -96,8 +96,8 @@ static const char* vol_to_str(u8 v, char (&buf)[4]) {
 
 // Unmute backup volume — the last positive volume before muting.
 // Persisted to vol_backup in config.ini so it survives app exit.
-// Always > 0; initialized to 100 as a safe default.
-static u8 g_vol_backup = 100;
+// Always > 0; initialized to 50 as a safe default.
+static u8 g_vol_backup = 50;
 
 // ── Windowed mode ─────────────────────────────────────────────────────────────
 // When true the ROM selector relaunches this overlay with -windowed <path>,
@@ -192,11 +192,11 @@ static void load_config() {
     if (!last_rom_val.empty() && last_rom_val.size() < sizeof(g_last_rom_path) - 1)
         strncpy(g_last_rom_path, last_rom_val.c_str(), sizeof(g_last_rom_path) - 1);
 
-    // volume — master GB audio volume (0–100), default 100
+    // volume — master GB audio volume (0–100), default 50
     { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolume), v))
         gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100))); }
 
-    // vol_backup — unmute restore target (0 treated as absent → default 100)
+    // vol_backup — unmute restore target (0 treated as absent → default 50)
     { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolBackup), v))
         g_vol_backup = static_cast<u8>(std::clamp(v, 1, 100)); }
 
@@ -249,8 +249,8 @@ static void set_if_missing(const char* key, const char* def) {
 
 static void write_default_config_if_missing() {
     set_if_missing("rom_dir",       g_rom_dir);
-    set_if_missing("volume",        "100");
-    set_if_missing("vol_backup",    "100");
+    set_if_missing("volume",        "50");
+    set_if_missing("vol_backup",    "50");
     set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
     set_if_missing("ingame_haptics", "1");
@@ -3236,6 +3236,12 @@ public:
         std::string jumpTarget = currentCombo.empty() ? ult::OPTION_SYMBOL : "";
 
         for (const auto& combo : g_defaultCombos) {
+            // Skip any combo that matches Tesla's current show/hide combo so the
+            // user cannot accidentally reassign the overlay open trigger to Quick
+            // Launch — that would make the overlay unreachable.
+            const u64 comboKeys = tsl::hlp::comboStringToKeys(combo);
+            if (comboKeys == tsl::cfg::launchCombo)
+                continue;
             std::string display = combo;
             ult::convertComboToUnicode(display);
 
