@@ -157,19 +157,19 @@ static void init_swizzle_lut() {
 
 // -- Source-pixel coordinate LUTs ---------------------------------------------
 // Maps each GB source pixel index to its output viewport extent (VP-relative).
-static bool    s_coord_ready = false;
-static int16_t s_dx0[GB_W], s_dx1[GB_W];
-static int16_t s_dy0[GB_H], s_dy1[GB_H];
+static bool s_coord_ready = false;
+static int  s_dx0[GB_W], s_dx1[GB_W];   // int: no sign-extension in hot loop
+static int  s_dy0[GB_H], s_dy1[GB_H];
 
 static void init_coord_lut() {
     const int cvp_w = vp_w(), cvp_h = vp_h();
     for (int i = 0; i < GB_W; ++i) {
-        s_dx0[i] = static_cast<int16_t>( i      * cvp_w / GB_W);
-        s_dx1[i] = static_cast<int16_t>((i + 1) * cvp_w / GB_W);
+        s_dx0[i] = i       * cvp_w / GB_W;
+        s_dx1[i] = (i + 1) * cvp_w / GB_W;
     }
     for (int i = 0; i < GB_H; ++i) {
-        s_dy0[i] = static_cast<int16_t>( i      * cvp_h / GB_H);
-        s_dy1[i] = static_cast<int16_t>((i + 1) * cvp_h / GB_H);
+        s_dy0[i] = i       * cvp_h / GB_H;
+        s_dy1[i] = (i + 1) * cvp_h / GB_H;
     }
     s_coord_ready = true;
 }
@@ -281,74 +281,140 @@ inline void apply_lcd_ghosting() {
     }
 
     static constexpr uint8_t FLICKER_THRESHOLD = 3u;
-    const int total = GB_W * GB_H;
+    static constexpr int     total             = GB_W * GB_H; // 23040, divisible by 8
 
-    // ── Pre-pass: bulk-transition detection ──────────────────────────────────
-    // Count how many pixels changed this frame.  The pixel array (~45 KB) is
-    // already hot in L2 cache from the draw pass so the extra traversal is
-    // negligible.  If the count exceeds BULK_CHANGE_LIMIT we are in a scroll
-    // or map-cut frame: reset counters for changed pixels instead of
-    // incrementing them, preventing stale counts from ghosting the first
-    // stable frame of the new map.
+    // ── Pre-pass: bulk-transition detection — NEON, 8 pixels/cycle ──────────
+    // Counts changed pixels with early exit: once BULK_CHANGE_LIMIT is
+    // exceeded we already know the answer and stop scanning.
+    // total=23040 is exactly divisible by 8, so no scalar tail is needed.
     int changed_count = 0;
-    for (int i = 0; i < total; i++)
-        changed_count += (g_gb_fb[i] != s_prev_fb[i]);
+    {
+        uint32x4_t acc = vdupq_n_u32(0);
+        int i = 0;
+        for (; i < total; i += 8) {
+            const uint16x8_t a   = vld1q_u16(g_gb_fb   + i);
+            const uint16x8_t b   = vld1q_u16(s_prev_fb + i);
+            // neq lane: 0xFFFF where different, 0x0000 where same
+            const uint16x8_t neq = vmvnq_u16(vceqq_u16(a, b));
+            // Convert to 0x0001/0x0000 so pairwise-add gives a per-pair count
+            acc = vaddq_u32(acc, vpaddlq_u16(vshrq_n_u16(neq, 15)));
+            // Early exit: check every 256 elements (32 NEON iterations)
+            if (__builtin_expect((i & 0xFF) == 0 && i >= 256, 0)) {
+                const uint64x2_t s64 = vpaddlq_u32(acc);
+                if ((int)(vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1)) > BULK_CHANGE_LIMIT) {
+                    changed_count = BULK_CHANGE_LIMIT + 1;
+                    goto pre_pass_done;
+                }
+            }
+        }
+        {
+            const uint64x2_t s64 = vpaddlq_u32(acc);
+            changed_count = (int)(vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1));
+        }
+    }
+    pre_pass_done:;
 
-    const bool bulk_transition = (changed_count > BULK_CHANGE_LIMIT);
+    // ── Bulk-transition fast path ────────────────────────────────────────────
+    // During a scroll or map-cut the loop body degenerates to:
+    //   mask[i] = 0 (always, because every changed pixel resets, every
+    //                stable pixel also resets via the else-0 branch)
+    //   prev[i] = curr[i] (unconditionally)
+    //   g_gb_fb[i] unchanged (no blend fires — mask was ≥threshold only if
+    //               it had been building, but it gets reset before the blend
+    //               check, so the blend condition is false)
+    // Replace the entire 23K-pixel loop with two memory operations.
+    if (changed_count > BULK_CHANGE_LIMIT) {
+        memset(s_flicker_mask, 0, total);
+        memcpy(s_prev_fb, g_gb_fb, total * sizeof(uint16_t));
+        return;
+    }
+
+    // ── Normal frame: NEON blend + mask update, 8 pixels/cycle ─────────────
+    // bulk_transition is false here, so the mask update simplifies to:
+    //   changed_now ? saturating_inc(mask) : 0
+    // Blend fires when changed_now && mask >= FLICKER_THRESHOLD.
+    // We compute blended values unconditionally then select with vbslq —
+    // cheaper than branching on a per-pixel condition.
+
+    const uint16x8_t v_thresh = vdupq_n_u16(FLICKER_THRESHOLD);
+    const uint8x8_t  v_one8   = vdup_n_u8(1);
 
     if (g_fb_is_rgb565) {
-        // CGB: raw RGB565.
-        for (int i = 0; i < total; i++) {
-            const uint16_t prev = s_prev_fb[i];
-            const uint16_t curr = g_gb_fb[i];
-            const bool changed_now = (curr != prev);
+        // CGB path: RGB565 in g_gb_fb, blend R5/G6/B5 channels.
+        const uint16x8_t m1f = vdupq_n_u16(0x001Fu); // 5-bit mask
+        const uint16x8_t m3f = vdupq_n_u16(0x003Fu); // 6-bit mask (green)
 
-            uint8_t mask = s_flicker_mask[i];
+        for (int i = 0; i < total; i += 8) {
+            const uint16x8_t curr_v = vld1q_u16(g_gb_fb   + i);
+            const uint16x8_t prev_v = vld1q_u16(s_prev_fb + i);
+            const uint8x8_t  mask_v = vld1_u8  (s_flicker_mask + i);
 
-            if (bulk_transition & changed_now) {
-                // Transition frame: suppress counter build-up for changed pixels.
-                // No blend, no increment — reset so scroll accumulation does not
-                // carry into the first stable frame of the new map.
-                mask = 0u;
-            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
-                // Pixel has been changing for FLICKER_THRESHOLD+ consecutive frames
-                // → genuine sustained flicker (e.g. Chain Chomp chain at 30 Hz).
-                // 50/50 blend produces stable mid-brightness — no flicker.
-                const uint8_t r = (uint8_t)(((curr >> 11 & 0x1Fu) + (prev >> 11 & 0x1Fu)) >> 1);
-                const uint8_t g = (uint8_t)(((curr >>  5 & 0x3Fu) + (prev >>  5 & 0x3Fu)) >> 1);
-                const uint8_t b = (uint8_t)(((curr       & 0x1Fu) + (prev       & 0x1Fu)) >> 1);
-                g_gb_fb[i] = (uint16_t)((r << 11) | (g << 5) | b);
-            }
-            // else: write raw (g_gb_fb[i] already holds curr from draw_line)
+            // Difference mask: 0xFFFF where pixel changed, 0x0000 where same
+            const uint16x8_t neq = vmvnq_u16(vceqq_u16(curr_v, prev_v));
 
-            // Saturating increment on change; reset to 0 on stable or transition.
-            s_flicker_mask[i] = (bulk_transition & changed_now)
-                ? 0u
-                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
-            s_prev_fb[i] = curr;   // always store raw for next frame
+            // Blend condition: changed && mask >= FLICKER_THRESHOLD
+            const uint16x8_t mask16     = vmovl_u8(mask_v);
+            const uint16x8_t blend_cond = vandq_u16(neq, vcgeq_u16(mask16, v_thresh));
+
+            // 50/50 RGB565 blend (computed unconditionally, selected below)
+            const uint16x8_t r = vshrq_n_u16(vaddq_u16(
+                vandq_u16(vshrq_n_u16(curr_v, 11), m1f),
+                vandq_u16(vshrq_n_u16(prev_v, 11), m1f)), 1);
+            const uint16x8_t g = vshrq_n_u16(vaddq_u16(
+                vandq_u16(vshrq_n_u16(curr_v,  5), m3f),
+                vandq_u16(vshrq_n_u16(prev_v,  5), m3f)), 1);
+            const uint16x8_t b = vshrq_n_u16(vaddq_u16(
+                vandq_u16(curr_v, m1f),
+                vandq_u16(prev_v, m1f)), 1);
+            const uint16x8_t blended =
+                vorrq_u16(vorrq_u16(vshlq_n_u16(r, 11), vshlq_n_u16(g, 5)), b);
+
+            // Write blended or raw depending on condition
+            vst1q_u16(g_gb_fb + i, vbslq_u16(blend_cond, blended, curr_v));
+
+            // Mask update: changed ? saturating_inc(mask) : 0
+            // vqadd saturates at 255; vand zeros lanes where not changed.
+            const uint8x8_t changed8 = vmovn_u16(neq); // 0xFF or 0x00
+            vst1_u8(s_flicker_mask + i, vand_u8(vqadd_u8(mask_v, v_one8), changed8));
+
+            // Always store raw curr for next frame's comparison
+            vst1q_u16(s_prev_fb + i, curr_v);
         }
     } else {
-        // DMG: pre-packed RGBA4444; alpha is always 0xF, blend only RGB nibbles.
-        for (int i = 0; i < total; i++) {
-            const uint16_t prev = s_prev_fb[i];
-            const uint16_t curr = g_gb_fb[i];
-            const bool changed_now = (curr != prev);
+        // DMG path: RGBA4444 in g_gb_fb, blend R/G/B nibbles; alpha=0xF fixed.
+        const uint16x8_t m0f    = vdupq_n_u16(0x000Fu);
+        const uint16x8_t v_alpha = vdupq_n_u16(0xF000u);
 
-            uint8_t mask = s_flicker_mask[i];
+        for (int i = 0; i < total; i += 8) {
+            const uint16x8_t curr_v = vld1q_u16(g_gb_fb   + i);
+            const uint16x8_t prev_v = vld1q_u16(s_prev_fb + i);
+            const uint8x8_t  mask_v = vld1_u8  (s_flicker_mask + i);
 
-            if (bulk_transition & changed_now) {
-                mask = 0u;
-            } else if (changed_now & (mask >= FLICKER_THRESHOLD)) {
-                const uint8_t r = (uint8_t)(((curr       & 0xFu) + (prev       & 0xFu)) >> 1);
-                const uint8_t g = (uint8_t)(((curr >>  4 & 0xFu) + (prev >>  4 & 0xFu)) >> 1);
-                const uint8_t b = (uint8_t)(((curr >>  8 & 0xFu) + (prev >>  8 & 0xFu)) >> 1);
-                g_gb_fb[i] = (uint16_t)(r | (g << 4) | (b << 8) | 0xF000u);
-            }
+            const uint16x8_t neq = vmvnq_u16(vceqq_u16(curr_v, prev_v));
 
-            s_flicker_mask[i] = (bulk_transition & changed_now)
-                ? 0u
-                : (changed_now ? (mask < 255u ? mask + 1u : 255u) : 0u);
-            s_prev_fb[i] = curr;
+            const uint16x8_t mask16     = vmovl_u8(mask_v);
+            const uint16x8_t blend_cond = vandq_u16(neq, vcgeq_u16(mask16, v_thresh));
+
+            // 50/50 RGBA4444 blend: average each 4-bit RGB nibble, keep A=0xF
+            const uint16x8_t r = vshrq_n_u16(vaddq_u16(
+                vandq_u16(curr_v,                  m0f),
+                vandq_u16(prev_v,                  m0f)), 1);
+            const uint16x8_t g = vshrq_n_u16(vaddq_u16(
+                vandq_u16(vshrq_n_u16(curr_v, 4),  m0f),
+                vandq_u16(vshrq_n_u16(prev_v, 4),  m0f)), 1);
+            const uint16x8_t b = vshrq_n_u16(vaddq_u16(
+                vandq_u16(vshrq_n_u16(curr_v, 8),  m0f),
+                vandq_u16(vshrq_n_u16(prev_v, 8),  m0f)), 1);
+            const uint16x8_t blended = vorrq_u16(
+                vorrq_u16(r, vorrq_u16(vshlq_n_u16(g, 4), vshlq_n_u16(b, 8))),
+                v_alpha);
+
+            vst1q_u16(g_gb_fb + i, vbslq_u16(blend_cond, blended, curr_v));
+
+            const uint8x8_t changed8 = vmovn_u16(neq);
+            vst1_u8(s_flicker_mask + i, vand_u8(vqadd_u8(mask_v, v_one8), changed8));
+
+            vst1q_u16(s_prev_fb + i, curr_v);
         }
     }
 }
@@ -397,7 +463,7 @@ static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
 
         for (int sx = 1; sx <= GB_W; ++sx) {
             const uint16_t pix = (sx < GB_W) ? src[sx] : static_cast<uint16_t>(~run_pix);
-            if (pix == run_pix) continue;
+            if (pix == run_pix) [[likely]] continue;
 
             // -- Flush run [run_sx, sx) ---------------------------------------
             const int ox0   = s_dx0[run_sx];
@@ -458,29 +524,31 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
     if (!s_lut_ready)   init_swizzle_lut();
     if (!s_coord_ready) init_coord_lut();
+    
 
-    const bool is565 = g_fb_is_rgb565;
+    render_gb_screen_chunk(renderer, g_fb_is_rgb565, 0, GB_H);
 
-    if (!ult::expandedMemory) {
-        render_gb_screen_chunk(renderer, is565, 0, GB_H);
-        return;
-    }
-
-    const int numThreads = static_cast<int>(ult::numThreads); // should be 4
-    const int chunkSize  = (GB_H + numThreads - 1) / numThreads; // ceil divide
-
-    for (int i = 0; i < numThreads; ++i) {
-        const int sy_start = i * chunkSize;
-        const int sy_end   = std::min(sy_start + chunkSize, GB_H);
-
-        ult::renderThreads[i] = std::thread(
-            render_gb_screen_chunk,
-            renderer, is565, sy_start, sy_end
-        );
-    }
-
-    for (auto& t : ult::renderThreads)
-        t.join();
+    //const bool is565 = g_fb_is_rgb565;
+    //if (!ult::expandedMemory) {
+    //    render_gb_screen_chunk(renderer, is565, 0, GB_H);
+    //    return;
+    //}
+    //
+    //const int numThreads = static_cast<int>(ult::numThreads); // should be 4
+    //const int chunkSize  = (GB_H + numThreads - 1) / numThreads; // ceil divide
+    //
+    //for (int i = 0; i < numThreads; ++i) {
+    //    const int sy_start = i * chunkSize;
+    //    const int sy_end   = std::min(sy_start + chunkSize, GB_H);
+    //    
+    //    ult::renderThreads[i] = std::thread(
+    //        render_gb_screen_chunk,
+    //        renderer, is565, sy_start, sy_end
+    //    );
+    //}
+    //
+    //for (auto& t : ult::renderThreads)
+    //    t.join();
 }
 
 // -- Game Boy Color logo below pixel-perfect screen --------------------------

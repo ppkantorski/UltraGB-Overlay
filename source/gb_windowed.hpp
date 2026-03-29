@@ -38,7 +38,7 @@
  *
  *   VI / touch coordinate math (scale N):
  *     FB size: GB_W×N  ×  GB_H×N   (framebuffer pixels)
- *     VI size: GB_W×N×3/2  ×  GB_H×N×3/2   (VI space, 1.5× display scale)
+ *     VI size: GB_W×N×3/2  ×  GB_H×N×3/2   (VI space, Switch 1.5× display scale)
  *     Max safe VI pos: 1920 − VI_W  ×  1080 − VI_H
  *     Window in touch space: GB_W×N  wide  ×  GB_H×N  tall
  *     touch→VI: ×3/2      VI→touch: ×2/3
@@ -186,10 +186,12 @@ public:
             }
         }
 
-        // ── Pass-through flash border ────────────────────────────────────────
+        // ── Pass-through flash border + drag overlay ─────────────────────────
+        // fw/fh computed once here; used by both conditional blocks below.
+        const s32 fw = static_cast<s32>(GB_W * g_win_scale);
+        const s32 fh = static_cast<s32>(GB_H * g_win_scale);
+
         if (s_focus_flash > 0) {
-            const s32 fw = static_cast<s32>(GB_W * g_win_scale);
-            const s32 fh = static_cast<s32>(GB_H * g_win_scale);
             const u8  al = s_focus_flash > 15
                 ? static_cast<u8>(0xF)
                 : static_cast<u8>(s_focus_flash * 0xF / 15);
@@ -207,8 +209,6 @@ public:
         // ── Reposition overlay ────────────────────────────────────────────────
         // While dragging: dim the frozen frame and show "Paused" centred.
         if (s_win_dragging) {
-            const s32 fw = static_cast<s32>(GB_W * g_win_scale);
-            const s32 fh = static_cast<s32>(GB_H * g_win_scale);
 
             // Semi-transparent black veil (~50 % opacity in RGBA4444).
             static constexpr tsl::Color DIM = {0x0, 0x0, 0x0, 0x8};
@@ -583,16 +583,7 @@ public:
 
         // ── Right/Left stick click: resize window ────────────────────────────
         // Right stick click steps up one scale; left stick click steps down.
-        //
-        // 720p mode  : floor=1, ceiling=4 (3 on 4 MB heap).
-        //   R: 1→2→3→4    L: 4→3→2→1
-        //
-        // 1080p mode (g_win_hd): only even scales are pixel-perfect
-        // (the 1.5× FB→VI mapping combined with 1:1 VI→display at 1080p
-        // means odd scales land on half-pixels and blur).
-        //   R: 2→4  (already at 4 → no-op, swallow press)
-        //   L: 4→2  (already at 2 → no-op, swallow press)
-        //   Limited memory: 4× unavailable; both directions are no-ops.
+        // Cycles 1× → 2× → 3× → 4× (capped at 3× on 4 MB heap).
         //
         // Both are disabled while pass-through is active so the background
         // app receives the stick click undisturbed.
@@ -605,34 +596,19 @@ public:
             if (rstick || lstick) {
                 const bool limitedMem =
                     (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
-                int new_scale;
-                if (g_win_hd) {
-                    // 1080p mode: cycle only between the two pixel-perfect
-                    // even scales.  On limited memory 4× is unavailable so
-                    // there is nothing to step to — swallow both directions.
-                    if (limitedMem) {
-                        new_scale = g_win_scale;  // no-op
-                    } else {
-                        new_scale = rstick
-                            ? (g_win_scale < 3 ? 4 : g_win_scale)   // displaying 2×→4; at 4×→no-op
-                            : (g_win_scale >= 3 ? 2 : g_win_scale);  // displaying 4×→2; at 2×→no-op
-                    }
-                } else {
-                    // 720p mode: step through 1–4 (cap at 3 on limited memory).
-                    const int max_scale = limitedMem ? 3 : 4;
-                    new_scale = rstick
-                        ? std::min(g_win_scale + 1, max_scale)
-                        : std::max(g_win_scale - 1, 1);
-                }
+                const int max_scale = limitedMem ? 3 : 4;
+                const int new_scale = rstick
+                    ? std::min(g_win_scale + 1, max_scale)
+                    : std::max(g_win_scale - 1, 1);
                 if (new_scale != g_win_scale) {
                     // Persist new scale and ROM path so the relaunch picks them up.
                     const char* sv =
                         (new_scale == 1) ? "1" :
                         (new_scale == 2) ? "2" :
                         (new_scale == 3) ? "3" : "4";
-                    ult::setIniFileValue(kConfigFile, "config", "win_scale", sv, "");
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinScale, sv, "");
                     if (g_gb.romPath[0])
-                        ult::setIniFileValue(kConfigFile, "config", "windowed_rom",
+                        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom,
                                              std::string(g_gb.romPath), "");
                     // Re-propagate the quick-exit flag so the relaunched windowed
                     // session still exits cleanly on the combo instead of returning
@@ -640,7 +616,7 @@ public:
                     // it from config on this session's launch, so we must write it
                     // again before each resize relaunch.
                     if (g_win_quick_exit)
-                        ult::setIniFileValue(kConfigFile, "config", "win_quick_exit", "1", "");
+                        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
                     // Simple click — confirms the scale step without implying exit.
                     // triggerNavigationFeedback (navigation sound + rumble) feels
                     // exit-like right before the overlay closes; a bare click is
@@ -822,7 +798,6 @@ public:
                                 static_cast<u32>(g_win_pos_x),
                                 static_cast<u32>(g_win_pos_y));
                             sync_notif_touch_offsets();
-                        sync_notif_touch_offsets();
                         }
                     }
                 }
@@ -885,21 +860,21 @@ public:
         // unrelated windowed launches.
         {
             const std::string qe = ult::parseValueFromIniSection(
-                kConfigFile, "config", "win_quick_exit");
+                kConfigFile, kConfigSection, kKeyWinQuickExit);
             g_win_quick_exit = (qe == "1");
             if (g_win_quick_exit)
-                ult::setIniFileValue(kConfigFile, "config", "win_quick_exit", "", "");
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
         }
 
         // Read the ROM path from config.ini.
         const std::string wrom = ult::parseValueFromIniSection(
-            kConfigFile, "config", "windowed_rom");
+            kConfigFile, kConfigSection, kKeyWindowedRom);
         if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
             strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
             g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
         }
         // Erase immediately so the key never persists across unrelated launches.
-        ult::setIniFileValue(kConfigFile, "config", "windowed_rom", "", "");
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
     }
 
     void exitServices() override {
