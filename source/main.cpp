@@ -76,6 +76,7 @@ static const std::string kKeyVolBackup    {"vol_backup"};
 static const std::string kKeyPixelPerfect {"pixel_perfect"};
 static const std::string kKeyWindowed     {"windowed"};
 static const std::string kKeyIngameHaptics{"ingame_haptics"};
+static const std::string kKeyIngameWallpaper{"ingame_wallpaper"};
 static const std::string kKeyWinPosX      {"win_pos_x"};
 static const std::string kKeyWinPosY      {"win_pos_y"};
 static const std::string kKeyWinScale     {"win_scale"};
@@ -103,6 +104,7 @@ static u8 g_vol_backup = 100;
 // rendering the Game Boy screen as a small draggable window with no UI chrome.
 static bool g_windowed_mode  = false;
 static bool g_ingame_haptics = true;
+static bool g_ingame_wallpaper = false;  // off by default; only relevant when expandedMemory is true
 
 // Set true by main() when the overlay is relaunched with the -returning argument
 // (i.e. the user exited windowed mode via the launch combo back to the normal UI).
@@ -212,6 +214,10 @@ static void load_config() {
     if (!hap_val.empty())
         g_ingame_haptics = (hap_val != "0");
 
+    const std::string wall_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyIngameWallpaper);
+    if (!wall_val.empty())
+        g_ingame_wallpaper = (wall_val == "1");
+
     // win_pos_x / win_pos_y — persisted VI-space window position
     { int v = 0;
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosX), v)) g_win_pos_x = v;
@@ -248,6 +254,7 @@ static void write_default_config_if_missing() {
     set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
     set_if_missing("ingame_haptics", "1");
+    set_if_missing("ingame_wallpaper", "0");
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
@@ -1651,7 +1658,7 @@ public:
         // setPixelAtOffset writes with a=0xF (fully opaque), so they overwrite
         // the wallpaper pixels in the game viewport area.  The extra ~92K pixels
         // blended under the viewport cost far less than the 3 saved full passes.
-        if (ult::expandedMemory)
+        if (ult::expandedMemory && g_ingame_wallpaper)
             renderer->drawWallpaper();
     
         //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
@@ -3021,9 +3028,9 @@ public:
             list->addItem(scale_item);
         }
 
-
-        // ── Input ────────────────────────────────────
-        list->addItem(new tsl::elm::CategoryHeader("Input"));
+        
+        // ── Misc ────────────────────────────────────
+        list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
 
         // ── Quick Combo ───────────────────────────────────────────────────────
         // A combo assigned here lets the user open the last played ROM directly
@@ -3062,6 +3069,17 @@ public:
                                  state ? "1" : "0", "");
         });
         list->addItem(haptics_item);
+
+        if (ult::expandedMemory) {
+            auto* wallpaper_item = new tsl::elm::ToggleListItem(
+                "In-Game Wallpaper", g_ingame_wallpaper, ult::ON, ult::OFF);
+            wallpaper_item->setStateChangedListener([](bool state) {
+                g_ingame_wallpaper = state;
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyIngameWallpaper,
+                                     state ? "1" : "0", "");
+            });
+            list->addItem(wallpaper_item);
+        }
 
         // Restore the previously focused item (empty on first visit or after a game launch).
         if (!m_settings_scroll.empty())
