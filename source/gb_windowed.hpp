@@ -21,13 +21,14 @@
  *     Scale 1: 160×144 px  — VI space 240×216   (native GB pixels)
  *     Scale 2: 320×288 px  — VI space 480×432   (2× integer scaled)
  *     Scale 3: 480×432 px  — VI space 720×648   (3× integer scaled)
+ *     Scale 4: 640×576 px  — VI space 960×864   (4× integer scaled)
  *
  *   Pixel blit:
  *     LUTs encode the Tesla block-linear address formula for the scaled
  *     framebuffer.  OWV (outer-width-value, the inter-strip stride) depends on
  *     framebuffer width and is recomputed per scale.  For each source GB pixel
  *     (sx, sy) the blit writes g_win_scale × g_win_scale destination pixels.
- *     s_win_col / s_win_row are sized for max 3× (480 / 432 entries).
+ *     s_win_col / s_win_row are sized for max 4× (640 / 576 entries).
  *
  *   Touch drag:
  *     Same scheme as 1× — polls HID directly.  Window size in touch space
@@ -62,7 +63,8 @@
 // OWV (outer-width-value) depends on framebuffer width W:
 //   OWV = ((W/2) >> 4) << 3  =  (W >> 5) << 3  =  (W / 32) * 8
 //
-//   Scale 1: W=160 → OWV=40    Scale 2: W=320 → OWV=80    Scale 3: W=480 → OWV=120
+//   Scale 1: W=160 → OWV=40    Scale 2: W=320 → OWV=80
+//   Scale 3: W=480 → OWV=120   Scale 4: W=640 → OWV=160
 //
 // The formula splits into col_part(x) + row_part(y):
 //   col_part(x) = (((x>>5)<<3)<<9) + ((x&16)<<3) + ((x&8)<<1) + (x&7)
@@ -383,10 +385,11 @@ class GBWindowedGui : public tsl::Gui {
     //   max_x = 1920 - GB_W * scale * 3 / 2
     //   max_y = 1080 - GB_H * scale * 3 / 2
     //
-    // All three scale factors produce exact integers:
+    // All four scale factors produce exact integers:
     //   1×: max_x=1680  max_y=864
     //   2×: max_x=1440  max_y=648
     //   3×: max_x=1200  max_y=432
+    //   4×: max_x= 960  max_y=216
     static int vi_max_x() { return 1920 - GB_W * g_win_scale * 3 / 2; }
     static int vi_max_y() { return 1080 - GB_H * g_win_scale * 3 / 2; }
 
@@ -579,13 +582,20 @@ public:
         }
 
         // ── Right/Left stick click: resize window ────────────────────────────
-        // Right stick click steps up one scale level; left stick click steps
-        // down one scale level.  1× is the floor; the ceiling is 3× on a
-        // 4 MB heap (limited memory) or 4× otherwise — matching the clamp
-        // applied at startup in main().  Both are disabled while input is
-        // detached (pass-through active) so the background app receives the
-        // button undisturbed.  At the ceiling or floor the press is silently
-        // ignored (no haptic, no relaunch).
+        // Right stick click steps up one scale; left stick click steps down.
+        //
+        // 720p mode  : floor=1, ceiling=4 (3 on 4 MB heap).
+        //   R: 1→2→3→4    L: 4→3→2→1
+        //
+        // 1080p mode (g_win_hd): only even scales are pixel-perfect
+        // (the 1.5× FB→VI mapping combined with 1:1 VI→display at 1080p
+        // means odd scales land on half-pixels and blur).
+        //   R: 2→4  (already at 4 → no-op, swallow press)
+        //   L: 4→2  (already at 2 → no-op, swallow press)
+        //   Limited memory: 4× unavailable; both directions are no-ops.
+        //
+        // Both are disabled while pass-through is active so the background
+        // app receives the stick click undisturbed.
         // Relaunch: writes the new scale + current ROM path to config.ini
         // and restarts in windowed mode; the current game state is saved
         // automatically via exitServices() → gb_unload_rom().
@@ -595,10 +605,25 @@ public:
             if (rstick || lstick) {
                 const bool limitedMem =
                     (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
-                const int max_scale = limitedMem ? 3 : 4;
-                const int new_scale = rstick
-                    ? std::min(g_win_scale + 1, max_scale)
-                    : std::max(g_win_scale - 1, 1);
+                int new_scale;
+                if (g_win_hd) {
+                    // 1080p mode: cycle only between the two pixel-perfect
+                    // even scales.  On limited memory 4× is unavailable so
+                    // there is nothing to step to — swallow both directions.
+                    if (limitedMem) {
+                        new_scale = g_win_scale;  // no-op
+                    } else {
+                        new_scale = rstick
+                            ? (g_win_scale < 3 ? 4 : g_win_scale)   // displaying 2×→4; at 4×→no-op
+                            : (g_win_scale >= 3 ? 2 : g_win_scale);  // displaying 4×→2; at 2×→no-op
+                    }
+                } else {
+                    // 720p mode: step through 1–4 (cap at 3 on limited memory).
+                    const int max_scale = limitedMem ? 3 : 4;
+                    new_scale = rstick
+                        ? std::min(g_win_scale + 1, max_scale)
+                        : std::max(g_win_scale - 1, 1);
+                }
                 if (new_scale != g_win_scale) {
                     // Persist new scale and ROM path so the relaunch picks them up.
                     const char* sv =

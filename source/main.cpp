@@ -130,6 +130,15 @@ static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
 // framebuffer is sized correctly before Tesla initialises.
 static int g_win_scale = 1;
 
+// true  = windowed mode targets 1080p output.  On a 1080p display the VI space
+//         maps 1:1 to physical pixels, so only even scale factors (2× and 4×)
+//         produce integer multiples (×3 and ×6 display pixels per GB source pixel).
+//         Odd scales (1× → ×1.5, 3× → ×4.5) land on half-pixels and blur.
+// false = targets standard 720p output (default).  The compositor downscales VI
+//         ×2/3, which cancels the 1.5× FB→VI mapping exactly — all four scales
+//         (1×/2×/3×/4×) are pixel-perfect on 720p.
+static bool g_win_hd = false;
+
 static void save_vol_backup() {
     char buf[4];
     ult::setIniFileValue(kConfigFile, "config", "vol_backup",
@@ -199,17 +208,35 @@ static void load_config() {
 
     // win_scale — windowed display scale: 1, 2, 3, or 4 (default 1).
     // Any absent or unrecognised value falls back to 1.
-    // 4× is clamped to 3× at runtime on limitedMemory without touching the
-    // saved value — so switching back to a normal-memory session restores 4×.
+    // Runtime clamps are applied below after win_hd is also read — config
+    // value is never overwritten here.
     {
         const std::string sv = ult::parseValueFromIniSection(path, "config", "win_scale");
         if      (sv == "2") g_win_scale = 2;
         else if (sv == "3") g_win_scale = 3;
         else if (sv == "4") g_win_scale = 4;
         else                g_win_scale = 1;
-        if (ult::limitedMemory && g_win_scale == 4)
-            g_win_scale = 3;  // runtime clamp only — config keeps "4"
     }
+
+    // win_hd — 1080p pixel-perfect windowed mode: 0 = 720p (default), 1 = 1080p.
+    // In 1080p mode only even scales (2x / 4x) are pixel-perfect; odd scales are
+    // clamped below without overwriting the saved config value.
+    {
+        const std::string hd = ult::parseValueFromIniSection(path, "config", "win_hd");
+        if (!hd.empty()) g_win_hd = (hd == "1");
+    }
+
+    // Apply runtime clamps to g_win_scale now that both win_scale and win_hd
+    // are known.  These mirror the identical clamps in main() that size the
+    // framebuffer — load_config() runs inside initServices() after the FB is
+    // already created, so g_win_scale must end up matching what main() used.
+    // Config is never written here; stored values are preserved for round-trip.
+    if (ult::limitedMemory && g_win_scale == 4)
+        g_win_scale = 3;
+    if (g_win_hd && g_win_scale % 2 != 0)
+        g_win_scale = (g_win_scale == 1) ? 2 : 4;
+    if (ult::limitedMemory && g_win_scale == 4)
+        g_win_scale = g_win_hd ? 2 : 3;
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -230,6 +257,7 @@ static void write_default_config_if_missing() {
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
+    set_if_missing("win_hd",        "0");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -270,6 +298,14 @@ static void save_win_scale() {
                   : (g_win_scale == 2) ? "2"
                   :                      "1";
     ult::setIniFileValue(kConfigFile, "config", "win_scale", s, "");
+}
+
+// Persist the 1080p windowed mode flag.
+// win_hd=1 means the user has told us the Switch is docked at 1080p output.
+// Only even scales (2× / 4×) are pixel-perfect in that case.
+static void save_win_hd() {
+    ult::setIniFileValue(kConfigFile, "config", "win_hd",
+                         g_win_hd ? "1" : "0", "");
 }
 
 // =============================================================================
@@ -2853,6 +2889,7 @@ class SettingsGui : public tsl::Gui {
     tsl::elm::Element* m_scale_item      = nullptr;
     tsl::elm::Element* m_win_mode_item   = nullptr;
     tsl::elm::Element* m_win_scale_item  = nullptr;
+    tsl::elm::Element* m_screen_mode_item = nullptr;
     tsl::elm::Element* m_haptics_item    = nullptr;
     tsl::elm::Element* m_quick_combo_item = nullptr;
 
@@ -2892,6 +2929,7 @@ public:
     virtual void update() override {
         if      (m_vol_slider     && m_vol_slider->hasFocus())          m_settings_scroll = "Game Boy";
         else if (m_win_mode_item  && m_win_mode_item->hasFocus())       m_settings_scroll = "Windowed Mode";
+        else if (m_screen_mode_item && m_screen_mode_item->hasFocus())  m_settings_scroll = "Screen Mode";
         else if (m_win_scale_item && m_win_scale_item->hasFocus())      m_settings_scroll = "Windowed Scale";
         else if (m_scale_item     && m_scale_item->hasFocus())          m_settings_scroll = "Overlay Scale";
         else if (m_quick_combo_item && m_quick_combo_item->hasFocus())  m_settings_scroll = "Quick Combo";
@@ -2949,33 +2987,103 @@ public:
         list->addItem(win_item);
         m_win_mode_item = win_item;
 
-        // ── Windowed Scale ────────────────────────────────────────────────────
-        // Cycles 1× → 2× → 3× → 4× → 1× on each A press.
-        // On limitedMemory, 4× is unavailable: the cycle caps at 3× and the
-        // label shows 3× even if the saved config value is 4×.  The config is
-        // NOT overwritten — switching back to a normal-memory session restores 4×.
-        // Only takes effect on the next windowed launch (the VI layer size is
-        // fixed at overlay startup).  Shown regardless of windowed mode state
-        // so the user can configure it before enabling windowed mode.
+        // ── Screen Mode + Windowed Scale ──────────────────────────────────────
+        // These two items share make_label so Screen Mode can immediately update
+        // the Windowed Scale display when the user toggles 720p ↔ 1080p.
+        // The strategy: define make_label once, create both items, then wire the
+        // Screen Mode click listener last so scale_item can be captured by value.
+        //
+        // Screen Mode: declares whether the Switch is outputting 720p or 1080p.
+        //   720p  — VI is downscaled ×2/3 before reaching the display, which
+        //           exactly cancels the 1.5× FB→VI mapping.  All four scale
+        //           factors (1×/2×/3×/4×) are pixel-perfect.
+        //   1080p — VI maps 1:1 to physical pixels, so the 1.5× FB→VI mapping
+        //           stays.  Only even scales (2× → ×3, 4× → ×6 display pixels
+        //           per GB source pixel) produce integers; odd scales (1×/3×)
+        //           land on half-pixels and blur.  Switching here clamps any
+        //           saved odd scale to the nearest even value immediately.
+        //
+        // Windowed Scale: the FB multiplier applied at the next windowed launch.
+        //   720p  : cycles 1× → 2× → 3× → 4× → 1×  (3× cap on 4 MB heap)
+        //   1080p : cycles 2× ↔ 4× only              (fixed at 2× on 4 MB heap)
         {
-            const char* scale_labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
-            const int maxScale     = ult::limitedMemory ? 3 : 4;
-            const int displayScale = std::min(g_win_scale, maxScale);
-            auto* scale_item = new tsl::elm::ListItem("Windowed Scale",
-                                                       scale_labels[displayScale - 1]);
-            scale_item->setClickListener([scale_item, maxScale](u64 keys) -> bool {
+            const int maxScale = ult::limitedMemory ? 3 : 4;
+
+            // Returns the scale value that should be displayed/used right now,
+            // honouring g_win_hd and the memory cap.
+            // In 1080p mode: stored scale >= 3 → display 4×; < 3 → display 2×.
+            // This means a user on 1x or 2x before switching to 1080p sees 2×,
+            // and a user on 3x or 4x sees 4×, without touching the stored value
+            // until they explicitly press A on Windowed Scale.
+            auto effective_scale = [maxScale]() -> int {
+                if (g_win_hd)
+                    return (g_win_scale >= 3 && !ult::limitedMemory) ? 4 : 2;
+                return std::min(g_win_scale, maxScale);
+            };
+
+            // Label string for the current effective scale.
+            // 1080p mode uses the same label format as 720p — no "(HD)" suffix.
+            auto make_label = [effective_scale]() -> std::string {
+                const int s = effective_scale();
+                static const char* lbs[] = {
+                    "1x", "2x", "3x", "4x"
+                };
+                return lbs[s - 1];
+            };
+
+            // Create Screen Mode item first — listener wired below after scale_item exists.
+            auto* hd_item = new tsl::elm::ListItem("Screen Mode",
+                                                    g_win_hd ? "1080p" : "720p");
+            list->addItem(hd_item);
+            m_screen_mode_item = hd_item;
+
+            // Create Windowed Scale item and wire its listener immediately.
+            auto* scale_item = new tsl::elm::ListItem("Windowed Scale", make_label());
+            scale_item->setClickListener([scale_item, maxScale,
+                                          effective_scale, make_label](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                // Cycle from the effective (possibly clamped) display value.
-                const int cur = std::min(g_win_scale, maxScale);
-                g_win_scale = (cur % maxScale) + 1;
-                const char* labels[] = { "1\xC3\x97", "2\xC3\x97", "3\xC3\x97", "4\xC3\x97"};
-                scale_item->setValue(labels[g_win_scale - 1]);
-                save_win_scale();
-                //triggerNavigationFeedback();
+                if (g_win_hd) {
+                    // Cycle: displaying 2× (stored < 3) → store 4; displaying 4× → store 2.
+                    // On limited memory 4× is unavailable so the A press is a no-op.
+                    if (!ult::limitedMemory) {
+                        g_win_scale = (g_win_scale < 3) ? 4 : 2;
+                        save_win_scale();
+                    }
+                } else {
+                    // Standard 720p cycle: 1 → 2 → 3 → 4 → 1
+                    // (caps at 3 on limited memory).
+                    const int cur = std::min(g_win_scale, maxScale);
+                    g_win_scale   = (cur % maxScale) + 1;
+                    save_win_scale();
+                }
+                scale_item->setValue(make_label());
                 return true;
             });
             list->addItem(scale_item);
             m_win_scale_item = scale_item;
+
+            // Wire Screen Mode listener now that scale_item is valid.
+            // Captures scale_item by value so it can call setValue immediately,
+            // keeping the Windowed Scale label in sync without a page flip.
+            hd_item->setClickListener([hd_item, scale_item,
+                                       make_label](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                g_win_hd = !g_win_hd;
+                hd_item->setValue(g_win_hd ? "1080p" : "720p");
+                save_win_hd();
+                // Refresh Windowed Scale label immediately to reflect the new mode.
+                // g_win_scale is intentionally left untouched here — effective_scale()
+                // maps stored scale to the nearest pixel-perfect value (stored < 3 → 2×,
+                // stored >= 3 → 4×) without overwriting the saved value.  The user's
+                // original scale is preserved so switching back to 720p restores it
+                // exactly.  g_win_scale is only written when the user explicitly presses
+                // A on Windowed Scale.
+                scale_item->setValue(make_label());
+                show_notify(g_win_hd
+                    ? "1080p2x / 4x are pixel-perfect"
+                    : "720pall scales pixel-perfect");
+                return true;
+            });
         }
 
         // ── Overlay Scale ─────────────────────────────────────────────────────
@@ -2984,14 +3092,14 @@ public:
         // Uses set_vp_scale() to invalidate the swizzle/coord LUTs together with
         // the flag — direct assignment to g_vp_2x alone would leave stale LUTs.
         {
-            const char* scale_labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
+            const char* scale_labels[] = { "2.5x", "2x" };
             auto* scale_item = new tsl::elm::ListItem("Overlay Scale",
                                                        scale_labels[g_vp_2x ? 1 : 0]);
             scale_item->setClickListener([scale_item](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
                 set_vp_scale(!g_vp_2x);
                 save_pixel_perfect();
-                const char* labels[] = { "2.5\xC3\x97", "2\xC3\x97" };
+                const char* labels[] = { "2.5x", "2x" };
                 scale_item->setValue(labels[g_vp_2x ? 1 : 0]);
                 return true;
             });
@@ -3612,6 +3720,18 @@ int main(int argc, char* argv[]) {
                         const bool earlyLimited =
                             (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
                         if (earlyLimited && g_win_scale == 4) g_win_scale = 3;
+
+                        // Apply win_hd pixel-perfect constraint (same logic as
+                        // the -windowed block; runtime clamp only, no config write).
+                        {
+                            const std::string hd = ult::parseValueFromIniSection(
+                                kConfigFile, "config", "win_hd");
+                            g_win_hd = (hd == "1");
+                        }
+                        if (g_win_hd && g_win_scale % 2 != 0)
+                            g_win_scale = (g_win_scale == 1) ? 2 : 4;
+                        if (earlyLimited && g_win_scale == 4)
+                            g_win_scale = g_win_hd ? 2 : 3;
                     }
 
                     // Write to config so WindowedOverlay::initServices() picks
@@ -3649,6 +3769,24 @@ int main(int argc, char* argv[]) {
                     (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
                 if (earlyLimitedMemory && g_win_scale == 4)
                     g_win_scale = 3;  // runtime clamp only — config keeps "4"
+
+                // Read win_hd so we can enforce pixel-perfect constraints before
+                // the VI layer is sized.  Clamping here is runtime-only; the saved
+                // config value is never overwritten by a launch-time clamp.
+                {
+                    const std::string hd = ult::parseValueFromIniSection(
+                        kConfigFile, "config", "win_hd");
+                    g_win_hd = (hd == "1");
+                }
+                // In 1080p mode only even scales are pixel-perfect (the 1.5× FB→VI
+                // mapping combined with the 1:1 VI→display mapping at 1080p means
+                // odd scales land on half-pixels).  Clamp without saving.
+                if (g_win_hd && g_win_scale % 2 != 0)
+                    g_win_scale = (g_win_scale == 1) ? 2 : 4;
+                // Apply the memory cap again after the HD clamp (HD can push scale
+                // from 3→4, which would violate the 4 MB limit).
+                if (earlyLimitedMemory && g_win_scale == 4)
+                    g_win_scale = g_win_hd ? 2 : 3;
             }
             ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
             ult::DefaultFramebufferHeight = GB_H * g_win_scale;
