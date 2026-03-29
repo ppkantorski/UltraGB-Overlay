@@ -21,13 +21,14 @@
  *     Scale 1: 160×144 px  — VI space 240×216   (native GB pixels)
  *     Scale 2: 320×288 px  — VI space 480×432   (2× integer scaled)
  *     Scale 3: 480×432 px  — VI space 720×648   (3× integer scaled)
+ *     Scale 4: 640×576 px  — VI space 960×864   (4× integer scaled)
  *
  *   Pixel blit:
  *     LUTs encode the Tesla block-linear address formula for the scaled
  *     framebuffer.  OWV (outer-width-value, the inter-strip stride) depends on
  *     framebuffer width and is recomputed per scale.  For each source GB pixel
  *     (sx, sy) the blit writes g_win_scale × g_win_scale destination pixels.
- *     s_win_col / s_win_row are sized for max 3× (480 / 432 entries).
+ *     s_win_col / s_win_row are sized for max 4× (640 / 576 entries).
  *
  *   Touch drag:
  *     Same scheme as 1× — polls HID directly.  Window size in touch space
@@ -62,7 +63,8 @@
 // OWV (outer-width-value) depends on framebuffer width W:
 //   OWV = ((W/2) >> 4) << 3  =  (W >> 5) << 3  =  (W / 32) * 8
 //
-//   Scale 1: W=160 → OWV=40    Scale 2: W=320 → OWV=80    Scale 3: W=480 → OWV=120
+//   Scale 1: W=160 → OWV=40    Scale 2: W=320 → OWV=80
+//   Scale 3: W=480 → OWV=120   Scale 4: W=640 → OWV=160
 //
 // The formula splits into col_part(x) + row_part(y):
 //   col_part(x) = (((x>>5)<<3)<<9) + ((x&16)<<3) + ((x&8)<<1) + (x&7)
@@ -148,21 +150,6 @@ public:
                 g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
                 if (g_gb_frame_next_ns < now_ns)
                     g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-
-                if (g_cgb_bounce_frames >= 0) {
-                    if (++g_cgb_bounce_frames >= 60) {
-                        g_cgb_bounce_frames = -1;
-                        char path[256] = {};
-                        strncpy(path, g_gb.romPath, sizeof(path) - 1);
-                        s_bounce_keepalive = true;
-                        const bool was_evicted = g_wallpaper_evicted;
-                        if (was_evicted) g_wallpaper_evicted = false;
-                        gb_unload_rom();
-                        if (was_evicted) g_wallpaper_evicted = true;
-                        if (gb_load_rom(path)) g_emu_active = true;
-                        s_bounce_keepalive = false;
-                    }
-                }
             }
         }
 
@@ -398,10 +385,11 @@ class GBWindowedGui : public tsl::Gui {
     //   max_x = 1920 - GB_W * scale * 3 / 2
     //   max_y = 1080 - GB_H * scale * 3 / 2
     //
-    // All three scale factors produce exact integers:
+    // All four scale factors produce exact integers:
     //   1×: max_x=1680  max_y=864
     //   2×: max_x=1440  max_y=648
     //   3×: max_x=1200  max_y=432
+    //   4×: max_x= 960  max_y=216
     static int vi_max_x() { return 1920 - GB_W * g_win_scale * 3 / 2; }
     static int vi_max_y() { return 1080 - GB_H * g_win_scale * 3 / 2; }
 
@@ -498,16 +486,37 @@ public:
 
         // ── Launch combo: exit windowed mode, return to normal UltraGB ────────
         if (combo_pressed(keysDown, keysHeld)) {
-            if (g_self_path[0])
-                tsl::setNextOverlay(std::string(g_self_path));
+            // Quick-exit mode (triggered via Quick Combo): close the overlay
+            // entirely without relaunching the normal UltraGB UI.
+            // Normal mode: return to UltraGB via setNextOverlay so it can
+            // restore the Settings scroll position.
+            // Use the synchronous standalone call — triggerExitFeedback() sets
+            // an atomic for the background feedback thread, but close() stops
+            // that thread before it gets a chance to process it, so the rumble
+            // would never fire.  rumbleDoubleClickStandalone() fires immediately,
+            // matching exactly what Tesla does at its own directMode exit path.
+
+            // Suppress Tesla's own directMode close-time double-click
+            // (tesla.hpp fires rumbleDoubleClickStandalone() on close when
+            // directMode=true and launchComboHasTriggered=false — session 1
+            // gets directMode from Ultrahand's --direct flag).  We fire our
+            // own exit feedback above, so we don't want a second one.
+            launchComboHasTriggered.store(true, std::memory_order_release);
+            if (!g_win_quick_exit && g_self_path[0])
+                tsl::setNextOverlay(std::string(g_self_path), "-returning");
             tsl::Overlay::get()->close();
+            ult::rumbleDoubleClickStandalone();
             return true;
         }
 
         // ── ZR double-click-hold: fast-forward ────────────────────────────────
+        // Disabled when input is detached (pass-through active): the background
+        // app owns ZR, so we must not intercept it to start fast-forward.
+        // Releasing ZR while pass-through is on still clears fast-forward
+        // because zr_held will be false in that state.
         {
-            const bool zr_down = (keysDown & KEY_ZR) != 0;
-            const bool zr_held = (keysHeld  & KEY_ZR) != 0;
+            const bool zr_down = !m_pass_through && (keysDown & KEY_ZR) != 0;
+            const bool zr_held = !m_pass_through && (keysHeld  & KEY_ZR) != 0;
             if (zr_down) {
                 if (m_zr_first_seen &&
                     (g_frame_count - m_zr_first_frame) <= static_cast<uint32_t>(ZR_DCLICK_WINDOW)) {
@@ -570,6 +579,89 @@ public:
             if (m_zl_first_seen &&
                 (g_frame_count - m_zl_first_frame) > static_cast<uint32_t>(ZL_DCLICK_WINDOW))
                 m_zl_first_seen = false;
+        }
+
+        // ── Right/Left stick click: resize window ────────────────────────────
+        // Right stick click steps up one scale; left stick click steps down.
+        //
+        // 720p mode  : floor=1, ceiling=4 (3 on 4 MB heap).
+        //   R: 1→2→3→4    L: 4→3→2→1
+        //
+        // 1080p mode (g_win_hd): only even scales are pixel-perfect
+        // (the 1.5× FB→VI mapping combined with 1:1 VI→display at 1080p
+        // means odd scales land on half-pixels and blur).
+        //   R: 2→4  (already at 4 → no-op, swallow press)
+        //   L: 4→2  (already at 2 → no-op, swallow press)
+        //   Limited memory: 4× unavailable; both directions are no-ops.
+        //
+        // Both are disabled while pass-through is active so the background
+        // app receives the stick click undisturbed.
+        // Relaunch: writes the new scale + current ROM path to config.ini
+        // and restarts in windowed mode; the current game state is saved
+        // automatically via exitServices() → gb_unload_rom().
+        if (!m_pass_through && !m_dragging && !m_plus_dragging) {
+            const bool rstick = (keysDown & KEY_RSTICK) != 0;
+            const bool lstick = (keysDown & KEY_LSTICK) != 0;
+            if (rstick || lstick) {
+                const bool limitedMem =
+                    (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
+                int new_scale;
+                if (g_win_hd) {
+                    // 1080p mode: cycle only between the two pixel-perfect
+                    // even scales.  On limited memory 4× is unavailable so
+                    // there is nothing to step to — swallow both directions.
+                    if (limitedMem) {
+                        new_scale = g_win_scale;  // no-op
+                    } else {
+                        new_scale = rstick
+                            ? (g_win_scale < 3 ? 4 : g_win_scale)   // displaying 2×→4; at 4×→no-op
+                            : (g_win_scale >= 3 ? 2 : g_win_scale);  // displaying 4×→2; at 2×→no-op
+                    }
+                } else {
+                    // 720p mode: step through 1–4 (cap at 3 on limited memory).
+                    const int max_scale = limitedMem ? 3 : 4;
+                    new_scale = rstick
+                        ? std::min(g_win_scale + 1, max_scale)
+                        : std::max(g_win_scale - 1, 1);
+                }
+                if (new_scale != g_win_scale) {
+                    // Persist new scale and ROM path so the relaunch picks them up.
+                    const char* sv =
+                        (new_scale == 1) ? "1" :
+                        (new_scale == 2) ? "2" :
+                        (new_scale == 3) ? "3" : "4";
+                    ult::setIniFileValue(kConfigFile, "config", "win_scale", sv, "");
+                    if (g_gb.romPath[0])
+                        ult::setIniFileValue(kConfigFile, "config", "windowed_rom",
+                                             std::string(g_gb.romPath), "");
+                    // Re-propagate the quick-exit flag so the relaunched windowed
+                    // session still exits cleanly on the combo instead of returning
+                    // to the UltraGB settings menu.  initServices() already cleared
+                    // it from config on this session's launch, so we must write it
+                    // again before each resize relaunch.
+                    if (g_win_quick_exit)
+                        ult::setIniFileValue(kConfigFile, "config", "win_quick_exit", "1", "");
+                    // Simple click — confirms the scale step without implying exit.
+                    // triggerNavigationFeedback (navigation sound + rumble) feels
+                    // exit-like right before the overlay closes; a bare click is
+                    // unambiguous and consistent with other button confirmations.
+                    triggerRumbleClick.store(true, std::memory_order_release);
+                    // Suppress Tesla's directMode close-time double-click rumble.
+                    // tesla.hpp fires rumbleDoubleClickStandalone() at process exit
+                    // when directMode=true and launchComboHasTriggered=false.
+                    // Session 1 (launched by Ultrahand with --direct) would produce
+                    // an unwanted double-click on the very first resize; subsequent
+                    // sessions have directMode=false so they're unaffected.  Setting
+                    // this flag here suppresses that extra rumble in all sessions.
+                    launchComboHasTriggered.store(true, std::memory_order_release);
+                    if (g_self_path[0])
+                        tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+                    tsl::Overlay::get()->close();
+                    return true;
+                }
+                // Already at the limit — swallow the press so nothing fires.
+                return true;
+            }
         }
 
         // ── Touch hold-to-drag (via direct HID poll) ──────────────────────────
@@ -787,6 +879,18 @@ public:
         load_config();
         write_default_config_if_missing();
 
+        // Read windowed quick-exit flag.  Set when the user triggered Quick Launch
+        // in windowed mode — the exit combo should close entirely, not return to
+        // the UltraGB menu.  Clear it immediately so it never persists across
+        // unrelated windowed launches.
+        {
+            const std::string qe = ult::parseValueFromIniSection(
+                kConfigFile, "config", "win_quick_exit");
+            g_win_quick_exit = (qe == "1");
+            if (g_win_quick_exit)
+                ult::setIniFileValue(kConfigFile, "config", "win_quick_exit", "", "");
+        }
+
         // Read the ROM path from config.ini.
         const std::string wrom = ult::parseValueFromIniSection(
             kConfigFile, "config", "windowed_rom");
@@ -799,10 +903,11 @@ public:
     }
 
     void exitServices() override {
-        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
+        tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
         tsl::disableHiding = false;  // restore default for any subsequent overlay
         ult::layerEdge  = 0;       // restore for normal overlay hit-tests
         tsl::layerEdgeY = 0;
+        gb_audio_pause();
         gb_unload_rom();             // saves quick-resume state + SRAM
         gb_audio_free_dma();
         free_lcd_ghosting();
