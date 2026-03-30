@@ -1793,7 +1793,12 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 		}
 
 		else if(gb->mbc == 5)
-			gb->cart_ram_bank = (val & 0x0F);
+			/* MBC5 RAM bank register: bits[0:2] = bank number (0–7),
+			 * bit 3 = rumble motor on MBC5+RUMBLE carts (e.g. Pokémon Pinball).
+			 * Mask to 0x07 so the rumble bit never inflates cart_ram_bank above
+			 * num_ram_banks, which would silently fall back to bank 0 and corrupt
+			 * SRAM writes directed at banks 1–3 whenever the motor is active. */
+			gb->cart_ram_bank = (val & 0x07);
 #if WALNUT_GB_SAFE_DUALFETCH_MBC
 		gb->prefetch_invalid=true;
 #endif
@@ -2015,6 +2020,17 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 				 * immediately after the next LCD disable, corrupting the
 				 * subsequent scene transition (staircase / town-map freeze). */
 				gb->counter.lcd_off_count = 0;
+				/* FIX: Clear stale ly0_preload on LCD re-enable.  The preload
+				 * flag is set during VBlank (LY=153 wrap).  If the LCD is
+				 * turned off at that moment and back on later, the flag is
+				 * still true, which makes the PPU skip the real line 0 and
+				 * cycle back through the preload branch — LY=144 is never
+				 * reached, VBlank never fires, and the game freezes on a
+				 * white screen.  Pokémon Pinball triggers this exactly: its
+				 * in-game save routine disables the LCD mid-VBlank, then
+				 * re-enables it for the resume; without this reset the PPU
+				 * loops indefinitely and the screen stays white. */
+				gb->display.ly0_preload = false;
 				/* Update the LYC coincidence flag to match hardware state, but
 				 * do NOT fire the LCDC interrupt here.  On real hardware the
 				 * LYC interrupt fires on LY *transitions* (rising edge of
@@ -5653,6 +5669,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
+				gb->lcd_blank = false;   /* Lift "skip first frame" blank so a save-state
+				 * resumed mid LCD-off transition does not stay white. See SameBoy
+				 * GB_FRAMESKIP_LCD_TURNED_ON -> GB_FRAMESKIP_FIRST_FRAME_RENDERED. */
 				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
 				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
 				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
@@ -7702,6 +7721,9 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
+				gb->lcd_blank = false;   /* Lift "skip first frame" blank so a save-state
+				 * resumed mid LCD-off transition does not stay white. See SameBoy
+				 * GB_FRAMESKIP_LCD_TURNED_ON -> GB_FRAMESKIP_FIRST_FRAME_RENDERED. */
 				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
 				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
 				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
@@ -10351,6 +10373,9 @@ void __gb_step_cpu_x(struct gb_s *gb)
 			{
 				gb->counter.lcd_off_count -= LCD_FRAME_CYCLES;
 				gb->gb_frame = true;
+				gb->lcd_blank = false;   /* Lift "skip first frame" blank so a save-state
+				 * resumed mid LCD-off transition does not stay white. See SameBoy
+				 * GB_FRAMESKIP_LCD_TURNED_ON -> GB_FRAMESKIP_FIRST_FRAME_RENDERED. */
 				/* NOTE: Do NOT fire VBLANK_INTR here.  On real hardware, when
 				 * the LCD is off LY is frozen at 0 and no VBlank interrupt fires.
 				 * Setting IO_IF |= VBLANK_INTR here causes a spurious VBlank ISR
