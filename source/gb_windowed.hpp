@@ -623,8 +623,8 @@ public:
         // and restarts in windowed mode; the current game state is saved
         // automatically via exitServices() → gb_unload_rom().
         if (!m_pass_through && !m_dragging && !m_plus_dragging) {
-            const bool rstick = (keysDown & KEY_RSTICK) != 0;
-            const bool lstick = (keysDown & KEY_LSTICK) != 0;
+            const bool rstick = (keysDown & KEY_RSTICK && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK)) != 0;
+            const bool lstick = (keysDown & KEY_LSTICK && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK)) != 0;
             if (rstick || lstick) {
                 const bool limitedMem =
                     (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);

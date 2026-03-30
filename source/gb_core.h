@@ -25,7 +25,7 @@
 #include <cstring>
 #include <cstdio>
 
-// ── Peanut-GB compile-time options ───────────────────────────────────────────
+// ── Walnut-GB compile-time options ───────────────────────────────────────────
 #ifndef ENABLE_LCD
 #  define ENABLE_LCD                  1
 #endif
@@ -763,7 +763,7 @@ extern bool     g_gbc_pal_found;      // true if game was found in GBC_TITLE_TAB
 extern bool g_lcd_ghosting;
 
 // ── Palette mode ──────────────────────────────────────────────────────────────
-// Per-DMG-game setting stored in sdmc:/config/ultragb/configure/<rom>.ini
+// Per-DMG-game setting stored in sdmc:/config/ultragbc/configure/<rom>.ini
 //   GBC    (default) — GBC built-in title-checksum lookup; greyscale for unknowns
 //   SGB              — Same lookup; warm amber for unknowns (approximates SGB feel)
 //   DMG              — Classic Game Boy green LCD tint
