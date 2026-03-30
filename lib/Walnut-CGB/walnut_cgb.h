@@ -833,6 +833,22 @@ struct gb_s
 		 * (ly0_preload=true), then enter Mode 2 on the next boundary.
 		 * Three bools share one byte - sizeof(gb_s) unchanged. */
 		bool ly0_preload : 1;
+
+		/* FIX (Shantae / inter-sprite flicker): OAM is scanned at Mode 2
+		 * START — before the CPU runs any cycles — and the result cached here.
+		 * __gb_draw_line then reads from this cache instead of live OAM.
+		 * This matches SameBoy's behaviour: on real hardware OAM is frozen to
+		 * the PPU during Modes 2+3, so Y values written during those 80 cycles
+		 * are invisible to the PPU for this scanline. Without this fix,
+		 * Shantae's flickering glyphs cause unrelated sprites on the same
+		 * horizontal axis to also flicker because their Y updates land during
+		 * Mode 2 and are read back at Mode 3 draw time. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+		uint8_t oam_scan_count;
+		uint8_t oam_scan_sprites[10]; /* OAM indices 0-39, latched at Mode 2 */
+		uint8_t oam_scan_ox[10];      /* X snapshot — used for DMG sort and render */
+		uint8_t oam_scan_oy[10];      /* Y snapshot — used for py row calculation */
+#endif
 	} display;
 
 #if WALNUT_FULL_GBC_SUPPORT
@@ -2854,6 +2870,7 @@ uint8_t __gb_execute_cb(struct gb_s *gb)
 struct sprite_data {
 	uint8_t sprite_number;
 	uint8_t x;
+	uint8_t y;
 };
 
 #if WALNUT_GB_HIGH_LCD_ACCURACY
@@ -2868,6 +2885,53 @@ static int compare_sprites(const struct sprite_data *const sd1, const struct spr
 	return (int)sd1->sprite_number - (int)sd2->sprite_number;
 }
 #endif
+
+
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+/* __gb_oam_scan — called at Mode 2 START, before any CPU cycles run.
+ *
+ * Mirrors SameBoy's OAM scan phase: the PPU latches which sprites fall on
+ * the current scanline BEFORE the CPU gets to execute.  Walnut's old path
+ * scanned OAM inside __gb_draw_line (Mode 3 start), so ~80 CPU cycles
+ * worth of HBlank writes to sprite Y registers were visible, causing
+ * sprites that should not appear on a scanline to consume per-line sprite
+ * slots and flicker unrelated sprites off screen (Shantae glyph flicker).
+ *
+ * Also latches wy_triggered here to match SameBoy's wy_check() timing:
+ * the window-trigger latch must be evaluated BEFORE the CPU can change
+ * IO_WY during Mode 2. */
+static inline void __gb_oam_scan(struct gb_s *gb)
+{
+	const uint8_t ly  = gb->hram_io[IO_LY];
+	const uint8_t big = gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE;
+
+#if WALNUT_FULL_GBC_SUPPORT
+    const uint8_t cgbMode = gb->cgb.cgbMode;
+#else
+    const uint8_t cgbMode = 0;
+#endif
+	uint8_t count = 0;
+	for(uint8_t s = 0; s < NUM_SPRITES; s++)
+	{
+		const uint8_t oy = gb->oam[4 * s];
+		if(ly + (big ? 0u : 8u) >= oy || ly + 16u < oy)
+			continue;
+		if(count >= MAX_SPRITES_LINE)
+			break;
+		gb->display.oam_scan_sprites[count] = s;
+		gb->display.oam_scan_ox[count]      = gb->oam[4 * s + 1];
+		gb->display.oam_scan_oy[count]      = oy;
+		count++;
+	}
+	gb->display.oam_scan_count = count;
+
+	/* Latch wy_triggered at Mode 2 start — before CPU can modify IO_WY. */
+	if((gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE)
+	        && (cgbMode || (gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE))
+	        && ly == gb->hram_io[IO_WY])
+	    gb->wy_triggered = true;
+}
+#endif /* WALNUT_GB_HIGH_LCD_ACCURACY */
 
 
 void __gb_draw_line(struct gb_s *gb)
@@ -2896,11 +2960,8 @@ void __gb_draw_line(struct gb_s *gb)
 				|| (gb->display.interlace_count
 				    && (hram_io_ly & 1) == 1))
 		{
-			/* Latch wy_triggered for this scanline before skipping.
-			 * Must mirror the equality check done in the draw path. */
-			if(gb->hram_io[IO_LCDC] & LCDC_WINDOW_ENABLE
-					&& hram_io_ly == gb->hram_io[IO_WY])
-				gb->wy_triggered = true;
+			/* wy_triggered was already latched by __gb_oam_scan at Mode 2
+			 * start, before the CPU ran.  No need to re-latch here. */
 
 			/* Compensate for missing window draw if required.
 			 * Same LCDC.0 gate as the real window draw path. */
@@ -3090,9 +3151,30 @@ void __gb_draw_line(struct gb_s *gb)
 	 * the first scanline where WY == LY (exact equality). Once latched it
 	 * stays true for the rest of the frame.  Using a live IO_WY >= LY check
 	 * here caused mid-frame WY writes (e.g. DKL2 HUD) to re-activate the
-	 * window on wrong scanlines, writing window tiles over sprite pixels. */
-	if(hram_io_ly == gb->hram_io[IO_WY])
-		gb->wy_triggered = true;
+	 * window on wrong scanlines, writing window tiles over sprite pixels.
+	 *
+	 * FIX: guard the latch behind LCDC_WINDOW_ENABLE, exactly as SameBoy's
+	 * wy_check() does and as the interlace early-return path already does.
+	 *
+	 * Without this gate, if the game has the window disabled when LY == WY
+	 * (e.g. during a cloud or scroll effect that briefly clears LCDC bit 5),
+	 * wy_triggered gets latched prematurely.  When the window is re-enabled
+	 * even one scanline later it immediately starts drawing — using a stale
+	 * window_clear value — and stamps window tiles over sprite pixels that
+	 * should be visible.  This produced two visible symptoms:
+	 *
+	 *   1. Small clusters of pixels vanishing from character sprites
+	 *      (window tile written over the sprite pixel at that position).
+	 *
+	 *   2. A flickering cloud effect (far right of screen) appearing to
+	 *      "transfer" to sprites on the left: the cloud's WY manipulation
+	 *      triggered the latch incorrectly, causing the window to activate
+	 *      on scanlines that cross the bath-house lady's sprites, overwriting
+	 *      her pixels in sync with the cloud's own flicker cadence.
+	 *
+	 * The interlace early-return path (above) already has the correct gate;
+	 * wy_triggered is now latched by __gb_oam_scan at Mode 2 start, matching
+	 * SameBoy's wy_check() timing exactly. No re-latch needed here. */
 
 	/* FIX: On DMG, LCDC bit 0 disables both BG and Window.
 	 * Only on CGB is it a sprite-priority master switch. */
@@ -3258,40 +3340,19 @@ void __gb_draw_line(struct gb_s *gb)
 	{
 		uint8_t sprite_number;
 #if WALNUT_GB_HIGH_LCD_ACCURACY
-		uint8_t number_of_sprites = 0;
-
-		struct sprite_data sprites_to_render[MAX_SPRITES_LINE + 1]; // Requires one extra slot for sorting 
-
-		/* Record number of sprites on the line being rendered, limited
-		 * to the maximum number sprites that the Game Boy is able to
-		 * render on each line (10 sprites). */
-		for(sprite_number = 0;
-				sprite_number < NUM_SPRITES;
-				sprite_number++)
+		/* FIX (Shantae / inter-sprite flicker): use the OAM snapshot that
+		 * was captured by __gb_oam_scan at Mode 2 START, before the CPU ran.
+		 * Reading live OAM here (Mode 3 start) allowed ~80 cycles of CPU
+		 * writes to sprite Y registers to be visible, causing sprites to
+		 * appear on scanlines they should not be on, consuming per-line
+		 * slots and flickering unrelated sprites off screen. */
+		uint8_t number_of_sprites = gb->display.oam_scan_count;
+		struct sprite_data sprites_to_render[MAX_SPRITES_LINE + 1];
+		for(uint8_t i = 0; i < number_of_sprites; i++)
 		{
-			/* Sprite Y position. */
-			uint8_t OY = gb->oam[4 * sprite_number + 0];
-			/* Sprite X position. */
-			uint8_t OX = gb->oam[4 * sprite_number + 1];
-
-			/* If sprite isn't on this line, continue. */
-			if(hram_io_ly +
-				(gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0 : 8) >= OY
-					|| hram_io_ly + 16 < OY)
-				continue;
-
-			/* Both DMG and CGB: collect the first 10 sprites that land on
-			 * this line in OAM order (0..39). Real hardware's OAM scan
-			 * selects by OAM order, not X position. X is only used for
-			 * pixel priority during rendering (lower X wins; lower OAM
-			 * index breaks ties). The previous DMG path sorted during
-			 * collection, keeping the 10 lowest-X sprites and dropping
-			 * valid OAM-order sprites — the root cause of horizontal
-			 * gaps ("lines through characters") in DKL2 and similar. */
-			if (number_of_sprites >= MAX_SPRITES_LINE) continue;
-			sprites_to_render[number_of_sprites].sprite_number = sprite_number;
-			sprites_to_render[number_of_sprites].x = OX;
-			number_of_sprites++;
+			sprites_to_render[i].sprite_number = gb->display.oam_scan_sprites[i];
+			sprites_to_render[i].x             = gb->display.oam_scan_ox[i];
+			sprites_to_render[i].y             = gb->display.oam_scan_oy[i];
 		}
 #endif
 
@@ -3331,10 +3392,17 @@ void __gb_draw_line(struct gb_s *gb)
 			uint8_t s = sprite_number;
 #endif
 			uint8_t py, t1, t2, dir, start, end, shift, disp_x;
-			/* Sprite Y position. */
+			/* Sprite Y position — use scan-time snapshot so the py row
+			 * calculation matches the visibility check done at Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+			uint8_t OY = sprites_to_render[sprite_number].y;
+			/* Sprite X position — use scan-time snapshot so the screen
+			 * position matches the sort order decided at Mode 2. */
+			uint8_t OX = sprites_to_render[sprite_number].x;
+#else
 			uint8_t OY = gb->oam[4 * s + 0];
-			/* Sprite X position. */
 			uint8_t OX = gb->oam[4 * s + 1];
+#endif
 			/* Sprite Tile/Pattern Number. */
 			uint8_t OT = gb->oam[4 * s + 2]
 				     & (gb->hram_io[IO_LCDC] & LCDC_OBJ_SIZE ? 0xFE : 0xFF);
@@ -5721,6 +5789,10 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				gb->wy_triggered = false;
 				/* Enter Mode 2 (OAM scan) for the real line 0. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
@@ -5821,6 +5893,10 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				/* Do NOT reset lcd_count here — preserve carry from the
 				 * previous line boundary subtraction so sub-mode
 				 * transitions fire at the correct absolute cycle. */
@@ -7773,6 +7849,10 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 				gb->wy_triggered = false;
 				/* Enter Mode 2 (OAM scan) for the real line 0. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
@@ -7873,6 +7953,10 @@ static inline void __gb_step_cpu(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				/* Do NOT reset lcd_count here — preserve carry from the
 				 * previous line boundary subtraction so sub-mode
 				 * transitions fire at the correct absolute cycle. */
@@ -10425,6 +10509,10 @@ void __gb_step_cpu_x(struct gb_s *gb)
 				gb->wy_triggered = false;
 				/* Enter Mode 2 (OAM scan) for the real line 0. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				if(gb->hram_io[IO_STAT] & STAT_MODE_2_INTR)
 					gb->hram_io[IO_IF] |= LCDC_INTR;
 				if(gb->counter.lcd_count >= LCD_MODE2_OAM_SCAN_END)
@@ -10525,6 +10613,10 @@ void __gb_step_cpu_x(struct gb_s *gb)
 
 				/* OAM Search occurs at the start of the line. */
 				gb->hram_io[IO_STAT] = (gb->hram_io[IO_STAT] & ~STAT_MODE) | IO_STAT_MODE_OAM_SCAN;
+				/* Latch OAM snapshot and wy_triggered before CPU runs Mode 2. */
+#if WALNUT_GB_HIGH_LCD_ACCURACY
+				__gb_oam_scan(gb);
+#endif
 				/* Do NOT reset lcd_count here — preserve carry from the
 				 * previous line boundary subtraction so sub-mode
 				 * transitions fire at the correct absolute cycle. */
