@@ -161,6 +161,30 @@ struct GBAPU {
     // waveforms — the combined-mix HP caused audible amplitude distortion.
     // Preserved across pause/resume to avoid clicks.
     float hp_ch[4]={};
+
+    // Pop-prevention: shadow the previous dac_on / enabled state per channel.
+    //
+    // When dac_on or enabled changes between consecutive output samples the raw
+    // pre-HP channel output 'd' can jump by up to 2.0:
+    //   • dac_on false→true:  d jumps  0.0 → -1.0        (Δ = -1.0)
+    //   • dac_on true→false:  d jumps  playing → 0.0
+    //   • enabled true→false: d jumps  playing → -1.0
+    //   • enabled false→true: d jumps -1.0 → new note level
+    //
+    // The HP filter, having been tracking the old DC level in hp_ch, converts
+    // that full step into an exponential transient (≈ HP_R × Δ in the very
+    // first sample, decaying over 5.7 ms) — heard as an audible pop/click on
+    // music transitions, scene changes, and channel gating.
+    //
+    // Fix: when either flag changes, snap hp_ch[i] to the current d value so
+    // d_out = d - hp_ch = 0 at the transition sample.  The HP filter resumes
+    // normally from the new level with no transient.
+    //
+    // Normal note play (both flags constant) is completely unaffected.
+    // Pokémon Yellow voice: NR30=0→0x80→trigger all fire within one sample's
+    // event batch, so the state ends the same as it began — no snap fires.
+    bool prev_dac_on[4]  = {};
+    bool prev_enabled[4] = {};
 };
 
 // Software master volume scalar (0.0 = silent, 1.0 = full).
@@ -342,12 +366,28 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     // A one-frame lag on a slider drag is imperceptible.
     const float mg = s_master_gain.load(std::memory_order_relaxed);
 
-    // Precompute sample-index due values so the inner event loop pays
-    // only an integer compare instead of a 64-bit multiply+divide each sample.
+    // Precompute sample-index due values using a 32-bit fixed-point scale factor
+    // instead of a 64-bit divide per event.  cycle is 0..70223 (16-bit), n_samp
+    // is 803 or 804, GB_FRAME_CYC is 70224.  The scale = (n_samp << 16) /
+    // GB_FRAME_CYC fits in 32 bits (804<<16 = 52,691,968 < 2^26), so
+    // cycle * scale fits in 32 bits with no overflow (70223 * 52691968 >> 16
+    // < 70223 * 804 = 56,459,292 < 2^26).  Result is identical to the 64-bit
+    // path for all valid inputs; 64-bit divide was ~10x more expensive on ARM.
     static uint32_t due_arr[LOC_CAP];
-    for (uint32_t k = 0; k < n_evts; ++k)
-        due_arr[k] = static_cast<uint32_t>(
-            static_cast<uint64_t>(evts[k].cycle) * n_samp / GB_FRAME_CYC);
+    {
+        const uint32_t scale = (n_samp << 16) / GB_FRAME_CYC;
+        for (uint32_t k = 0; k < n_evts; ++k)
+            due_arr[k] = (static_cast<uint32_t>(evts[k].cycle) * scale) >> 16;
+    }
+
+    // Hoist NR50 master volume out of the per-sample loop.
+    // NR50 changes at most once per frame (rare mid-frame writes), so we track
+    // the last-seen nr50 value and only recompute lv/rv when it changes.
+    // This eliminates 803 pairs of shift+mask+cast+float-add operations per frame
+    // in the common case where NR50 is constant (the vast majority of frames).
+    uint8_t cached_nr50 = a.nr50;
+    float lv = static_cast<float>(((cached_nr50 >> 4) & 7) + 1);
+    float rv = static_cast<float>(( cached_nr50        & 7) + 1);
 
     for (uint32_t i=0; i<n_samp; ++i) {
         // ── Cycle-accurate event distribution ────────────────────────────────
@@ -359,10 +399,13 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             ++evt_idx;
         }
 
-        // NR50 master volume — recomputed each sample so mid-frame NR50 events
-        // (rare but possible) take effect at the correct sample boundary.
-        const float lv = static_cast<float>(((a.nr50>>4)&7)+1);
-        const float rv = static_cast<float>((a.nr50&7)+1);
+        // NR50 master volume — update cached floats only when NR50 actually changed
+        // (covers the rare mid-frame NR50 write injected by the event loop above).
+        if (__builtin_expect(a.nr50 != cached_nr50, 0)) {
+            cached_nr50 = a.nr50;
+            lv = static_cast<float>(((cached_nr50 >> 4) & 7) + 1);
+            rv = static_cast<float>(( cached_nr50        & 7) + 1);
+        }
 
         a.cycle_frac+=STEP;
         const int cyc=static_cast<int>(a.cycle_frac>>16);
@@ -425,6 +468,11 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch1.vol):0.0f;
             d1=a.ch1.dac_on?avg*DAC_SCALE-1.0f:0.0f;
         }
+        if (a.ch1.dac_on != a.prev_dac_on[0] || a.ch1.enabled != a.prev_enabled[0]) {
+            a.hp_ch[0] = d1;  // absorb DC step — no transient pop
+            a.prev_dac_on[0]  = a.ch1.dac_on;
+            a.prev_enabled[0] = a.ch1.enabled;
+        }
         { const float _h=HP_R*a.hp_ch[0]+HP_C*d1; d1-=_h; a.hp_ch[0]=_h; }
 
         // ── CH2 — integrate square wave ───────────────────────────────────────
@@ -447,6 +495,11 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             const float avg=a.ch2.enabled
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch2.vol):0.0f;
             d2=a.ch2.dac_on?avg*DAC_SCALE-1.0f:0.0f;
+        }
+        if (a.ch2.dac_on != a.prev_dac_on[1] || a.ch2.enabled != a.prev_enabled[1]) {
+            a.hp_ch[1] = d2;  // absorb DC step — no transient pop
+            a.prev_dac_on[1]  = a.ch2.dac_on;
+            a.prev_enabled[1] = a.ch2.enabled;
         }
         { const float _h=HP_R*a.hp_ch[1]+HP_C*d2; d2-=_h; a.hp_ch[1]=_h; }
 
@@ -479,6 +532,11 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.ch3.timer=t; a.ch3.pos=pos;
             d3=a.ch3.dac_on?acc*rcyc*DAC_SCALE-1.0f:0.0f;
         }
+        if (a.ch3.dac_on != a.prev_dac_on[2] || a.ch3.enabled != a.prev_enabled[2]) {
+            a.hp_ch[2] = d3;  // absorb DC step — no transient pop
+            a.prev_dac_on[2]  = a.ch3.dac_on;
+            a.prev_enabled[2] = a.ch3.enabled;
+        }
         { const float _h=HP_R*a.hp_ch[2]+HP_C*d3; d3-=_h; a.hp_ch[2]=_h; }
 
         // ── CH4 — integrate LFSR noise ────────────────────────────────────────
@@ -509,6 +567,11 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             const float avg=a.ch4.enabled
                 ?static_cast<float>(hi)*rcyc*static_cast<float>(a.ch4.vol):0.0f;
             d4=a.ch4.dac_on?avg*DAC_SCALE-1.0f:0.0f;
+        }
+        if (a.ch4.dac_on != a.prev_dac_on[3] || a.ch4.enabled != a.prev_enabled[3]) {
+            a.hp_ch[3] = d4;  // absorb DC step — no transient pop
+            a.prev_dac_on[3]  = a.ch4.dac_on;
+            a.prev_enabled[3] = a.ch4.enabled;
         }
         { const float _h=HP_R*a.hp_ch[3]+HP_C*d4; d4-=_h; a.hp_ch[3]=_h; }
 

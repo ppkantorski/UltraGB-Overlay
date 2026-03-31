@@ -41,7 +41,7 @@
 // draw_ultragb_title is defined in main.cpp (static, visible here because
 // this header is included after the definition).
 // Forward-declare the signature so the compiler is happy if included earlier.
-static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32);
+static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
@@ -71,7 +71,7 @@ public:
 
         // --- Animated title — matches IS_LAUNCHER_DIRECTIVE Ultrahand menu exactly:
         //     y=50, offset=6 → baseline 56; fontSize=42 ---
-        draw_ultragb_title(renderer, 20, 56, 42);
+        draw_ultragb_title(renderer, 20, 56, 42, true);
 
         // --- Version label subtitle — matches Ultrahand main menu: y+25=75, fontSize=15 ---
         // ult::versionLabel carries the full "vX.X.X ▸ loaderTitle" string with the

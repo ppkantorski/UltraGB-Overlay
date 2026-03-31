@@ -316,6 +316,9 @@ class GBWindowedGui : public tsl::Gui {
     int  m_pos_start_x   = 0;      // g_win_pos_x when hold began (VI space)
     int  m_pos_start_y   = 0;      // g_win_pos_y when hold began (VI space)
     bool m_prev_touching = false;  // touch state last frame (from HID poll)
+    bool m_restoreHapticState = false;
+    bool runOnce = true;
+
 
     // ── KEY_PLUS 2s hold → joystick reposition state ─────────────────────────
     bool     m_plus_dragging      = false;  // actively repositioning via joystick
@@ -323,6 +326,7 @@ class GBWindowedGui : public tsl::Gui {
     uint64_t m_plus_hold_start_ns = 0;      // ns timestamp when hold began
     float    m_joy_acc_x          = 0.f;    // sub-pixel accumulator, VI-space X
     float    m_joy_acc_y          = 0.f;    // sub-pixel accumulator, VI-space Y
+    uint64_t m_joy_last_ns        = 0;      // timestamp of previous joystick-active frame (for dt scaling)
 
     // 60 frames ≈ 1 second at the GB's 59.73 Hz render rate.
     static constexpr int      HOLD_FRAMES      = 60;
@@ -354,13 +358,6 @@ class GBWindowedGui : public tsl::Gui {
     bool m_waitForRelease = true;
 
     bool m_load_failed = false;
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-    static bool combo_pressed(u64 keysDown, u64 keysHeld) {
-        const u64 combo = tsl::cfg::launchCombo;
-        return ((keysDown & combo) != 0) &&
-               (((keysDown | keysHeld) & combo) == combo);
-    }
 
     // Poll the HID touch screen.  Returns true if at least one finger is down.
     // We bypass the touchPos parameter from Tesla because Tesla clears its own
@@ -481,6 +478,16 @@ public:
                 tsl::setNextOverlay(std::string(g_self_path));
             tsl::Overlay::get()->close();
         }
+        if (runOnce) {
+            if (g_ingame_haptics && !ult::useHapticFeedback) {
+                ult::useHapticFeedback = true;
+                m_restoreHapticState = true;
+            }
+            if (g_self_path[0]) {
+                returnOverlayPath = std::string(g_self_path);
+            }
+            runOnce = false;
+        }
     }
 
     // ── handleInput ──────────────────────────────────────────────────────────
@@ -499,6 +506,11 @@ public:
 
         // ── Launch combo: exit windowed mode, return to normal UltraGB ────────
         if (combo_pressed(keysDown, keysHeld)) {
+            if (m_restoreHapticState) {
+                ult::useHapticFeedback = false;
+                m_restoreHapticState = false;
+            }
+
             // Quick-exit mode (triggered via Quick Combo): close the overlay
             // entirely without relaunching the normal UltraGB UI.
             // Normal mode: return to UltraGB via setNextOverlay so it can
@@ -515,11 +527,15 @@ public:
             // gets directMode from Ultrahand's --direct flag).  We fire our
             // own exit feedback above, so we don't want a second one.
             gb_audio_pause();
+
             launchComboHasTriggered.store(true, std::memory_order_release);
-            if (!g_win_quick_exit && g_self_path[0])
-                tsl::setNextOverlay(std::string(g_self_path), "-returning");
+            if (!g_win_quick_exit && g_self_path[0]) {
+                const std::string returnArg = g_directMode ? "-returning --direct" : "-returning";
+                tsl::setNextOverlay(std::string(g_self_path), returnArg);
+            }
+
             tsl::Overlay::get()->close();
-            ult::rumbleDoubleClickStandalone();
+            
             return true;
         }
 
@@ -559,7 +575,7 @@ public:
         if (!m_dragging && !m_plus_dragging && !m_pass_through) {
             gb_set_input(keysHeld | keysDown);
             if (g_ingame_haptics &&
-                (keysDown & (KEY_A | KEY_B | KEY_PLUS | KEY_MINUS |
+                (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClick.store(true, std::memory_order_release);
         }
@@ -793,6 +809,7 @@ public:
                         gb_audio_pause();
                         m_joy_acc_x     = 0.f;
                         m_joy_acc_y     = 0.f;
+                        m_joy_last_ns   = 0;      // will be anchored on first active frame
                         triggerNavigationFeedback(); // haptic: drag started
                     }
                 }
@@ -811,10 +828,25 @@ public:
                         static constexpr float MAX_SENS  = 0.0005f;
                         const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve;
 
+                        // Delta-time scaling: sens values are tuned for 60 fps.
+                        // Multiply by (actual_dt * 60) so the real-world velocity
+                        // is constant regardless of frame rate — at 60 fps the factor
+                        // is exactly 1.0 (no change in feel); at lower frame rates
+                        // each frame contributes proportionally more so the window
+                        // moves at the same speed it would at full 60 fps.
+                        // Clamped to [1/4 frame .. 4 frames] to guard against
+                        // spurious spikes (first frame, timer hiccup, etc.).
+                        const uint64_t now_ns = ult::nowNs();
+                        if (m_joy_last_ns == 0) m_joy_last_ns = now_ns;
+                        const float dt_ns  = static_cast<float>(now_ns - m_joy_last_ns);
+                        const float dt_factor = std::max(0.25f,
+                                                std::min(4.0f, dt_ns * (60.0f / 1e9f)));
+                        m_joy_last_ns = now_ns;
+
                         // Accumulate fractional VI-space movement; Y axis is inverted
                         // (stick up → negative y → window moves up).
-                        m_joy_acc_x +=  static_cast<float>(leftJoy.x) * sens;
-                        m_joy_acc_y += -static_cast<float>(leftJoy.y) * sens;
+                        m_joy_acc_x +=  static_cast<float>(leftJoy.x) * sens * dt_factor;
+                        m_joy_acc_y += -static_cast<float>(leftJoy.y) * sens * dt_factor;
 
                         const int dx = static_cast<int>(m_joy_acc_x);
                         const int dy = static_cast<int>(m_joy_acc_y);
@@ -831,6 +863,10 @@ public:
                                 static_cast<u32>(g_win_pos_y));
                             sync_notif_touch_offsets();
                         }
+                    } else {
+                        // Stick returned to deadzone — reset the timestamp so the
+                        // next active frame doesn't accumulate a long idle gap.
+                        m_joy_last_ns = 0;
                     }
                 }
             } else {

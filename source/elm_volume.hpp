@@ -43,7 +43,7 @@ public:
         const s32 iconBase = this->getY() + kIconBaseY;
 
         // Measure glyph once.
-        const auto [gw, gh] = renderer->getTextDimensions("\uE13C", false, kIconSize);
+        static const auto [gw, gh] = renderer->getTextDimensions("\uE13C", false, kIconSize);
         const s32 glyphW   = static_cast<s32>(gw);
         const s32 glyphH   = static_cast<s32>(gh);
         const s32 glyphTop = iconBase - glyphH;
@@ -67,19 +67,19 @@ public:
 
         renderer->enableScissoring(scissorX, scissorY, scissorW, scissorH);
         renderer->drawString("\uE13C", false, iconX, iconBase, kIconSize,
-                             a(tsl::style::color::ColorText));
+                             ((!this->m_focused || !ult::useSelectionText) ? tsl::defaultTextColor : tsl::selectedTextColor));
         renderer->disableScissoring();
 
         // 3. Cross centred in the right-half region — drawn outside any scissor.
         const s32 rightX    = iconX + glyphW / 2;
         const s32 rightW    = glyphW - glyphW / 2;
         const s32 crossSize = std::max(8, glyphH * 45 / 100);
-        const auto [cw, ch] = renderer->getTextDimensions("\uE14C", false, crossSize);
+        static const auto [cw, ch] = renderer->getTextDimensions("\uE14C", false, crossSize);
         const s32 crossX    = rightX + (rightW - static_cast<s32>(cw)) / 2;
         const s32 crossY    = (iconBase - glyphH / 2) + static_cast<s32>(ch) / 2 + 2;
 
         renderer->drawString("\uE14C", false, crossX, crossY, crossSize,
-                             a(tsl::style::color::ColorText));
+                             ((!this->m_focused || !ult::useSelectionText) ? tsl::defaultTextColor : tsl::selectedTextColor));
     }
 
     // -----------------------------------------------------------------------
