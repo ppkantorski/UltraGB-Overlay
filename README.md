@@ -68,7 +68,7 @@ Each ROM has an individual settings screen (`Y` in the ROM list) with:
 ## Requirements
 
 - Nintendo Switch with [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) custom firmware
-- [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay) installed
+- [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay) and [nx-ovlloader v2.0.0+](https://github.com/ppkantorski/nx-ovlloader) installed
 - ROMs placed anywhere accessible on the SD card (`.gb` / `.gbc`)
 
 ---
