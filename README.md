@@ -10,7 +10,7 @@ A Game Boy / Game Boy Color emulator overlay for the Nintendo Switch, built on [
 - Full **Game Boy** (DMG) and **Game Boy Color** (GBC/CGB) emulation via [Walnut-CGB](https://github.com/Mr-PauI/Walnut-CGB) (a fork of [Peanut-GB](https://github.com/deltabeard/Peanut-GB))
 - Supports MBC1, MBC2, MBC3 (with RTC), MBC5, and ROM-only cartridges
 - LCD ghosting / frame blending for accurate DMG flicker reproduction
-- Fast-forward (4× speed) via ZR double-click-hold
+- Fast-forward (2x speed) via ZR double-click-hold
 
 ### Display
 - **Overlay mode** — emulator drawn inside the standard Ultrahand overlay panel (448×720 framebuffer), scaled to fit
