@@ -39,17 +39,17 @@ using namespace ult;
 // =============================================================================
 // Paths / config
 // =============================================================================
-static constexpr const char* CONFIG_DIR  = "sdmc:/config/ultragb/";
-static constexpr const char* CONFIG_FILE = "sdmc:/config/ultragb/config.ini";
-static constexpr const char* SAVE_DIR          = "sdmc:/config/ultragb/saves/";
+static constexpr const char* CONFIG_DIR        = "sdmc:/config/ultragb/";
+static constexpr const char* CONFIG_FILE       = "sdmc:/config/ultragb/config.ini";
+static constexpr const char* SAVE_BASE_DIR     = "sdmc:/config/ultragb/saves/";
 static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
-static constexpr const char* INTERNAL_STATE_DIR = "sdmc:/config/ultragb/states/internal/";
-static constexpr const char* STATE_DIR         = INTERNAL_STATE_DIR; // alias — internal quick-resume
-static constexpr const char* INTERNAL_SAVE_DIR  = "sdmc:/config/ultragb/saves/internal/";  // live .sav files
+static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
+//static constexpr const char* INTERNAL_SAVE_BASE_DIR  = "sdmc:/config/ultragb/saves/internal/";  // live .sav files
 static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
 
-static constexpr size_t PATH_BUFFER_SIZE = 256;
+static constexpr size_t PATH_BUFFER_SIZE = 128;
 static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
+static char g_save_dir[PATH_BUFFER_SIZE]            = "sdmc:/config/ultragb/saves/internal/";
 static char g_last_rom_path[PATH_BUFFER_SIZE]       = {};   // basename of last-played ROM, persisted to config.ini
 static char g_pending_rom_path[PATH_BUFFER_SIZE]    = {};   // path deferred from click listener → loaded in GBOverlayGui::createUI()
 static char g_rom_selector_scroll[PATH_BUFFER_SIZE] = {};  // last ROM the user interacted with in the selector; used to restore scroll on page flip
@@ -82,6 +82,7 @@ static const std::string kConfigFile{CONFIG_FILE};
 // process, eliminating those per-call allocations.
 static const std::string kConfigSection   {"config"};
 static const std::string kKeyRomDir       {"rom_dir"};
+static const std::string kKeySaveDir      {"save_dir"};
 static const std::string kKeyLastRom      {"last_rom"};
 static const std::string kKeyVolume       {"volume"};
 static const std::string kKeyVolBackup    {"vol_backup"};
@@ -211,6 +212,17 @@ static void load_config() {
         }
     }
 
+    // rom_dir
+    const std::string save_dir_val = ult::parseValueFromIniSection(path, kConfigSection, kKeySaveDir);
+    if (!save_dir_val.empty() && save_dir_val.size() < sizeof(g_save_dir) - 2) {
+        strncpy(g_save_dir, save_dir_val.c_str(), sizeof(g_save_dir) - 2);
+        const size_t vlen = strlen(g_save_dir);
+        if (vlen > 0 && g_save_dir[vlen - 1] != '/') {
+            g_save_dir[vlen]     = '/';
+            g_save_dir[vlen + 1] = '\0';
+        }
+    }
+
     // original_palette key is superseded by per-game palette_mode in configure/<rom>.ini
     // (kept for legacy: if a user has it in config.ini it is silently ignored now)
 
@@ -276,6 +288,7 @@ static void set_if_missing(const char* key, const char* def) {
 
 static void write_default_config_if_missing() {
     set_if_missing("rom_dir",       g_rom_dir);
+    set_if_missing("save_dir",      g_save_dir);
     set_if_missing("volume",        "50");
     set_if_missing("vol_backup",    "50");
     set_if_missing("pixel_perfect", "0");
@@ -728,7 +741,7 @@ static void load_save(GBState& s) {
 }
 static void write_save(GBState& s) {
     if (!s.cartRam || !s.cartRamSz) return;
-    ult::createDirectory(INTERNAL_SAVE_DIR);
+    ult::createDirectory(g_save_dir);
     FILE* f = fopen(s.savePath, "wb");
     if (!f) return;
     fwrite(s.cartRam, 1, s.cartRamSz, f);
@@ -1029,14 +1042,14 @@ static std::string newest_save_backup_slot_label(const char* romPath) {
 // Full path to a save-data backup slot file.
 static void build_save_backup_slot_path(const char* romPath, int slot, char* out, size_t outSz) {
     char dir[PATH_BUFFER_SIZE] = {};
-    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_DIR);
+    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_BASE_DIR);
     snprintf(out, outSz, "%sslot_%d.sav", dir, slot);
 }
 
 // Full path to a save-data backup slot timestamp file.
 static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz) {
     char dir[PATH_BUFFER_SIZE] = {};
-    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_DIR);
+    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_BASE_DIR);
     snprintf(out, outSz, "%sslot_%d.ts", dir, slot);
 }
 
@@ -1062,11 +1075,11 @@ static inline void delete_file(const char* p) { ult::deleteFileOrDirectory(p); }
 // (game has no save data yet).
 static bool backup_save_data_slot(const char* romPath, int slot) {
     char internalPath[PATH_BUFFER_SIZE] = {};
-    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_SAVE_DIR, ".sav");
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), g_save_dir, ".sav");
     if (!file_exists(internalPath)) return false;
 
     char dir[PATH_BUFFER_SIZE] = {};
-    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_DIR);
+    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_BASE_DIR);
     ult::createDirectory(dir);
 
     char slotPath[PATH_BUFFER_SIZE] = {};
@@ -1087,7 +1100,7 @@ static bool restore_save_data_slot(const char* romPath, int slot) {
     if (!file_exists(slotPath)) return false;
 
     char internalPath[PATH_BUFFER_SIZE] = {};
-    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_SAVE_DIR, ".sav");
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), g_save_dir, ".sav");
 
     copy_file(slotPath, internalPath);
     if (!file_exists(internalPath)) return false;
@@ -1109,7 +1122,7 @@ static bool restore_save_data_slot(const char* romPath, int slot) {
 // Returns false if the internal state file doesn't exist (game not yet played).
 static bool save_user_slot(const char* romPath, int slot) {
     char internalPath[PATH_BUFFER_SIZE] = {};
-    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), STATE_DIR, ".state");
     if (!file_exists(internalPath)) return false;
 
     // Ensure per-game directory exists before writing
@@ -1135,7 +1148,7 @@ static bool load_user_slot(const char* romPath, int slot) {
     if (!file_exists(slotPath)) return false;
 
     char internalPath[PATH_BUFFER_SIZE] = {};
-    build_rom_data_path(romPath, internalPath, sizeof(internalPath), INTERNAL_STATE_DIR, ".state");
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), STATE_DIR, ".state");
 
     copy_file(slotPath, internalPath);
     return file_exists(internalPath);
@@ -1409,7 +1422,7 @@ bool gb_load_rom(const char* path) {
     g_gb.rom     = rom_buf;
     g_gb.romSize = sz;
     strncpy(g_gb.romPath, path, sizeof(g_gb.romPath)-1);
-    build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), INTERNAL_SAVE_DIR, ".sav");
+    build_rom_data_path(path, g_gb.savePath, sizeof(g_gb.savePath), g_save_dir, ".sav");
 
     // Allocate the core emulator struct — contains WRAM (32 KB) + VRAM (16 KB) + OAM/HRAM.
     // Lives on the heap so these ~49 KB are only resident during active gameplay.
@@ -1735,7 +1748,7 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
     }
     cx += renderer->drawString("GB",  false, cx, y, fontSize, tsl::logoColor2).first;
     if (quickModeSymbol && g_directMode)
-        cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, tsl::onTextColor).first;
+        cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, tsl::RGB888("6ea0f0")).first;
     return cx;
 }
 
@@ -2896,7 +2909,7 @@ public:
             // Delete the internal quick-resume state so gb_load_rom cold-boots
             char internalPath[PATH_BUFFER_SIZE] = {};
             build_rom_data_path(romPath.c_str(), internalPath, sizeof(internalPath),
-                                INTERNAL_STATE_DIR, ".state");
+                                STATE_DIR, ".state");
             delete_file(internalPath);
             // Launch the game — no state file means cold boot
             audio_exit_if_enabled();
@@ -3658,14 +3671,15 @@ public:
         ult::COPY_BUFFER_SIZE = 1024; // minimize copy buffer
         tsl::overrideBackButton = true;
         ult::createDirectory(CONFIG_DIR);
-        ult::createDirectory(SAVE_DIR);
-        ult::createDirectory(INTERNAL_SAVE_DIR);
+        ult::createDirectory(SAVE_BASE_DIR);
+        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
-        ult::createDirectory(INTERNAL_STATE_DIR);
+        ult::createDirectory(STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
         load_config();
         write_default_config_if_missing();
         ult::createDirectory(g_rom_dir);
+        ult::createDirectory(g_save_dir);
 
         // Register "-quicklaunch" mode in overlays.ini so Ultrahand can
         // display and assign a combo to it.  Also refreshes g_quick_combo.
@@ -3717,8 +3731,8 @@ public:
         // Migrate legacy .sav files from saves/ root → saves/internal/
         // Runs once after the first update; files that already exist in the
         // destination are skipped automatically by moveFilesOrDirectoriesByPattern.
-        //ult::moveFilesOrDirectoriesByPattern(std::string(SAVE_DIR) + "*.sav",
-        //                                     INTERNAL_SAVE_DIR);
+        //ult::moveFilesOrDirectoriesByPattern(std::string(SAVE_BASE_DIR) + "*.sav",
+        //                                     INTERNAL_SAVE_BASE_DIR);
     }
 
     virtual void exitServices() override {
@@ -3900,10 +3914,12 @@ int main(int argc, char* argv[]) {
                     // launch, causing the brief menu flash before windowed starts.
                     // Use getCurrentHeapSize() directly instead — it queries the
                     // real heap tier before Tesla initialises.
+                    const auto currentHeapSize    = ult::getCurrentHeapSize();
+                    const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
+                    const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+                    const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
                     {
-                        const bool earlyLimited         = ult::limitedMemory;
-                        const bool earlyExpanded        = ult::expandedMemory && !ult::furtherExpandedMemory;
-                        const bool earlyFurtherExpanded = ult::furtherExpandedMemory;
+                        //const bool earlyFurtherExpanded = (currentHeapSize > ult::OverlayHeapSize::Size_8MB);
 
                         FILE* fsz = fopen(fullPath.c_str(), "rb");
                         bool tooLarge = false;
@@ -3912,9 +3928,9 @@ int main(int argc, char* argv[]) {
                             const size_t rsz = static_cast<size_t>(ftell(fsz));
                             fclose(fsz);
                             tooLarge =
-                                ( earlyLimited         && rsz >= kROM_2MB && rsz < kROM_4MB) ||
-                                (!earlyExpanded        && rsz >= kROM_4MB && rsz < kROM_6MB) ||
-                                (!earlyFurtherExpanded && rsz >= kROM_6MB);
+                                (earlyLimited       && rsz >= kROM_2MB) ||
+                                (earlyRegularMemory && rsz >= kROM_4MB) ||
+                                (earlyExpanded      && rsz >= kROM_6MB);
                         }
                         if (tooLarge)
                             goto normal_overlay_launch;
@@ -3928,8 +3944,7 @@ int main(int argc, char* argv[]) {
                         else if (sv == "3") g_win_scale = 3;
                         else if (sv == "4") g_win_scale = 4;
                         else                g_win_scale = 1;
-                        const bool earlyLimited =
-                            (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
+
                         if (earlyLimited && g_win_scale == 4) g_win_scale = 3;
                     }
 

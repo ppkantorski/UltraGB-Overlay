@@ -922,14 +922,16 @@ public:
         tsl::disableHiding = true;
 
         ult::createDirectory(CONFIG_DIR);
-        ult::createDirectory(SAVE_DIR);
-        ult::createDirectory(INTERNAL_SAVE_DIR);
+        ult::createDirectory(SAVE_BASE_DIR);
+        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
-        ult::createDirectory(INTERNAL_STATE_DIR);
+        ult::createDirectory(STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
 
         load_config();
         write_default_config_if_missing();
+        ult::createDirectory(g_rom_dir);
+        ult::createDirectory(g_save_dir);
 
         // Read windowed quick-exit flag.  Set when the user triggered Quick Launch
         // in windowed mode — the exit combo should close entirely, not return to
