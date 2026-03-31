@@ -1,4 +1,4 @@
-# UltraGB
+# UltraGB Overlay
 
 A Game Boy / Game Boy Color emulator overlay for the Nintendo Switch, built on [Ultrahand](https://github.com/ppkantorski/Ultrahand-Overlay). Play GB and GBC games directly over any running title — no home menu required.
 
