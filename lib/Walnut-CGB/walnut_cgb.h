@@ -59,9 +59,14 @@
 * for a little endian platform. If 0, then big endian.
 */
 // The safe flags below toggle opcode reloading for dual fetch execution for mbc, dma and specific opcodes - used for debugging invalidated opcodes or compatibility but slows execution
-#define WALNUT_GB_SAFE_DUALFETCH_OPCODES 1
-#define WALNUT_GB_SAFE_DUALFETCH_DMA  1
-#define WALNUT_GB_SAFE_DUALFETCH_MBC  1
+// Disabled: commercial GBC games (incl. Oracle of Ages/Seasons) do not use self-modifying code,
+// bank switches always execute from bank-0 (prefetch always valid), and OAM/VRAM DMA always
+// transfers from ROM. These flags add an extra __gb_read() function-pointer dispatch after every
+// memory-write opcode and after every DMA/bank-switch, which accumulates to significant overhead
+// in games that hammer tile copies, OAM fills, and HDMA. No behavior change for commercial carts.
+#define WALNUT_GB_SAFE_DUALFETCH_OPCODES 0
+#define WALNUT_GB_SAFE_DUALFETCH_DMA  0
+#define WALNUT_GB_SAFE_DUALFETCH_MBC  0
 // WALNUT_GB_16_BIT_OPS_DUALFETCH when true enables 16-bit operation for opcodes with 16-bit reads for the first half of the dual fetch chain
 // currently breaks compatibility with some games, 16-bit opcode optimization needs revisions. The 3 tiers here are used to isolate misbehaving opcodes more quickly when debugging.
 #define WALNUT_GB_16_BIT_OPS_DUALFETCH 0
@@ -73,7 +78,7 @@
 // WALNUT_GB_16BIT_DMA uses 16-bit(and 32-bit) dma transfers rather than byte-by-byte, only one mode can be used at a time. The gb_read_32bit function is used for the 32-bit DMA, otherwise that function will not be called
 //  **Note:** The current implementation of 16-bit DMA is limited to systems that do not have aliasing or alignment restrictions when writing data (e.g., ESP32-S3). On some platforms, you may need to compile with `-fno-strict-aliasing` to avoid issues with pointer aliasing.
 #define WALNUT_GB_16BIT_DMA 0
-#define WALNUT_GB_32BIT_DMA 0
+#define WALNUT_GB_32BIT_DMA 1
 // Uses alignment aware read/writes with an 8-bit fallback (16-bit alignment implemented for read path only in this version)
 #define WALNUT_GB_16BIT_ALIGNED 0
 #define WALNUT_GB_32BIT_ALIGNED 0
