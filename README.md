@@ -127,6 +127,4 @@ sdmc:/
 
 ## License
 
-UltraGB is released under the [GPLv2](LICENSE).
-Walnut-CGB and Peanut-GB are MIT licensed.
-See individual source files for full copyright notices.
+UltraGB Overlay is released under the [GPLv2](LICENSE).
