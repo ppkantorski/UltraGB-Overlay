@@ -1,7 +1,7 @@
 /********************************************************************************
  * File: main.cpp
  * Description:
- *   Game GB / Game GBC Color emulator overlay for Nintendo Switch.
+ *   Game Boy / Game Boy Color emulator overlay for Nintendo Switch.
  *
  *   Config: sdmc:/config/ultragb/config.ini  (rom_dir=sdmc:/roms/gb/)
  *   Saves:  sdmc:/config/ultragb/saves/
@@ -10,6 +10,9 @@
  *     A / B / D-pad / + (Start) / - (Select) — mapped to GB buttons
  *     X — pause and return to ROM picker (state preserved)
  *     System overlay combo — hides overlay (game pauses automatically)
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #define NDEBUG
@@ -48,12 +51,18 @@ static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure
 static constexpr size_t PATH_BUFFER_SIZE = 256;
 static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
 static char g_last_rom_path[PATH_BUFFER_SIZE]       = {};   // basename of last-played ROM, persisted to config.ini
-static char g_pending_rom_path[PATH_BUFFER_SIZE]    = {};   // path deferred from click listener → loaded in GBEmulatorGui::createUI()
+static char g_pending_rom_path[PATH_BUFFER_SIZE]    = {};   // path deferred from click listener → loaded in GBOverlayGui::createUI()
 static char g_rom_selector_scroll[PATH_BUFFER_SIZE] = {};  // last ROM the user interacted with in the selector; used to restore scroll on page flip
 static char g_settings_scroll[64]                   = {};  // last focused item label in SettingsGui; cleared on game launch, restored on page flip
 
 
-// Set true by GBEmulatorGui when it exits to RomSelectorGui via X.
+static constexpr const char* NOT_ENOUGH_MEMORY_WARNING = "Not enough memory.";
+static constexpr const char* SLOT_IS_EMPTY_WARNING = "Slot is empty.";
+static constexpr const char* REQUIRES_AT_LEAST_6MB = "Requires at least 6MB.";
+static constexpr const char* REQUIRES_AT_LEAST_8MB = "Requires at least 8MB.";
+static constexpr const char* REQUIRES_AT_LEAST_10MB = "Requires at least 10MB.";
+
+// Set true by GBOverlayGui when it exits to RomSelectorGui via X.
 // RomSelectorGui reads and clears this in its constructor, then blocks all
 // navigation input (and keeps clearing jumpToTop/Bottom/skipUp/skipDown) until every
 // physical key is released — preventing L/R/ZL/ZR presses made in-game from
@@ -86,6 +95,7 @@ static const std::string kKeyWinScale     {"win_scale"};
 static const std::string kKeyWindowedRom  {"windowed_rom"};
 static const std::string kKeyWinQuickExit {"win_quick_exit"};
 static const std::string kKeySettingsScroll{"settings_scroll"};
+static const std::string kKeyPlayerRom    {"overlay_rom"};      // ROM path for -overlay relaunch
 
 // Stack-only integer-to-string for 0–100 volume values.
 // std::to_string heap-allocates; this writes into a caller-supplied char[4] buffer.
@@ -134,6 +144,18 @@ static char g_quick_combo[64] = {};
 // the last played ROM.  KEY_X (overlay) and the hide combo (windowed) then
 // close the overlay entirely instead of returning to the menu.
 static bool g_quick_launch = false;
+
+// Set true by main() when launched with the -overlay argument.
+// Causes loadInitialGui() to skip the ROM selector and boot directly into the
+// last-written overlay_rom (stored in config.ini by launch_overlay_mode()).
+// The overlay combo (launchCombo) closes the overlay entirely; X returns to the
+// ROM selector by relaunching the overlay with -returning.
+static bool g_overlay_mode = false;
+
+// ROM path received via the -overlay argument.
+// Written to config.ini by launch_overlay_mode() and read in
+// Overlay::initServices().  Consumed by loadInitialGui() on first use.
+static char g_overlay_rom_path[PATH_BUFFER_SIZE] = {};
 
 // Set true when a windowed quick-launch is triggered from loadInitialGui().
 // Written to config.ini as "win_quick_exit=1" before the -windowed relaunch so
@@ -331,9 +353,8 @@ static const std::array<std::string, 28> g_defaultCombos = {{
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 static bool combo_pressed(u64 keysDown, u64 keysHeld) {
-    const u64 combo = tsl::cfg::launchCombo;
-    return ((keysDown & combo) != 0) &&
-           (((keysDown | keysHeld) & combo) == combo);
+    return (keysDown & tsl::cfg::launchCombo) && \
+        (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo);
 }
 
 
@@ -428,30 +449,24 @@ static void register_quick_launch_mode() {
     if (!filename || !filename[0]) return;
     if (!ult::isFile(ult::OVERLAYS_INI_FILEPATH)) return;
 
-    auto iniData = ult::getParsedDataFromIniFile(ult::OVERLAYS_INI_FILEPATH);
-    auto& section = iniData[filename];
-
     static constexpr const char* kExpectedArgs   = "(-quicklaunch)";
     static constexpr const char* kExpectedLabels = "(Quick Launch)";
 
-    if (section["mode_args"] != kExpectedArgs) {
-        section["mode_args"]   = kExpectedArgs;
-        section["mode_labels"] = kExpectedLabels;
-        ult::saveIniFileData(ult::OVERLAYS_INI_FILEPATH, iniData);
+    ult::setIniFileValue(ult::OVERLAYS_INI_FILEPATH, filename, "mode_args",   kExpectedArgs);
+    ult::setIniFileValue(ult::OVERLAYS_INI_FILEPATH, filename, "mode_labels", kExpectedLabels);
+
+    g_quick_combo[0] = '\0';
+
+    const std::string mc = ult::parseValueFromIniSection(
+        ult::OVERLAYS_INI_FILEPATH, filename, "mode_combos"
+    );
+
+    const auto comboList = splitIniList(mc);
+    if (!comboList.empty() && !comboList[0].empty()) {
+        strncpy(g_quick_combo, comboList[0].c_str(), sizeof(g_quick_combo) - 1);
+        g_quick_combo[sizeof(g_quick_combo) - 1] = '\0';
     }
 
-    // Refresh g_quick_combo from the stored mode_combos[0].
-    g_quick_combo[0] = '\0';
-    const std::string mc = section["mode_combos"];
-    const auto comboList = splitIniList(mc);
-    if (!comboList.empty() && !comboList[0].empty())
-        strncpy(g_quick_combo, comboList[0].c_str(), sizeof(g_quick_combo) - 1);
-
-    // ── Startup dedup ─────────────────────────────────────────────────────────
-    // Clear our mode combo from every other overlay/package that may have been
-    // assigned it while UltraGB was not running.  skipOwnModeCombos=true so we
-    // don't erase our own overlays.ini entry (nothing re-writes it afterwards).
-    // Our own key_combo IS still checked — a conflicting open-combo is cleared.
     if (g_quick_combo[0])
         remove_quick_combo_from_others(g_quick_combo, /*skipOwnModeCombos=*/true);
 }
@@ -1174,7 +1189,7 @@ static inline void audio_exit_if_enabled() {
 
 // Attempt a windowed relaunch for romPath.  Writes the path to config.ini,
 // calls setNextOverlay, and closes.  Returns false when windowed mode is off.
-static bool launch_windowed(const char* romPath) {
+static bool launch_windowed_mode(const char* romPath) {
     if (!g_windowed_mode || !g_self_path[0]) return false;
 
     skipRumbleDoubleClick = true;
@@ -1194,6 +1209,48 @@ static bool launch_windowed(const char* romPath) {
     }
     tsl::Overlay::get()->close();
     return true;
+}
+
+// =============================================================================
+// launch_overlay_mode — relaunch this overlay with -overlay <romPath>
+//
+// Mirrors launch_windowed_mode() exactly.  Instead of in-process swapTo<GBOverlayGui>
+// (which accumulates menu heap / glyph state), we restart the whole overlay so
+// GBOverlayGui always starts in a pristine process with no residual UI state.
+//
+// Direct-mode callers (g_directMode) relaunch with -quicklaunch so the new
+// process preserves the "combo closes, no ROM selector return" behaviour.
+// Normal callers relaunch with -overlay; pressing launch combo inside the emulator then
+// relaunches with -returning so the ROM selector opens cleanly.
+//
+// If g_self_path is unavailable (shouldn't happen), the call is silently
+// ignored — the config key is still written so the next normal launch picks
+// up the ROM as last_rom and the user can reopen from the selector.
+// =============================================================================
+static void launch_overlay_mode(const char* romPath) {
+    if (!g_self_path[0]) return;  // no self path — can't relaunch; caller ignores
+
+    
+    ult::launchingOverlay.store(true, std::memory_order_release);
+
+    // Persist the ROM path so the relaunched process can read it.
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, romPath, "");
+
+    // Persist the current settings-page scroll position so it survives the
+    // overlay process restart.  The re-launched overlay reads and erases this
+    // transient key in initServices() via the existing -returning path.
+    if (g_settings_scroll[0])
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                             g_settings_scroll, "");
+
+    // In direct mode relaunch as -quicklaunch (combo closes, no selector return).
+    // Otherwise relaunch as -overlay (X returns to selector via -returning).
+    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-overlay");
+    if (g_directMode)
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+
+    skipRumbleDoubleClick = true;
+    tsl::Overlay::get()->close();
 }
 
 // ROM size thresholds — shared by gb_load_rom, rom_is_playable, GameConfigGui.
@@ -1230,16 +1287,16 @@ bool gb_load_rom(const char* path) {
     //
     // Notify the user with an actionable message before touching any state.
     if (ult::limitedMemory && sz >= kROM_2MB && sz < kROM_4MB) {
-        show_notify("Requires at least 6MB.");
+        show_notify(REQUIRES_AT_LEAST_6MB);
         fclose(f); return false;
     }
     // Default (6 MB heap): reject ROMs > 2 MB.
     if (!ult::expandedMemory && sz >= kROM_4MB && sz < kROM_6MB) {
-        show_notify("Requires at least 8MB.");
+        show_notify(REQUIRES_AT_LEAST_8MB);
         fclose(f); return false;
     }
     if (!ult::furtherExpandedMemory && sz >= kROM_6MB) {
-        show_notify("Requires at least 10MB.");
+        show_notify(REQUIRES_AT_LEAST_10MB);
         fclose(f); return false;
     }
 
@@ -1326,7 +1383,7 @@ bool gb_load_rom(const char* path) {
     // detects non-null dma[] pointers and skips re-allocation.
     if (!gb_audio_preinit_dma()) {
         fclose(f);
-        show_notify("Not enough memory.");
+        show_notify(NOT_ENOUGH_MEMORY_WARNING);
         maybe_reload_wallpaper();
         return false;
     }
@@ -1337,7 +1394,7 @@ bool gb_load_rom(const char* path) {
     uint8_t* rom_buf = static_cast<uint8_t*>(malloc(sz));
     if (!rom_buf) {
         fclose(f);
-        show_notify("Not enough memory.");
+        show_notify(NOT_ENOUGH_MEMORY_WARNING);
         maybe_reload_wallpaper();
         return false;
     }
@@ -1359,7 +1416,7 @@ bool gb_load_rom(const char* path) {
     g_gb.gb = static_cast<struct gb_s*>(calloc(1, sizeof(struct gb_s)));
     if (!g_gb.gb) {
         gb_cancel_load();
-        show_notify("Not enough memory.");
+        show_notify(NOT_ENOUGH_MEMORY_WARNING);
         return false;
     }
 
@@ -1472,7 +1529,7 @@ bool gb_load_rom(const char* path) {
     g_gb_fb = static_cast<uint16_t*>(calloc(GB_W * GB_H, sizeof(uint16_t)));
     if (!g_gb_fb) {
         gb_cancel_load();
-        show_notify("Not enough memory.");
+        show_notify(NOT_ENOUGH_MEMORY_WARNING);
         return false;
     }
 
@@ -1484,7 +1541,7 @@ bool gb_load_rom(const char* path) {
     // ── Attempt to restore a previously saved state ───────────────────────────
     // save_state() is called from gb_unload_rom() so every clean unload leaves a
     // .state file.  If it loads successfully the CPU/memory/framebuffer are
-    // restored exactly where the player left off.  On failure (no file, wrong
+    // restored exactly where the overlay left off.  On failure (no file, wrong
     // version, truncated) we fall through to a normal cold boot — no harm done.
     bool apu_restored = false;
     const bool resumed = load_state(g_gb, &apu_restored);
@@ -1595,9 +1652,9 @@ static const char* rom_playability_message(const char* path) {
     //   4 MB heap  (limitedMemory)           — 2 MB+ ROMs blocked; 4 MB+ fall through
     //   6 MB heap  (!expandedMemory)         — 4 MB+ ROMs blocked; 6 MB+ fall through
     //   10 MB+ heap (furtherExpandedMemory)  — all ROMs pass
-    if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return "Requires at least 6MB.";
-    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return "Requires at least 8MB.";
-    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return "Requires at least 10MB.";
+    if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return REQUIRES_AT_LEAST_6MB;
+    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
+    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
     return nullptr;  // playable
 }
 
@@ -1611,8 +1668,8 @@ void gb_set_input(u64 keysHeld) {
     uint8_t joy = 0xFF;
     if (keysHeld & KEY_A)     joy &= ~(1u << 0);
     if (keysHeld & KEY_B)     joy &= ~(1u << 1);
-    if (keysHeld & KEY_MINUS || keysHeld & KEY_Y) joy &= ~(1u << 2);
-    if (keysHeld & KEY_PLUS  || keysHeld & KEY_X)  joy &= ~(1u << 3);
+    if ((keysHeld & KEY_MINUS) || (keysHeld & KEY_Y)) joy &= ~(1u << 2);
+    if ((keysHeld & KEY_PLUS)  || (keysHeld & KEY_X)) joy &= ~(1u << 3);
     if (keysHeld & KEY_RIGHT) joy &= ~(1u << 4);
     if (keysHeld & KEY_LEFT)  joy &= ~(1u << 5);
     if (keysHeld & KEY_UP)    joy &= ~(1u << 6);
@@ -1678,14 +1735,14 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
     }
     cx += renderer->drawString("GB",  false, cx, y, fontSize, tsl::logoColor2).first;
     if (quickModeSymbol && g_directMode)
-        cx += renderer->drawString("\uE08E",  false, cx, y-2, fontSize-5, tsl::inprogressTextColor).first;
+        cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, tsl::onTextColor).first;
     return cx;
 }
 
 // =============================================================================
-// GBScreenElement — drawing only; no input handling (input lives on Gui)
+// GBOverlayElement — drawing only; no input handling (input lives on Gui)
 // =============================================================================
-class GBScreenElement : public tsl::elm::Element {
+class GBOverlayElement : public tsl::elm::Element {
 public:
     virtual void draw(tsl::gfx::Renderer* renderer) override {
         // Zero the footer-button width atomics every frame.
@@ -1959,9 +2016,9 @@ static std::string make_slot_detail_header(int slot, const std::string& name) {
     return buf;
 }
 // =============================================================================
-// GBEmulatorGui — input handled at the Gui level (same pattern as TetrisGui)
+// GBOverlayGui — input handled at the Gui level
 // =============================================================================
-class GBEmulatorGui : public tsl::Gui {
+class GBOverlayGui : public tsl::Gui {
     bool m_waitForRelease = true;  // ignore input until all buttons are released
     u64  m_prevTouchKeys  = 0;     // track previous touch state
     bool m_vp_tap_pending = false; // true while a screen-region tap is in progress
@@ -1980,17 +2037,19 @@ class GBEmulatorGui : public tsl::Gui {
     uint32_t m_zr_first_frame = 0;     // g_frame_count when first press fired
 
 public:
-    ~GBEmulatorGui() {
+    ~GBOverlayGui() {
         if (m_restoreHapticState) {
             ult::useHapticFeedback = false;
             m_restoreHapticState = false;
         }
-        tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
+        //tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
         tsl::disableHiding = false;
     }
 
     virtual tsl::elm::Element* createUI() override {
         tsl::disableHiding = true;
+        // ALWAYS release ult::Audio's audio session in windowed mode.
+        ult::Audio::exit();
         // ── Deferred ROM load ─────────────────────────────────────────────────
         // g_pending_rom_path is set by the click listener instead of calling
         // gb_load_rom() there.  By the time createUI() runs, ~RomSelectorGui()
@@ -2025,7 +2084,7 @@ public:
             // button or fire its rumble / simulation callbacks.
             ult::noClickableItems.store(true, std::memory_order_release);
         }
-        return new GBScreenElement();
+        return new GBOverlayElement();
     }
 
     virtual void update() override {
@@ -2066,22 +2125,26 @@ public:
             m_waitForRelease = false;
         }
 
-        // ── Overlay player mode: Ultrahand launch combo → close ───────────────
-        // In quick-launch (player) mode the Ultrahand show/hide combo closes
+        // ── Overlay overlay mode: Ultrahand launch combo → close ───────────────
+        // In quick-launch (overlay) mode the Ultrahand show/hide combo closes
         // the overlay entirely.  Hiding is disabled in initServices() so the
         // combo never hides — it reaches us here instead, exactly mirroring the
         // combo_pressed() path in GBWindowedGui.
         // gb_audio_pause() before close() matches windowed behaviour.
         // launchComboHasTriggered suppresses Tesla's own directMode double-click
         // so we don't get duplicate exit feedback.
-        if (g_quick_launch || g_directMode) {
-            const u64 combo = tsl::cfg::launchCombo;
-            if (((keysDown & combo) != 0) && (((keysDown | keysHeld) & combo) == combo)) {
+        if (g_quick_launch || g_directMode || g_overlay_mode) {
+            if ((keysDown & tsl::cfg::launchCombo) && (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo)) {
                 g_touch_keys = 0;
                 ult::noClickableItems.store(false, std::memory_order_release);
                 gb_audio_pause();
+    
                 launchComboHasTriggered.store(true, std::memory_order_release);
-                triggerExitFeedback();
+                if (!g_directMode && g_self_path[0]) {
+                    const std::string returnArg = "-returning";
+                    tsl::setNextOverlay(std::string(g_self_path), returnArg);
+                }
+    
                 tsl::Overlay::get()->close();
                 return true;
             }
@@ -2090,25 +2153,39 @@ public:
         // ── Normal mode only: X → back to ROM picker ──────────────────────────
         // Checked before any other work so touch mapping, tap-detector updates,
         // haptic setup, and gb_set_input are all skipped on the exit frame.
-        // In overlay player mode KEY_X is a free button passed to the GB core.
+        // In overlay overlay mode KEY_X is a free button passed to the GB core.
         if (!g_quick_launch && combo_pressed(keysDown, keysHeld)) {
             g_touch_keys = 0;
             ult::noClickableItems.store(false, std::memory_order_release);
-            // Save + unload first, then swap to the ROM selector.
-            gb_unload_rom();  // saves state, writes SRAM, shuts down audio
-
-            if (ult::useSoundEffects && !ult::limitedMemory)
-                ult::Audio::initialize();
 
             triggerExitFeedback();
-            jumpToTop.store(false, std::memory_order_release);
-            jumpToBottom.store(false, std::memory_order_release);
-            skipUp.store(false, std::memory_order_release);
-            skipDown.store(false, std::memory_order_release);
-            // Signal RomSelectorGui to swallow input until all keys are
-            // released — in-game button presses must not fire list jumps.
-            g_waitForInputRelease = true;
-            tsl::swapTo<RomSelectorGui>();
+
+            if (g_overlay_mode && g_self_path[0]) {
+                // Player mode: mirror the windowed combo exit exactly.
+                // Pause audio immediately so output stops before the process winds
+                // down; exitServices() will call gb_unload_rom() (saves state +
+                // SRAM) and gb_audio_free_dma() in the correct teardown order.
+                gb_audio_pause();
+                tsl::setNextOverlay(g_self_path, "-returning");
+                tsl::Overlay::get()->close();
+            } else {
+                // Normal in-process swap: save + unload here because the Overlay
+                // process stays alive and RomSelectorGui needs a clean slate.
+                // exitServices() is NOT called on swapTo, so we do it ourselves.
+                gb_unload_rom();  // saves state, writes SRAM, shuts down audio
+
+                if (ult::useSoundEffects && !ult::limitedMemory)
+                    ult::Audio::initialize();
+
+                jumpToTop.store(false, std::memory_order_release);
+                jumpToBottom.store(false, std::memory_order_release);
+                skipUp.store(false, std::memory_order_release);
+                skipDown.store(false, std::memory_order_release);
+                // Signal RomSelectorGui to swallow input until all keys are
+                // released — in-game button presses must not fire list jumps.
+                g_waitForInputRelease = true;
+                tsl::swapTo<RomSelectorGui>();
+            }
             return true;
         }
 
@@ -2160,7 +2237,7 @@ public:
         // frames (~333 ms).  Requiring keysHeld == KEY_RSTICK during the hold
         // ensures accidental combos (e.g. RS + ZL for system overlay) don't fire.
         {
-            const bool rs_down      = (keysDown & KEY_RSTICK) != 0;
+            const bool rs_down      = (keysDown & KEY_RSTICK);
             const bool rs_held_alone = (keysHeld == KEY_RSTICK);
 
             if (rs_down && !m_rs_tap_pending) {
@@ -2193,8 +2270,8 @@ public:
         // On release: audio resumes and the frame clock is re-anchored so there
         // is no catch-up burst of normal frames after the fast-forward ends.
         {
-            const bool zr_down = (keysDown & KEY_ZR) != 0;
-            const bool zr_held = (keysHeld  & KEY_ZR) != 0;
+            const bool zr_down = (keysDown & KEY_ZR);
+            const bool zr_held = (keysHeld  & KEY_ZR);
 
             if (zr_down) {
                 if (m_zr_first_seen &&
@@ -2339,16 +2416,16 @@ public:
     }
 };
 
-// Deferred normal ROM launch: store path and swap to the emulator Gui.
-// Defined here (after GBEmulatorGui) because swapTo<GBEmulatorGui> requires
-// the complete type.
-static void launch_emulator(const char* romPath) {
-    strncpy(g_pending_rom_path, romPath, sizeof(g_pending_rom_path) - 1);
-    g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-    // Do NOT clear g_settings_scroll here — the user expects to land back on the
-    // same Settings item after X-ing out of the emulator and returning to Settings.
-    tsl::swapTo<GBEmulatorGui>();
-}
+// Deferred normal ROM launch: relaunch this overlay with -overlay so GBOverlayGui
+// always starts in a fresh process (no residual menu heap / glyph state).
+// All three call sites (RomSelectorGui, SlotActionGui, GameConfigGui) use this
+// single entry point — no swapTo<GBOverlayGui> anywhere in normal flow.
+//static void launch_emulator(const char* romPath) {
+//    // Do NOT clear g_settings_scroll here — the user expects to land back on the
+//    // same Settings item after X-ing out of the emulator and returning to Settings.
+//    launch_overlay_mode(romPath);
+//    // tsl::swapTo<GBOverlayGui>(); — replaced by overlay relaunch above.
+//}
 
 // =============================================================================
 // SlotActionGui — Save / Load for a single user save-state slot
@@ -2403,7 +2480,7 @@ public:
         list->addItem(saveItem);
 
         // ── Load ──────────────────────────────────────────────────────────────
-        auto* loadItem = new tsl::elm::ListItem("Load");
+        auto* loadItem = new tsl::elm::SilentListItem("Load");
         loadItem->setClickListener([romPath, slot](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
             
@@ -2412,7 +2489,7 @@ public:
             build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
             if (!file_exists(slotPath)) {
                 triggerWallFeedback();
-                show_notify("Slot is empty.");
+                show_notify(SLOT_IS_EMPTY_WARNING);
                 return true;
             }
             // Copy slot → internal state
@@ -2428,12 +2505,12 @@ public:
             save_last_rom(romPath.c_str());
             // Windowed mode: relaunch self with -windowed so the game runs in
             // the small draggable window, matching what the ROM selector does.
-            if (launch_windowed(romPath.c_str())) {
-                triggerEnterSound.store(true, std::memory_order_release);
+            if (launch_windowed_mode(romPath.c_str())) {
+                //triggerEnterSound.store(true, std::memory_order_release);
                 return true;
             }
-            triggerEnterFeedback();
-            launch_emulator(romPath.c_str());
+            //triggerEnterFeedback();
+            launch_overlay_mode(romPath.c_str());
             return true;
         });
         list->addItem(loadItem);
@@ -2448,7 +2525,7 @@ public:
             build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
             if (!file_exists(slotPath)) {
                 triggerWallFeedback();
-                show_notify("Slot is empty.");
+                show_notify(SLOT_IS_EMPTY_WARNING);
                 return true;
             }
             // Delete the state file and its timestamp
@@ -2547,7 +2624,7 @@ public:
             build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
             if (!file_exists(slotPath)) {
                 triggerWallFeedback();
-                show_notify("Slot is empty.");
+                show_notify(SLOT_IS_EMPTY_WARNING);
                 return true;
             }
             if (!restore_save_data_slot(romPath.c_str(), slot)) {
@@ -2573,7 +2650,7 @@ public:
             char slotPath[PATH_BUFFER_SIZE] = {};
             build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
             if (!file_exists(slotPath)){
-                show_notify("Slot is empty.");
+                show_notify(SLOT_IS_EMPTY_WARNING);
                 triggerWallFeedback();
                 return true;
             }
@@ -2812,7 +2889,7 @@ public:
         list->addItem(saveDataItem);
 
         // ── Reset (cold boot) ─────────────────────────────────────────────
-        auto* resetItem = new tsl::elm::ListItem("Reset");
+        auto* resetItem = new tsl::elm::SilentListItem("Reset");
         resetItem->setClickListener([romPath](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
             
@@ -2829,12 +2906,12 @@ public:
             
             // Windowed mode: relaunch self with -windowed so the game runs in
             // the small draggable window, matching what the ROM selector does.
-            if (launch_windowed(romPath.c_str())) {
-                triggerEnterSound.store(true, std::memory_order_release);
+            if (launch_windowed_mode(romPath.c_str())) {
+                //triggerEnterSound.store(true, std::memory_order_release);
                 return true;
             }
-            triggerEnterFeedback();
-            launch_emulator(romPath.c_str());
+            //triggerEnterFeedback();
+            launch_overlay_mode(romPath.c_str());
             return true;
         });
         list->addItem(resetItem);
@@ -2909,9 +2986,9 @@ public:
             (!ult::expandedMemory && ghostingRomSz >= kROM_2MB) ||
             (ult::expandedMemory && !ult::furtherExpandedMemory && ghostingRomSz >= kROM_4MB);
         const char* ghostingMsg =
-            (ghostingRomSz >= kROM_4MB) ? "Requires at least 10MB." :
-            (ghostingRomSz >= kROM_2MB) ? "Requires at least 8MB."  :
-                                           "Requires at least 6MB.";
+            (ghostingRomSz >= kROM_4MB) ? REQUIRES_AT_LEAST_10MB :
+            (ghostingRomSz >= kROM_2MB) ? REQUIRES_AT_LEAST_8MB  :
+                                           REQUIRES_AT_LEAST_6MB;
 
         if (ghostingLocked) {
             auto* ghost_item = new tsl::elm::ListItem("LCD Ghosting", ult::OFF);
@@ -3390,7 +3467,7 @@ class RomSelectorGui : public tsl::Gui {
     bool m_waitForRelease = false;  // true while we wait for all keys to clear after emulator exit
 public:
     explicit RomSelectorGui(std::string jumpTo = "") : m_jump_to(std::move(jumpTo)) {
-        // If GBEmulatorGui flagged that L/R/ZL/ZR may still be physically held,
+        // If GBOverlayGui flagged that L/R/ZL/ZR may still be physically held,
         // arm the release-gate so handleInput swallows those keys until the
         // controller is clean.
         if (g_waitForInputRelease) {
@@ -3405,7 +3482,7 @@ public:
     // ~UltraGBOverlayFrame deletes m_contentElement (list) →
     // ~List deletes all items.
     //
-    // Note on glyph cache: GBEmulatorGui::createUI() calls
+    // Note on glyph cache: GBOverlayGui::createUI() calls
     // FontManager::clearCache() before the ROM malloc, so no flush is
     // needed here — the cache repopulates automatically when the user
     // returns to this screen.
@@ -3463,8 +3540,7 @@ public:
                 if (inProgress && inProgressLabel.empty())
                     inProgressLabel = name;
 
-                auto* item = new tsl::elm::MiniListItem(
-                    name, inProgress ? ult::INPROGRESS_SYMBOL : "");
+                auto* item = new tsl::elm::SilentListItem(name, inProgress ? ult::INPROGRESS_SYMBOL : "", true);
                 if (!playable)
                     item->setTextColor(tsl::warningTextColor);
 
@@ -3488,8 +3564,8 @@ public:
                     if (!playable) { gb_load_rom(p); return false; }
                     audio_exit_if_enabled();
                     save_last_rom(p);
-                    if (launch_windowed(p)) return true;
-                    launch_emulator(p);
+                    if (launch_windowed_mode(p)) return true;
+                    launch_overlay_mode(p);
 
                     return true;
                 });
@@ -3595,17 +3671,32 @@ public:
         // display and assign a combo to it.  Also refreshes g_quick_combo.
         register_quick_launch_mode();
 
-        // In overlay player mode the Ultrahand launch combo must close the
-        // overlay (not hide it).  Hiding is disabled here so the combo falls
-        // through to our handleInput close() path — exactly as WindowedOverlay
-        // does in its initServices().
-        if (g_quick_launch)
+        // In overlay overlay mode (quick-launch or -overlay relaunch) the Ultrahand
+        // launch combo must close the overlay (not hide it).  Hiding is disabled
+        // here so the combo falls through to our handleInput close() path —
+        // exactly as WindowedOverlay does in its initServices().
+        if (g_quick_launch || g_overlay_mode)
             tsl::disableHiding = true;
+
+        // -overlay relaunch: read the ROM path that launch_overlay_mode() wrote
+        // to config.ini so loadInitialGui() can boot directly into GBOverlayGui.
+        // The key is erased immediately after reading so a cold launch or crash
+        // never accidentally re-plays a stale overlay_rom on the next startup.
+        if (g_overlay_mode) {
+            const std::string pr = ult::parseValueFromIniSection(
+                kConfigFile, kConfigSection, kKeyPlayerRom);
+            if (!pr.empty() && pr.size() < sizeof(g_overlay_rom_path) - 1) {
+                strncpy(g_overlay_rom_path, pr.c_str(), sizeof(g_overlay_rom_path) - 1);
+                g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
+            }
+            if (!pr.empty())
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
+        }
 
         // Restore the settings-page scroll position when returning from windowed
         // mode.  g_returning_from_windowed is set by main() when -returning is
         // present in argv; the transient "settings_scroll" ini key was written by
-        // launch_windowed() immediately before the windowed setNextOverlay call.
+        // launch_windowed_mode() immediately before the windowed setNextOverlay call.
         //
         // The key is always erased here regardless of the return-path flag so
         // that an abnormal windowed exit (process killed by the OS) cannot leave
@@ -3631,7 +3722,7 @@ public:
     }
 
     virtual void exitServices() override {
-        tsl::disableHiding = false;  // restore default; was set true in overlay player mode
+        tsl::disableHiding = false;  // restore default; was set true in overlay overlay mode
         gb_audio_pause();
         gb_unload_rom();   // save state, write SRAM, shut down audio, free ROM buffer
         gb_audio_free_dma();  // release DMA buffers held across sessions (see gb_audio.h)
@@ -3660,6 +3751,28 @@ public:
     }
 
     virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
+        // ── -overlay relaunch: boot directly into GBOverlayGui ───────────────
+        // launch_overlay_mode() wrote the ROM path to config.ini; initServices()
+        // already read it into g_overlay_rom_path and cleared the config key.
+        // Mirrors the normal quick-launch path but always goes through -overlay
+        // (never -quicklaunch) for non-direct entries, so X can return to the
+        // ROM selector via -returning.
+        if (g_overlay_mode && g_overlay_rom_path[0]) {
+            // Guard: bail out cleanly if the ROM cannot be loaded on this tier.
+            if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
+                show_notify(msg);
+                g_overlay_mode = false;
+                return initially<RomSelectorGui>();
+            }
+            // loadWallpaperFileWhenSafe() is normally called by UltraGBOverlayFrame's
+            // constructor; since we bypass that frame here, trigger it explicitly.
+            ult::loadWallpaperFileWhenSafe();
+            strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
+            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+            g_overlay_rom_path[0] = '\0';  // consumed
+            return initially<GBOverlayGui>();
+        }
+
         if (g_quick_launch && g_last_rom_path[0]) {
             // Build full path from dir + basename persisted by save_last_rom().
             // snprintf directly into a stack buffer — no heap std::string needed.
@@ -3694,12 +3807,12 @@ public:
             // Skip the ROM selector and boot directly into the emulator.
             // UltraGBOverlayFrame normally calls loadWallpaperFileWhenSafe() in
             // its constructor; since we bypass that frame, trigger it here so the
-            // wallpaper is available when GBScreenElement draws its first frame.
+            // wallpaper is available when GBOverlayElement draws its first frame.
             ult::loadWallpaperFileWhenSafe();
 
             strncpy(g_pending_rom_path, romPath, sizeof(g_pending_rom_path) - 1);
             g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            return initially<GBEmulatorGui>();
+            return initially<GBOverlayGui>();
         }
 
         return initially<RomSelectorGui>();
@@ -3739,6 +3852,15 @@ int main(int argc, char* argv[]) {
 
         if (strcmp(argv[i], "--direct") == 0) {
             g_directMode = true;
+            skipRumbleDoubleClick = false;
+        }
+
+        // -overlay: relaunch into overlay overlay mode with the ROM path stored in
+        // config.ini under "overlay_rom".  Behaves like -quicklaunch but always
+        // returns to the ROM selector (via -returning relaunch) when X is pressed,
+        // and the overlay combo closes entirely.
+        if (strcmp(argv[i], "-overlay") == 0) {
+            g_overlay_mode = true;
             skipRumbleDoubleClick = false;
         }
 

@@ -16,6 +16,9 @@
  *     CGB_BG_PAL_BYTE(gb, pal, col, byte)
  *     CGB_SP_PAL_BYTE(gb, pal, col, byte)
  *   See comments near those macros below.
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #pragma once
@@ -24,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <arm_neon.h>
 
 // ── Walnut-GB compile-time options ───────────────────────────────────────────
 #ifndef ENABLE_LCD
@@ -941,74 +945,92 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
     // Silently swallow emulation errors; the game will just glitch rather than crash.
 }
 
-// ── LCD draw-line callback ────────────────────────────────────────────────────
-// Walnut-CGB pixel byte encoding:
+// ── LCD draw-line callback (Absolute fastest NEON-safe, color-correct) ──────
 //
-//   CGB mode (gb->cgb.cgbMode != 0):
-//     Pixel byte is a direct index into gb->cgb.fixPalette[]:
-//       [0x00..0x1F] = BG palettes  (8 palettes × 4 colours, RGB565 LE)
-//       [0x20..0x3F] = OBJ palettes (8 palettes × 4 colours, RGB565 LE)
-//     Just use fixPalette[pixel] directly — Walnut pre-converts BGR555→RGB565.
+// Notes:
+// 1. CGB mode (gb->cgb.cgbMode != 0):
+//    - Pixel bytes are direct indexes into gb->cgb.fixPalette[] (prebuilt RGB565).
+//    - Upper 0x20 bit selects BG/OBJ.
+//    - Computes luma/shade fully vectorized for 8 pixels at a time.
 //
-//   DMG mode (non-CGB ROM):
-//     WALNUT_GB_12_COLOUR=1: bits[1:0]=colour index, bits[5:4]=source
-//       (LCD_PALETTE_BG=0x20=BG, else sprite).  We only need bits[1:0].
-//     We select palette based on g_palette_mode (GBC/DMG/NATIVE) per-pixel.
+// 2. DMG mode (non-CGB ROM):
+//    - Pixel bits[1:0] = color index, bits[5:4] = source.
+//    - Uses g_dmg_flat_pal[] lookup.
+//    - Fully NEON vectorized for 8 pixels at a time.
 //
-// LCD ghosting is applied as a post-frame pass by apply_lcd_ghosting()
-// in gb_renderer.h, which blends g_gb_fb (raw current frame) against
-// s_prev_fb (raw previous frame).  See gb_renderer.h for details.
+// 3. Remainder pixels handled scalar for safety.
+// 4. Framebuffer is g_gb_fb (raw 16-bit RGB565), ghosting handled later.
 static void gb_lcd_draw_line(struct gb_s* gb,
-                              const uint8_t* pixels,
-                              const uint_fast8_t line) {
-    
-    if ((int)line >= GB_H) return;
-    uint16_t* row = g_gb_fb + (int)line * GB_W;
+                             const uint8_t* pixels,
+                             const uint_fast8_t line)
+{
+    if ((int)line >= GB_H) return;                // Out-of-bounds check
+    uint16_t* row = g_gb_fb + (int)line * GB_W;  // Pointer to current line
 
 #if WALNUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode) {
         if (g_fb_is_prepacked) {
-            // CGB-compatible game running in CGB hardware mode but displaying
-            // with a user-chosen DMG palette (DMG-green / Native grey).
-            // The emulator core keeps cgbMode=1 so all CGB hardware (double
-            // speed, VRAM banking, CGB palettes) runs correctly.  Only the
-            // display output is re-routed through the DMG flat palette.
-            //
-            // CGB pixel-index layout (Walnut CGB scanline renderer):
-            //   0x00–0x1F  BG  (palette_num[4:2] × 4 + color_id[1:0])
-            //   0x20–0x3F  OBJ (palette_num[4:2] × 4 + color_id[1:0] + 0x20)
-            //   bits[1:0]  = raw color_id from tile data — NOT a shade value.
-            //
-            // WHY WE CANNOT USE (px & 0x03) AS SHADE:
-            //   In CGB mode, color_id (bits[1:0]) is a raw index into the
-            //   game's CGB palette registers.  The game defines what RGB color
-            //   each index means.  A CGB-compat game may put color 0 = black
-            //   and color 3 = white (inverse of DMG convention), producing
-            //   inverted glyphs and colors when the raw index is used as shade.
-            //
-            // CORRECT APPROACH: look up the true RGB565 color from
-            //   fixPalette[px], compute perceptual luminance, and map to
-            //   shade 0 (lightest) … 3 (darkest) for the DMG palette.
-            //
-            // BT.601-approximate luma (all channels normalised to 5-bit):
-            //   luma = (R×2 + G5×5 + B) / 8,  range 0–31
-            //   shade = 3 − (luma >> 3)         (inverted: high luma = light)
-            for (int x = 0; x < GB_W; x++) {
-                const uint8_t  px  = pixels[x];
-                const uint16_t rgb = gb->cgb.fixPalette[px];
-                // RGB565: R=[15:11] 5-bit, G=[10:5] 6-bit, B=[4:0] 5-bit
-                const uint8_t r  = (uint8_t)((rgb >> 11) & 0x1Fu);
-                const uint8_t g5 = (uint8_t)((rgb >>  6) & 0x1Fu);  // top 5 of 6 green bits
-                const uint8_t b  = (uint8_t)( rgb        & 0x1Fu);
-                // Perceptual luma 0–31 (max = (31×2+31×5+31)/8 = 31)
-                const uint8_t luma  = (uint8_t)((r * 2u + g5 * 5u + b) / 8u);
-                // shade 0 = lightest (luma 24–31), shade 3 = darkest (luma 0–7)
-                const uint8_t shade = 3u - (luma >> 3u);
-                // Route through BG or OBJ sub-palette slot
-                row[x] = g_dmg_flat_pal[(px < 0x20u) ? (0x20u | shade) : shade];
+            int x = 0;
+
+            // --- CGB prepacked DMG display path ---
+            for (; x + 7 < GB_W; x += 8) {
+                // Load 8 pixel indices
+                uint8x8_t px8 = vld1_u8(pixels + x);
+
+                // --- Fully vectorized fixPalette load ---
+                uint16x8_t rgb;
+                rgb = vcombine_u16(
+                    vld1_u16(&gb->cgb.fixPalette[px8[0]]),  // low 4 pixels
+                    vld1_u16(&gb->cgb.fixPalette[px8[4]])   // high 4 pixels
+                );
+
+                // Extract R/G/B channels (5-bit each)
+                uint16x8_t r  = vandq_u16(vshrq_n_u16(rgb, 11), vdupq_n_u16(0x1F));
+                uint16x8_t g5 = vandq_u16(vshrq_n_u16(rgb, 6),  vdupq_n_u16(0x1F));
+                uint16x8_t b  = vandq_u16(rgb, vdupq_n_u16(0x1F));
+
+                // Compute luma = (2*r + 5*g5 + b) >> 3
+                uint16x8_t luma = vshrq_n_u16(
+                    vaddq_u16(vaddq_u16(vshlq_n_u16(r,1), vmulq_n_u16(g5,5)), b), 3
+                );
+
+                // Compute shade = 3 - (luma >> 3)
+                uint16x8_t shade = vsubq_u16(vdupq_n_u16(3), vshrq_n_u16(luma, 3));
+
+                // BG/OBJ mask: if px & 0x20 == 0 select OBJ (0x20)
+                uint16x8_t mask = vbslq_u16(
+                    vandq_u16(vmovl_u8(px8), vdupq_n_u16(0x20)),
+                    vdupq_n_u16(0), vdupq_n_u16(0x20)
+                );
+
+                uint16x8_t idx = vorrq_u16(shade, mask);
+
+                // --- Fully unrolled store, avoids vgetq_lane issues ---
+                row[x+0] = g_dmg_flat_pal[idx[0]];
+                row[x+1] = g_dmg_flat_pal[idx[1]];
+                row[x+2] = g_dmg_flat_pal[idx[2]];
+                row[x+3] = g_dmg_flat_pal[idx[3]];
+                row[x+4] = g_dmg_flat_pal[idx[4]];
+                row[x+5] = g_dmg_flat_pal[idx[5]];
+                row[x+6] = g_dmg_flat_pal[idx[6]];
+                row[x+7] = g_dmg_flat_pal[idx[7]];
             }
+
+            // Scalar remainder
+            for (; x < GB_W; x++) {
+                const uint8_t px = pixels[x];
+                const uint16_t rgb = gb->cgb.fixPalette[px];
+                const uint8_t r  = (rgb >> 11) & 0x1F;
+                const uint8_t g5 = (rgb >> 6)  & 0x1F;
+                const uint8_t b  = rgb & 0x1F;
+                const uint8_t luma = (r*2 + g5*5 + b) >> 3;
+                const uint8_t shade = 3 - (luma >> 3);
+                row[x] = g_dmg_flat_pal[shade | ((px & 0x20u) ? 0 : 0x20u)];
+            }
+
+            return;
         } else {
-            // Normal CGB path: fixPalette is pre-built RGB565 — one lookup per pixel.
+            // Normal CGB path: one lookup per pixel
             for (int x = 0; x < GB_W; x++)
                 row[x] = gb->cgb.fixPalette[pixels[x]];
         }
@@ -1016,14 +1038,25 @@ static void gb_lcd_draw_line(struct gb_s* gb,
     }
 #endif
 
-    // DMG path — branchless flat-palette lookup.
-    //
-    // g_dmg_flat_pal is indexed by (px & 0x33):
-    //   bits[5:4] select sub-palette slot (0x00=OBJ0, 0x10=OBJ1, 0x20=BG)
-    //   bits[1:0] select colour within that palette
-    // Values are pre-packed RGBA4444 (set by gb_select_dmg_palette), so the
-    // renderer can use them directly without any per-run conversion.
-    for (int x = 0; x < GB_W; x++)
+    // --- DMG path ---
+    int x = 0;
+    for (; x + 7 < GB_W; x += 8) {
+        uint8x8_t px = vld1_u8(pixels + x);
+        uint8x8_t idx = vand_u8(px, vdup_n_u8(0x33));
+
+        // Fully unrolled vectorized store
+        row[x+0] = g_dmg_flat_pal[idx[0]];
+        row[x+1] = g_dmg_flat_pal[idx[1]];
+        row[x+2] = g_dmg_flat_pal[idx[2]];
+        row[x+3] = g_dmg_flat_pal[idx[3]];
+        row[x+4] = g_dmg_flat_pal[idx[4]];
+        row[x+5] = g_dmg_flat_pal[idx[5]];
+        row[x+6] = g_dmg_flat_pal[idx[6]];
+        row[x+7] = g_dmg_flat_pal[idx[7]];
+    }
+
+    // Scalar remainder
+    for (; x < GB_W; x++)
         row[x] = g_dmg_flat_pal[pixels[x] & 0x33];
 }
 

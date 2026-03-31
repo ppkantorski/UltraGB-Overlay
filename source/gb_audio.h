@@ -56,6 +56,9 @@
  *     audoutAppendAudioOutBuffer is non-blocking (μs inside mutex); the
  *     pre-queued silence frames keep the hardware queue 2-3 deep at all
  *     times.  svcSleepThread(GB_FRAME_NS) is the submission clock.
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #pragma once

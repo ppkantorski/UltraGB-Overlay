@@ -24,6 +24,9 @@
  *
  *   offsetWidthVar for the fixed 448-wide framebuffer:
  *       ((448/2) >> 4) << 3 = 112  (compile-time constant OWV).
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #pragma once
@@ -433,23 +436,15 @@ inline void free_lcd_ghosting() {
     s_prev_fb_valid = false;
 }
 
-// -- GB screen render ---------------------------------------------------------
+// -- GB screen render (Ultimate Switch NEON, fully vectorized, contiguous run detection)
 // Hot path summary per frame:
 //   - Outer loop: 144 GB source rows
 //   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
 //   - Per run: colour conversion fires exactly once (or zero times if IS_PREPACKED)
-//   - Per run x output row: 8x-unrolled scatter-write via setPixelAtOffset
-//
-// Template parameters (both resolved at compile time, zero runtime overhead):
-//   IS565       — true for CGB games (Walnut emits RGB565 via fixPalette)
-//   IS_PREPACKED— true for DMG games: g_gb_fb already holds RGBA4444 values
-//                 pre-baked by gb_select_dmg_palette(); conversion is skipped
-//                 entirely, making the hot loop a pure lookup + scatter-write.
-//
-// When ult::expandedMemory is true, the 144 source rows are split evenly across
-// ult::renderThreads.  Each source row maps to a disjoint set of output rows so
-// there are zero shared writes — no locks needed.
-
+//   - Per run x output row: NEON vector store, 16–32 pixels in one go when possible
+// Template parameters:
+//   IS565       — true for CGB games
+//   IS_PREPACKED— true for DMG games
 template <bool IS565, bool IS_PREPACKED>
 static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
                                         const int sy_start, const int sy_end) {
@@ -458,47 +453,68 @@ static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
         const int oy1 = s_dy1[sy];
         const uint16_t* __restrict__ src = g_gb_fb + sy * GB_W;
 
-        int      run_sx  = 0;
+        int run_sx  = 0;
         uint16_t run_pix = src[0];
 
         for (int sx = 1; sx <= GB_W; ++sx) {
             const uint16_t pix = (sx < GB_W) ? src[sx] : static_cast<uint16_t>(~run_pix);
             if (pix == run_pix) [[likely]] continue;
 
-            // -- Flush run [run_sx, sx) ---------------------------------------
+            // Correct horizontal mapping: exclusive s_dx1
             const int ox0   = s_dx0[run_sx];
             const int ox1   = s_dx1[sx - 1];
             const int run_w = ox1 - ox0;
 
-            // Colour conversion: once per run — dead code per unused branch
+            // Colour conversion: once per run
             uint16_t packed;
             if constexpr (IS_PREPACKED) {
-                packed = run_pix;                   // already RGBA4444 from draw_line
+                packed = run_pix;
             } else if constexpr (IS565) {
-                packed = rgb565_to_packed(run_pix); // CGB: fixPalette → RGB565 → pack
+                packed = rgb565_to_packed(run_pix);
             } else {
-                packed = rgb555_to_packed(run_pix); // DMG non-prepacked fallback
+                packed = rgb555_to_packed(run_pix);
             }
-            const tsl::Color color = *reinterpret_cast<const tsl::Color*>(&packed);
+
+            uint16x8_t vcolor_lo = vdupq_n_u16(packed);
+            uint16x8_t vcolor_hi = vdupq_n_u16(packed);
 
             for (int oy = oy0; oy < oy1; ++oy) {
-                const uint32_t row_base = s_row_lut[oy];
+                // Base framebuffer pointer for this row
+                tsl::Color* framebuffer =
+                    static_cast<tsl::Color*>(renderer->getCurrentFramebuffer()) + s_row_lut[oy];
                 const uint32_t* __restrict__ cl = s_col_lut + ox0;
+
                 int ox = 0;
 
-                // 8x unrolled: independent stores, CPU can pipeline them
-                for (; ox + 7 < run_w; ox += 8) {
-                    renderer->setPixelAtOffset(row_base + cl[ox + 0], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 1], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 2], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 3], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 4], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 5], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 6], color);
-                    renderer->setPixelAtOffset(row_base + cl[ox + 7], color);
+                // --- Contiguous memory path ---
+                if (cl[0] + run_w - 1 == cl[run_w - 1]) {
+                    while (ox + 15 < run_w) {
+                        vst1q_u16(reinterpret_cast<uint16_t*>(framebuffer + cl[ox + 0]), vcolor_lo);
+                        vst1q_u16(reinterpret_cast<uint16_t*>(framebuffer + cl[ox + 8]), vcolor_hi);
+                        ox += 16;
+                    }
+                    // leftover pixels
+                    for (; ox < run_w; ++ox)
+                        framebuffer[cl[ox]] = *reinterpret_cast<tsl::Color*>(&packed);
+
+                } else {
+                    // --- Scattered memory path ---
+                    // 8-pixel unrolled stores
+                    const int limit = run_w & ~7; // largest multiple of 8 ≤ run_w
+                    for (; ox < limit; ox += 8) {
+                        framebuffer[cl[ox + 0]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 1]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 2]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 3]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 4]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 5]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 6]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        framebuffer[cl[ox + 7]] = *reinterpret_cast<tsl::Color*>(&packed);
+                    }
+                    // leftover pixels
+                    for (; ox < run_w; ++ox)
+                        framebuffer[cl[ox]] = *reinterpret_cast<tsl::Color*>(&packed);
                 }
-                for (; ox < run_w; ++ox)
-                    renderer->setPixelAtOffset(row_base + cl[ox], color);
             }
 
             run_sx  = sx;

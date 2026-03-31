@@ -30,6 +30,9 @@
  *   Instance-level dirty-flag caching (m_footerDirty) avoids rebuilding the
  *   footer string and re-measuring the page-label width every frame; those
  *   values only change when setPageNames() is called.
+ * 
+ *  Licensed under both GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #pragma once

@@ -46,12 +46,16 @@
  *   Included at the bottom of main.cpp, after all globals and helpers are
  *   fully defined.  g_win_scale must be declared in main.cpp before this
  *   header is included.
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
 #pragma once
 
 #include <cstring>
 #include <algorithm>
+
 // gb_renderer.h (rgb555_to_packed, rgb565_to_packed) is already included above.
 
 // ── Swizzle LUTs for the scaled framebuffer ───────────────────────────────────
@@ -118,7 +122,7 @@ static void init_win_luts(int scale) {
 // GBWindowedElement
 // Blits the GB framebuffer (160×144) into the scaled Tesla framebuffer via LUTs.
 // For scale N: each source pixel writes N×N destination framebuffer pixels.
-// Also drives the emulation clock (mirrors GBScreenElement::draw exactly).
+// Also drives the emulation clock (mirrors GBOverlayElement::draw exactly).
 // This is a leaf element — no children, no focus, no touch.
 // =============================================================================
 class GBWindowedElement : public tsl::elm::Element {
@@ -545,8 +549,8 @@ public:
         // Releasing ZR while pass-through is on still clears fast-forward
         // because zr_held will be false in that state.
         {
-            const bool zr_down = !m_pass_through && (keysDown & KEY_ZR) != 0;
-            const bool zr_held = !m_pass_through && (keysHeld  & KEY_ZR) != 0;
+            const bool zr_down = !m_pass_through && (keysDown & KEY_ZR);
+            const bool zr_held = !m_pass_through && (keysHeld & KEY_ZR);
             if (zr_down) {
                 if (m_zr_first_seen &&
                     (g_frame_count - m_zr_first_frame) <= static_cast<uint32_t>(ZR_DCLICK_WINDOW)) {
@@ -589,8 +593,8 @@ public:
         // so the Switch routes controller input natively to whatever app/game is
         // running underneath.  requestForeground(true) reclaims it.
         {
-            const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT))) != 0;
-            const bool zl_held = ((keysHeld & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT))) != 0;
+            const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
+            const bool zl_held = ((keysHeld & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
 
             if (zl_down) {
                 if (m_zl_first_seen &&
@@ -639,8 +643,8 @@ public:
         // and restarts in windowed mode; the current game state is saved
         // automatically via exitServices() → gb_unload_rom().
         if (!m_pass_through && !m_dragging && !m_plus_dragging) {
-            const bool rstick = (keysDown & KEY_RSTICK && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK)) != 0;
-            const bool lstick = (keysDown & KEY_LSTICK && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK)) != 0;
+            const bool rstick = (keysDown & KEY_RSTICK && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK));
+            const bool lstick = (keysDown & KEY_LSTICK && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK));
             if (rstick || lstick) {
                 const bool limitedMem =
                     (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
@@ -817,17 +821,23 @@ public:
                 if (m_plus_dragging) {
                     // Move the window with the left stick.
                     // x^8 sensitivity curve: stays fine at low deflection, accelerates near full.
-                    if (std::abs(leftJoy.x) > JOY_DEADZONE
-                        || std::abs(leftJoy.y) > JOY_DEADZONE) {
-                        const float mag  = sqrtf(
-                            static_cast<float>(leftJoy.x) * static_cast<float>(leftJoy.x)
-                            + static_cast<float>(leftJoy.y) * static_cast<float>(leftJoy.y));
-                        const float norm  = mag / 32767.f;
-                        const float curve = powf(norm, 8.f);
+                    if (std::abs(leftJoy.x) > JOY_DEADZONE || std::abs(leftJoy.y) > JOY_DEADZONE) {
+                        const float fx = static_cast<float>(leftJoy.x);
+                        const float fy = static_cast<float>(leftJoy.y);
+                
+                        // magnitude without sqrtf
+                        const float mag2 = fx*fx + fy*fy; // squared magnitude
+                        const float norm = mag2 / (32767.f*32767.f); // normalized squared
+                
+                        // x^8 curve without powf
+                        const float curve2 = norm * norm;      // ^2
+                        const float curve4 = curve2 * curve2;  // ^4
+                        const float curve8 = curve4 * curve4;  // ^8
+                
                         static constexpr float BASE_SENS = 0.00008f;
                         static constexpr float MAX_SENS  = 0.0005f;
-                        const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve;
-
+                        const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve8;
+                
                         // Delta-time scaling: sens values are tuned for 60 fps.
                         // Multiply by (actual_dt * 60) so the real-world velocity
                         // is constant regardless of frame rate — at 60 fps the factor
@@ -838,21 +848,20 @@ public:
                         // spurious spikes (first frame, timer hiccup, etc.).
                         const uint64_t now_ns = ult::nowNs();
                         if (m_joy_last_ns == 0) m_joy_last_ns = now_ns;
-                        const float dt_ns  = static_cast<float>(now_ns - m_joy_last_ns);
-                        const float dt_factor = std::max(0.25f,
-                                                std::min(4.0f, dt_ns * (60.0f / 1e9f)));
+                        const float dt_ns = static_cast<float>(now_ns - m_joy_last_ns);
+                        const float dt_factor = std::max(0.25f, std::min(4.0f, dt_ns * (60.0f / 1e9f)));
                         m_joy_last_ns = now_ns;
-
+                
                         // Accumulate fractional VI-space movement; Y axis is inverted
                         // (stick up → negative y → window moves up).
-                        m_joy_acc_x +=  static_cast<float>(leftJoy.x) * sens * dt_factor;
-                        m_joy_acc_y += -static_cast<float>(leftJoy.y) * sens * dt_factor;
-
+                        m_joy_acc_x += fx * sens * dt_factor;
+                        m_joy_acc_y += -fy * sens * dt_factor;
+                
                         const int dx = static_cast<int>(m_joy_acc_x);
                         const int dy = static_cast<int>(m_joy_acc_y);
                         m_joy_acc_x -= static_cast<float>(dx);
                         m_joy_acc_y -= static_cast<float>(dy);
-
+                
                         const int nx = std::max(0, std::min(vi_max_x(), g_win_pos_x + dx));
                         const int ny = std::max(0, std::min(vi_max_y(), g_win_pos_y + dy));
                         if (nx != g_win_pos_x || ny != g_win_pos_y) {
