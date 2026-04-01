@@ -8444,7 +8444,7 @@ void gb_init_lcd(struct gb_s *gb,
 
 	gb->direct.interlace = false;
 	gb->direct.no_sprite_limit = true;
-	gb->direct.no_obj_priority = true;
+	gb->direct.no_obj_priority = false;
 	gb->display.interlace_count = false;
 	gb->direct.frame_skip = false;
 	gb->display.frame_skip_count = false;
