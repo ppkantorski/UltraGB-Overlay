@@ -8,7 +8,7 @@
  *   RENDER THREAD (draw())
  *   ┌─────────────────────────────────────────────┐
  *   │ gb_run_frame()                              │
- *   │   └─ peanut_gb calls audio_write(addr,val) │  ← SPSC enqueue only (~5 ns)
+ *   │   └─ walnut_cgb calls audio_write(addr,val) │  ← SPSC enqueue only (~5 ns)
  *   │ gb_audio_submit()  [no-op]                  │
  *   │ render pixels                               │
  *   └─────────────────────────────────────────────┘
@@ -392,6 +392,10 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     float lv = static_cast<float>(((cached_nr50 >> 4) & 7) + 1);
     float rv = static_cast<float>(( cached_nr50        & 7) + 1);
 
+    // Hoist NR51 panning out of the per-sample loop.
+    // NR51 also rarely changes mid-frame, so cache it exactly like NR50.
+    uint8_t cached_nr51 = a.nr51;
+
     for (uint32_t i=0; i<n_samp; ++i) {
         // ── Cycle-accurate event distribution ────────────────────────────────
         // Apply every event whose T-cycle timestamp maps to sample index <= i.
@@ -410,6 +414,12 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             rv = static_cast<float>(( cached_nr50        & 7) + 1);
         }
 
+        // NR51 panning — update cached byte only when NR51 actually changed
+        // (covers the rare mid-frame NR51 write injected by the event loop above).
+        if (__builtin_expect(a.nr51 != cached_nr51, 0)) {
+            cached_nr51 = a.nr51;
+        }
+
         a.cycle_frac+=STEP;
         const int cyc=static_cast<int>(a.cycle_frac>>16);
         a.cycle_frac&=0xFFFFu;
@@ -421,7 +431,7 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.seq_cycles-=GB_SEQ_CYC;
             const int s=a.seq_step;
             if((s&1)==0){
-                auto tl=[](bool&en,bool le,int&lt){if(le&&lt>0&&--lt==0)en=false;};
+                auto tl=[](bool&en,bool le,int& lt){if(le&&lt>0&&--lt==0)en=false;};
                 tl(a.ch1.enabled,a.ch1.len_en,a.ch1.len_timer);
                 tl(a.ch2.enabled,a.ch2.len_en,a.ch2.len_timer);
                 tl(a.ch3.enabled,a.ch3.len_en,a.ch3.len_timer);
@@ -580,10 +590,11 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
 
         // ── NR51 panning + NR50 volume ────────────────────────────────────────
         float ls=0.0f,rs=0.0f;
-        if(a.nr51&0x10u){ls+=d1;} if(a.nr51&0x01u){rs+=d1;}
-        if(a.nr51&0x20u){ls+=d2;} if(a.nr51&0x02u){rs+=d2;}
-        if(a.nr51&0x40u){ls+=d3;} if(a.nr51&0x04u){rs+=d3;}
-        if(a.nr51&0x80u){ls+=d4;} if(a.nr51&0x08u){rs+=d4;}
+        const uint8_t nr51 = cached_nr51;
+        if(nr51&0x10u){ls+=d1;} if(nr51&0x01u){rs+=d1;}
+        if(nr51&0x20u){ls+=d2;} if(nr51&0x02u){rs+=d2;}
+        if(nr51&0x40u){ls+=d3;} if(nr51&0x04u){rs+=d3;}
+        if(nr51&0x80u){ls+=d4;} if(nr51&0x08u){rs+=d4;}
         ls*=lv; rs*=rv;
 
         // ── Scale, clamp, write ──────────────────────────────────────────────
