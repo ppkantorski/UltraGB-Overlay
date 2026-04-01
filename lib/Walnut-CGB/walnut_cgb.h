@@ -850,9 +850,9 @@ struct gb_s
 		 * Mode 2 and are read back at Mode 3 draw time. */
 #if WALNUT_GB_HIGH_LCD_ACCURACY
 		uint8_t oam_scan_count;
-		uint8_t oam_scan_sprites[10]; /* OAM indices 0-39, latched at Mode 2 */
-		uint8_t oam_scan_ox[10];      /* X snapshot — used for DMG sort and render */
-		uint8_t oam_scan_oy[10];      /* Y snapshot — used for py row calculation */
+		uint8_t oam_scan_sprites[NUM_SPRITES]; /* OAM indices 0-39, latched at Mode 2 */
+		uint8_t oam_scan_ox[NUM_SPRITES];      /* X snapshot — used for DMG sort and render */
+		uint8_t oam_scan_oy[NUM_SPRITES];      /* Y snapshot — used for py row calculation */
 #endif
 	} display;
 
@@ -895,6 +895,11 @@ struct gb_s
 		 */
 		bool interlace : 1;
 		bool frame_skip : 1;
+		/* Enhancement flags — default false (calloc-zeroed).
+		 * Initialized to true in gb_init_lcd for visual correctness.
+		 * Set to false after gb_init_lcd to restore hardware-accurate behaviour. */
+		bool no_sprite_limit : 1; /* Lift 10-sprite-per-scanline hardware cap */
+		bool no_obj_priority : 1; /* Sprites always draw above BG (ignore OBJ_PRIORITY / pixelsPrio) */
 
 		union
 		{
@@ -2921,7 +2926,7 @@ static inline void __gb_oam_scan(struct gb_s *gb)
 		const uint8_t oy = gb->oam[4 * s];
 		if(ly + (big ? 0u : 8u) >= oy || ly + 16u < oy)
 			continue;
-		if(count >= MAX_SPRITES_LINE)
+		if(count >= MAX_SPRITES_LINE && !gb->direct.no_sprite_limit)
 			break;
 		gb->display.oam_scan_sprites[count] = s;
 		gb->display.oam_scan_ox[count]      = gb->oam[4 * s + 1];
@@ -3352,7 +3357,7 @@ void __gb_draw_line(struct gb_s *gb)
 		 * appear on scanlines they should not be on, consuming per-line
 		 * slots and flickering unrelated sprites off screen. */
 		uint8_t number_of_sprites = gb->display.oam_scan_count;
-		struct sprite_data sprites_to_render[MAX_SPRITES_LINE + 1];
+		struct sprite_data sprites_to_render[NUM_SPRITES + 1];
 		for(uint8_t i = 0; i < number_of_sprites; i++)
 		{
 			sprites_to_render[i].sprite_number = gb->display.oam_scan_sprites[i];
@@ -3491,19 +3496,24 @@ void __gb_draw_line(struct gb_s *gb)
 					uint8_t bgColorIdx = bgColors[disp_x] & 0x3;
 					uint8_t isBackgroundDisabled = c && !(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE);
 					uint8_t isPixelPriorityNonConflicting = c &&
-															!(pixelsPrio[disp_x] && bgColorIdx) &&
-															!((OF & OBJ_PRIORITY) && bgColorIdx);
+															!(!gb->direct.no_obj_priority && pixelsPrio[disp_x] && bgColorIdx) &&
+															!(!gb->direct.no_obj_priority && (OF & OBJ_PRIORITY) && bgColorIdx);
 
 					if(isBackgroundDisabled || isPixelPriorityNonConflicting)
 					{
 						/* Set pixel colour. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;  // add 0x20 to differentiate from BG
 					}
-					else if(c)
+					else if(c && !gb->direct.no_obj_priority)
 					{
 						/* This sprite defers to BG. Restore the original BG pixel so
 						 * any lower-priority sprite that already drew here is evicted. */
 						pixels[disp_x] = bgColors[disp_x];
+					}
+					else if(c)
+					{
+						/* no_obj_priority=true: sprite wins unconditionally. */
+						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;
 					}
 				}
 				else
@@ -3530,7 +3540,7 @@ void __gb_draw_line(struct gb_s *gb)
 				 *      (set during BG/window tile rendering).  Extract it with
 				 *      (bgColors[disp_x] >> 2) & 0x3.  Zero = BG colour 0
 				 *      (transparent on real HW), non-zero = opaque BG. */
-				if(c && !((OF & OBJ_PRIORITY) && ((bgColors[disp_x] >> 2) & 0x3)))
+				if(c && (gb->direct.no_obj_priority || !((OF & OBJ_PRIORITY) && ((bgColors[disp_x] >> 2) & 0x3))))
 				{
 					/* Set pixel colour. */
 					pixels[disp_x] = (OF & OBJ_PALETTE)
@@ -3545,7 +3555,7 @@ void __gb_draw_line(struct gb_s *gb)
 					pixels[disp_x] &= ~LCD_PALETTE_BG;
 #endif
 				}
-				else if(c)
+				else if(c && !gb->direct.no_obj_priority)
 				{
 					/* FIX (DMG missing BG-restore):
 					 *
@@ -8433,6 +8443,8 @@ void gb_init_lcd(struct gb_s *gb,
 	gb->display.lcd_draw_line = lcd_draw_line;
 
 	gb->direct.interlace = false;
+	gb->direct.no_sprite_limit = true;
+	gb->direct.no_obj_priority = true;
 	gb->display.interlace_count = false;
 	gb->direct.frame_skip = false;
 	gb->display.frame_skip_count = false;
