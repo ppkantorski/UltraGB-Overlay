@@ -2944,6 +2944,27 @@ static inline void __gb_oam_scan(struct gb_s *gb)
 #endif /* WALNUT_GB_HIGH_LCD_ACCURACY */
 
 
+// ── LCD ghosting: per-OAM-entry visibility tracking ──────────────────────────
+// Written by __gb_draw_line, read and updated by apply_lcd_ghosting()
+// (gb_renderer.h).  All three uint8/bool arrays fit in one cache line.
+//
+//   s_sprite_rendered_curr[s] — true if OAM entry s wrote a visible (non-
+//     transparent, priority-winning) pixel to ANY scanline this frame.
+//   s_sprite_rendered_prev[s] — same for the previous frame.
+//   s_sprite_flicker_cnt[s]   — how many consecutive frames the rendered
+//     state has alternated (true→false→true or false→true→false).
+//     When ≥ 1 the sprite is classified as a 30Hz transparency sprite.
+//
+//   s_flicker_pixel_curr / s_flicker_pixel_prev — per-pixel (LCD_W×LCD_H)
+//     byte arrays: 1 where a confirmed-flickering sprite drew that pixel
+//     this frame / last frame.  Allocated lazily alongside s_prev_fb; both
+//     pointers live here so __gb_draw_line can write to them directly.
+static bool    s_sprite_rendered_curr[NUM_SPRITES] = {};
+static bool    s_sprite_rendered_prev[NUM_SPRITES] = {};
+static uint8_t s_sprite_flicker_cnt[NUM_SPRITES]   = {};
+static uint8_t* s_flicker_pixel_curr = nullptr;   // LCD_HEIGHT*LCD_WIDTH heap bytes
+static uint8_t* s_flicker_pixel_prev = nullptr;   // LCD_HEIGHT*LCD_WIDTH heap bytes — carries ON-frame flag to OFF frame
+
 void __gb_draw_line(struct gb_s *gb)
 {
 	uint8_t pixels[160] = {0};
@@ -3503,6 +3524,11 @@ void __gb_draw_line(struct gb_s *gb)
 					{
 						/* Set pixel colour. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;  // add 0x20 to differentiate from BG
+						/* Ghosting: track sprite visibility and mark flicker pixels. */
+						s_sprite_rendered_curr[s] = true;
+						if (s_flicker_pixel_curr) {
+						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
+						}
 					}
 					else if(c && !gb->direct.no_obj_priority)
 					{
@@ -3514,6 +3540,11 @@ void __gb_draw_line(struct gb_s *gb)
 					{
 						/* no_obj_priority=true: sprite wins unconditionally. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;
+						/* Ghosting: track sprite visibility and mark flicker pixels. */
+						s_sprite_rendered_curr[s] = true;
+						if (s_flicker_pixel_curr) {
+						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
+						}
 					}
 				}
 				else
@@ -3554,6 +3585,11 @@ void __gb_draw_line(struct gb_s *gb)
 					/* Deselect BG palette. */
 					pixels[disp_x] &= ~LCD_PALETTE_BG;
 #endif
+					/* Ghosting: track sprite visibility and mark flicker pixels. */
+					s_sprite_rendered_curr[s] = true;
+					if (s_flicker_pixel_curr) {
+					    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
+					}
 				}
 				else if(c && !gb->direct.no_obj_priority)
 				{
@@ -3574,7 +3610,7 @@ void __gb_draw_line(struct gb_s *gb)
 					 *   - "pixels appearing above character heads" (low-priority
 					 *     sprite at wrong Y bleeding through BG-deferred position)
 					 *   - Sprite fragments appearing at incorrect screen positions
-					 *   - Corrupted glyph rendering in DKL2, Test Drive Le Mans
+					 *   - Corrupted glyph rendering in DKL2 (not fixed actually), Test Drive Le Mans
 					 *
 					 * bgColors[disp_x] holds the full encoded BG pixel
 					 * (bg_palette[c] | (c<<2) | LCD_PALETTE_BG) captured before
