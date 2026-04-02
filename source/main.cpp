@@ -87,6 +87,7 @@ static const std::string kKeyLastRom      {"last_rom"};
 static const std::string kKeyVolume       {"volume"};
 static const std::string kKeyVolBackup    {"vol_backup"};
 static const std::string kKeyOverlay      {"overlay"};
+static const std::string kKeyLcdGrid      {"lcd_grid"};
 static const std::string kKeyWindowed     {"windowed"};
 static const std::string kKeyIngameHaptics{"ingame_haptics"};
 static const std::string kKeyIngameWallpaper{"ingame_wallpaper"};
@@ -186,12 +187,13 @@ static void save_vol_backup() {
                          vol_to_str(g_vol_backup, buf), "");
 }
 
-// Parse "1"/"2"/"3"/"4" win_scale string → int; anything else → 1.
-// Avoids duplicating the identical 4-branch if/else at three sites in main().
+// Parse "1"/"2"/"3"/"4"/"5" win_scale string → int; anything else → 1.
+// Avoids duplicating the identical 5-branch if/else at three sites in main().
 static int parse_win_scale_str(const std::string& sv) {
-    if (sv == "2") return 2;
-    if (sv == "3") return 3;
+    if (sv == "5") return 5;
     if (sv == "4") return 4;
+    if (sv == "3") return 3;
+    if (sv == "2") return 2;
     return 1;
 }
 
@@ -260,6 +262,11 @@ static void load_config() {
     if (!ovl_val.empty())
         g_vp_2x = (ovl_val == "1");
 
+    // lcd_grid — 0 = off (default), 1 = LCD grid effect enabled
+    const std::string grid_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyLcdGrid);
+    if (!grid_val.empty())
+        g_lcd_grid = (grid_val == "1");
+
     // windowed — 0 = normal (default), 1 = windowed mode
     const std::string win_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyWindowed);
     if (!win_val.empty())
@@ -278,14 +285,18 @@ static void load_config() {
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosX), v)) g_win_pos_x = v;
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosY), v)) g_win_pos_y = v; }
 
-    // win_scale — windowed display scale: 1, 2, 3, or 4 (default 1).
+    // win_scale — windowed display scale: 1, 2, 3, 4, or 5 (default 1).
     // Any absent or unrecognised value falls back to 1.
     // Config value is never overwritten here; stored values are preserved for round-trip.
     g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinScale));
 
-    // Clamp to the memory limit (4× unavailable on 4 MB heap).
-    if (ult::limitedMemory && g_win_scale == 4)
+    // Clamp to the memory limit.
+    // 4 MB heap: max 3× (4× requires at least 6 MB).
+    // 6 MB / 8 MB heap: max 4× (5× requires at least 10 MB).
+    if (ult::limitedMemory && g_win_scale >= 4)
         g_win_scale = 3;
+    if (!ult::limitedMemory && !ult::expandedMemory && g_win_scale >= 5)
+        g_win_scale = 4;
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -303,6 +314,7 @@ static void write_default_config_if_missing() {
     set_if_missing("vol_backup",    "50");
     set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
+    set_if_missing("lcd_grid",      "0");
     set_if_missing("ingame_haptics", "1");
     set_if_missing("ingame_wallpaper", "0");
     set_if_missing("win_pos_x",     "840");
@@ -324,6 +336,12 @@ static void save_overlay_scale() {
                          g_vp_2x ? "1" : "0", "");
 }
 
+// Persist the LCD grid toggle to config.ini.
+static void save_lcd_grid() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyLcdGrid,
+                         g_lcd_grid ? "1" : "0", "");
+}
+
 // Persist the windowed mode toggle to config.ini.
 static void save_windowed_mode() {
     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowed,
@@ -343,7 +361,8 @@ static void save_win_pos() {
 // The new scale takes effect the next time the user launches a ROM in
 // windowed mode (setNextOverlay reads it before Tesla initialises the layer).
 static void save_win_scale() {
-    const char* s = (g_win_scale == 4) ? "4"
+    const char* s = (g_win_scale == 5) ? "5"
+                  : (g_win_scale == 4) ? "4"
                   : (g_win_scale == 3) ? "3"
                   : (g_win_scale == 2) ? "2"
                   :                      "1";
@@ -619,6 +638,7 @@ bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_ro
 bool g_fb_is_prepacked        = false;  // true when g_gb_fb stores RGBA4444 (DMG games)
 bool g_vp_2x                  = false;  // false=2.5× (default), true=2× pixel-perfect
 bool g_lcd_ghosting           = false;  // 50/50 frame blend — simulates GBC LCD persistence; per-game, off by default
+bool g_lcd_grid               = false;  // LCD grid overlay — darkens inter-pixel gaps to simulate real GB Color LCD
 bool g_fast_forward           = false;  // true while ZR double-click-hold is active
 
 // Monotonically incrementing display-frame counter used for double-click timing.
@@ -2521,11 +2541,11 @@ public:
         // Capped at 3× on 4 MB heap sessions.  Takes effect on the next
         // windowed launch (framebuffer is sized before Tesla initialises).
         {
-            const int maxScale = ult::limitedMemory ? 3 : 4;
+            const int maxScale = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : 5);
 
             auto make_label = [maxScale]() -> std::string {
                 const int s = std::min(g_win_scale, maxScale);
-                static const char* lbs[] = { "1x", "2x", "3x", "4x" };
+                static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x"};
                 return lbs[s - 1];
             };
 
@@ -2559,6 +2579,26 @@ public:
                 return true;
             });
             list->addItem(scale_item);
+        }
+
+        // ── LCD Grid ──────────────────────────────────────────────────────────
+        // Simulates the dark inter-pixel gap of a real Game Boy Color LCD by
+        // dimming the last row and column of each scaled source-pixel block to
+        // ~12.5 % brightness, leaving a visible "grid" between lit cells.
+        //
+        // Applies to both the overlay renderer (post-pass over the viewport) and
+        // the windowed renderer (inline in the blit via a compile-time template).
+        // Automatically has no visible effect at windowed 1× scale (each GB
+        // pixel is a single framebuffer pixel — no room for a gap); the flag is
+        // still persisted so it activates as soon as the user scales up.
+        {
+            auto* grid_item = new tsl::elm::ToggleListItem(
+                "LCD Grid", g_lcd_grid, ult::ON, ult::OFF);
+            grid_item->setStateChangedListener([](bool state) {
+                g_lcd_grid = state;
+                save_lcd_grid();
+            });
+            list->addItem(grid_item);
         }
 
         
@@ -3217,6 +3257,12 @@ int main(int argc, char* argv[]) {
     // a windowed launch — tsl::loop<Overlay> runs normally — but Overlay::
     // initServices() needs to know it should restore the persisted settings
     // scroll position from config.ini rather than starting fresh.
+    
+    const auto currentHeapSize    = ult::getCurrentHeapSize();
+    const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
+    const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+    const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-returning") == 0) {
             g_returning_from_windowed = true;
@@ -3239,7 +3285,6 @@ int main(int argc, char* argv[]) {
 
         if (strcmp(argv[i], "-quicklaunch") == 0) {
             g_quick_launch = true;
-
 
             // ── Windowed quick-launch fast path ───────────────────────────────
             // When windowed mode is configured and a last-played ROM is saved,
@@ -3273,10 +3318,6 @@ int main(int argc, char* argv[]) {
                     // launch, causing the brief menu flash before windowed starts.
                     // Use getCurrentHeapSize() directly instead — it queries the
                     // real heap tier before Tesla initialises.
-                    const auto currentHeapSize    = ult::getCurrentHeapSize();
-                    const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
-                    const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
-                    const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
                     {
                         const size_t rsz = get_rom_size(fullPath.c_str());
                         const bool tooLarge = rsz > 0 &&
@@ -3287,11 +3328,13 @@ int main(int argc, char* argv[]) {
                             goto normal_overlay_launch;
                     }
 
-                    // Read win_scale with the same early-limited-memory clamp
+                    // Read win_scale with the same early-memory clamps
                     // used in the -windowed block below.
                     {
                     g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
-                        if (earlyLimited && g_win_scale == 4) g_win_scale = 3;
+                        if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
+                        if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
+                        //if (earlyExpanded      && g_win_scale >= 5) g_win_scale = 5;
                     }
 
                     // Write to config so WindowedOverlay::initServices() picks
@@ -3318,13 +3361,13 @@ int main(int argc, char* argv[]) {
                     kConfigFile, kConfigSection, kKeyWinScale));
 
                 // Mirror Tesla's heap check (tsl::loop does the same at startup).
-                // If we are on a 4 MB heap and the saved scale is 4×, clamp it
-                // to 3× now — before the VI layer is sized — but do NOT save,
-                // so switching back to a normal-memory session restores 4×.
-                const bool earlyLimitedMemory =
-                    (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
-                if (earlyLimitedMemory && g_win_scale == 4)
-                    g_win_scale = 3;  // runtime clamp only — config keeps "4"
+                // Clamp scale to the maximum allowed for this heap tier — but do
+                // NOT save, so switching to a higher-memory session restores it.
+                // 4 MB: max 3×   6 MB / 8 MB: max 4×   10 MB: max 5×
+
+                if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
+                if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
+                //if (earlyExpanded      && g_win_scale >= 5) g_win_scale = 5;
             }
             ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
             ult::DefaultFramebufferHeight = GB_H * g_win_scale;

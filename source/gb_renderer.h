@@ -197,243 +197,250 @@ inline void set_vp_scale(const bool want_2x) {
     s_coord_ready = false;
 }
 
-// -- LCD ghosting (frame blend) -----------------------------------------------
-// Simulates GBC LCD phosphor persistence: pixels that toggle on/off at 30 Hz
-// appear semi-transparent instead of flickering.  Games like Link's Awakening
-// deliberately use this — Chain Chomp's chain alternates every frame expecting
-// the LCD to average it into a translucent ghost.
+// -- LCD grid effect ----------------------------------------------------------
+// When enabled, darkens the last destination row and column of each GB source
+// pixel's scaled block, simulating the dark sub-pixel gap of a real Game Boy
+// Color LCD screen.
 //
-// Problem with naïve 50/50 blend: it blurs moving characters and causes
-// sprite "doubling" — a 1-bit flicker flag triggers on the frame a sprite
-// LEAVES a pixel (change #2), blending old position with new background.
+// g_lcd_grid is defined in main.cpp; declared extern here so gb_windowed.hpp
+// (which includes this header) can share the same flag.
+
+extern bool g_lcd_grid;  // false = off (default), true = show LCD grid
+
+// Dim a packed RGBA4444 pixel to ~75 % brightness, alpha kept.
+// Each RGB channel is reduced by one quarter: new = ch - (ch >> 2).
+// This sits in the sweet spot where the grid line is visibly darker than the
+// lit cell but the underlying colour still reads clearly — comparable to the
+// GBC LCD gap tint.  No inter-field carry: each channel is extracted before
+// the arithmetic.
+static inline uint16_t dim_packed_grid(const uint16_t p) {
+    const uint16_t r = (p      ) & 0xFu;
+    const uint16_t g = (p >>  4) & 0xFu;
+    const uint16_t b = (p >>  8) & 0xFu;
+    return static_cast<uint16_t>(
+        (p & 0xF000u)
+        | ((b - (b >> 2u)) << 8u)
+        | ((g - (g >> 2u)) << 4u)
+        |  (r - (r >> 2u)));
+}
+
+// Post-pass: darken grid-line pixels in the overlay viewport.
 //
-// Solution — saturating-counter blend:
-//   s_flicker_mask[i] is a uint8_t counter, not a flag.
-//     • Increments (saturating at 255) each frame the pixel changes.
-//     • Resets to 0 each frame the pixel stays the same.
-//   Blend fires only when counter_prev >= FLICKER_THRESHOLD (3).
+// Runs after render_gb_screen_chunk — both s_coord_ready and s_lut_ready are
+// guaranteed true at that point.
 //
-//   A sprite passing through pixel A causes EXACTLY 2 changes:
-//     arrive (counter→1), leave (counter→2).  2 < 3 → NEVER blended.
+// Complexity:
+//   Horizontal lines: GB_H × vp_w()   writes   (last dest-row of each GB row)
+//   Vertical   lines: GB_H × (avg_cell_h-1) × GB_W   writes   (last dest-col
+//     of each GB col, excluding rows already processed as horizontal lines)
 //
-//   Chain Chomp chain (alternates every frame indefinitely):
-//     change→1, change→2, change→3, change≥3 → BLEND on frame 4+ (≈50ms warm-up).
+// At 2.5×: ≈ 144×400 + 144×1.5×160 ≈ 92 K writes per frame when enabled.
+// At 2×:   ≈ 144×320 + 144×1×160   ≈ 69 K writes per frame when enabled.
+// Either way < 0.1 ms on the Switch CPU — negligible.
+inline void render_gb_grid_overlay(tsl::gfx::Renderer* renderer) {
+    if (!g_lcd_grid) return;
+
+    tsl::Color* fb = static_cast<tsl::Color*>(renderer->getCurrentFramebuffer());
+    const int cvp_w = vp_w();
+
+    // ── Horizontal grid lines ─────────────────────────────────────────────
+    // For each GB source row sy, darken every pixel in the last dest-row of
+    // that row's scaled block: oy = s_dy1[sy] - 1.
+    for (int sy = 0; sy < GB_H; ++sy) {
+        const uint32_t row_off = s_row_lut[s_dy1[sy] - 1];
+        for (int ox = 0; ox < cvp_w; ++ox) {
+            uint16_t& px = reinterpret_cast<uint16_t&>(fb[row_off + s_col_lut[ox]]);
+            px = dim_packed_grid(px);
+        }
+    }
+
+    // ── Vertical grid lines ───────────────────────────────────────────────
+    // For each dest-row that is NOT itself a horizontal grid line, darken the
+    // last dest-col of each GB source column: ox = s_dx1[sx] - 1.
+    // Skipping the grid rows avoids reprocessing intersections (no visible
+    // difference, but saves writes and avoids a second dim pass darkening them
+    // to ~1.5 % — they stay at the single-pass ~12.5 %).
+    for (int sy = 0; sy < GB_H; ++sy) {
+        const int oy_end = s_dy1[sy] - 1;   // exclusive upper bound (the grid row itself)
+        for (int oy = s_dy0[sy]; oy < oy_end; ++oy) {
+            const uint32_t row_off = s_row_lut[oy];
+            for (int sx = 0; sx < GB_W; ++sx) {
+                uint16_t& px = reinterpret_cast<uint16_t&>(
+                    fb[row_off + s_col_lut[s_dx1[sx] - 1]]);
+                px = dim_packed_grid(px);
+            }
+        }
+    }
+}
+
+// -- LCD ghosting (targeted per-sprite flicker blend) -------------------------
+// Simulates GBC LCD phosphor persistence for games that create transparency
+// effects by alternating sprite visibility at 30 Hz.
 //
-//   Result: sustained per-pixel flicker is ghosted; moving sprites and
-//   walking animations are written raw with zero blur and zero doubling.
+// Design — targeted per-sprite OAM tracking + instant 50/50 blend:
 //
-// TRANSITION GUARD (bulk-change detection):
-//   During a room/map transition the scroll causes a large fraction of the
-//   screen to change on every scroll frame, building flicker counters up to
-//   ≥ FLICKER_THRESHOLD.  On the first stable frame of the new map those
-//   stale counters would fire a blend against transition data, producing a
-//   one-frame smear/artifact around the character's path and edge tiles.
+//   walnut_cgb.h tracks which OAM entries rendered pixels each frame vs the
+//   previous frame.  When an entry alternates rendered/not-rendered on
+//   consecutive frames (the 30 Hz flicker pattern), s_sprite_flicker_cnt[s]
+//   increments and pixels drawn by that sprite are marked in s_flicker_pixel_curr[].
 //
-//   Fix: a single pre-pass counts changed pixels.  If the count exceeds
-//   BULK_CHANGE_LIMIT (30% of the screen), the frame is classified as a
-//   transition frame and any changed pixel has its counter reset to 0 rather
-//   than incremented — no blend fires, no counter pollution carries forward.
+//   apply_lcd_ghosting() blends ONLY those marked pixels at exactly 50/50
+//   using (curr + prev) >> 1.  This is perfectly symmetric: ON frame and OFF
+//   frame produce IDENTICAL output colour → zero visible oscillation.
 //
-//   Chain chomp chain: ~20–40 pixels change per frame → never triggers.
-//   Normal heavy sprite frame: ~1,000–2,500 pixels → never triggers.
-//   Room transition scroll frame: ~10,000–23,040 pixels → always triggers.
-//   The 30% threshold (~6,912 px) gives a wide safety margin between the two.
+//   When a non-flickering sprite (Link, BG tiles) draws OVER a position that
+//   was previously marked, walnut clears both s_flicker_pixel_curr[i] and
+//   s_flicker_pixel_prev[i] at that pixel.  This prevents any ghost bleed
+//   at positions now covered by a solid, non-flickering sprite.
 //
-//   Performance: one extra pass through 23,040 uint16_t comparisons whose
-//   cache lines are already hot from the draw pass — negligible overhead.
-//   Memory: one stack int (changed_count). Zero additional heap or BSS.
+// Why moving sprites are never blurred:
+//   Link renders every frame → rendered_curr == rendered_prev == true every
+//   frame → flicker_cnt stays 0 → flickering_this_frame = false → walnut clears
+//   the flicker marks at Link's pixels → no blend. ✓
+//
+// Why transparency sprites blend perfectly from frame 1:
+//   A ghost sprite alternates visible/invisible every frame → flickering_this_frame
+//   is true on its ON frame → pixel marked in curr → is_flicker=true → instant
+//   50/50 blend.  OFF frame: curr=0 but prev=1 (carried) → is_flicker=true →
+//   50/50 blend again.  Both frames output (sprite+bg)/2.  No ramp-up delay.
+//   No oscillation. ✓
+//
+// Why camera scroll doesn't kill transparency:
+//   Background pixels are never marked as flicker pixels → no blend there.
+//   No bulk-change early return needed; the pixel marks gate everything. ✓
 //
 // Memory (heap, freed on ROM unload):
-//   s_prev_fb      — raw pixels from last frame              45,056 bytes
-//   s_flicker_mask — 1 byte per pixel: saturating change count  23,040 bytes
-//   BSS cost: two pointers = 16 bytes.
-//   On limitedMemory devices both allocations are skipped entirely.
-static uint16_t* s_prev_fb      = nullptr;  // 45 KB, raw previous frame
-static uint8_t*  s_flicker_mask = nullptr;  // 23 KB, per-pixel alternation flag
-static bool      s_prev_fb_valid = false;   // false until first frame is seeded
+//   s_prev_fb            — raw previous frame pixels    45,056 bytes
+//   s_flicker_pixel_curr — per-pixel flicker flag        23,040 bytes
+//   s_flicker_pixel_prev — carries ON-frame flag to OFF  23,040 bytes
+//   Static tracking arrays in walnut_cgb.h: 120 bytes BSS.
 
-// Fraction of total pixels that must change in one frame for it to be
-// classified as a bulk transition (room scroll / map cut) rather than
-// normal per-pixel flicker.  30% → 6,912 pixels out of 23,040 total.
-// Chain chomp flicker: ~20–40 px.  Heavy sprite frame: ~1,000–2,500 px.
-// Room transition scroll frame: ~10,000–23,040 px.  Wide safety margin.
-static constexpr float BULK_CHANGE_FRAC  = 0.30f;
-static constexpr int   BULK_CHANGE_LIMIT =
-    static_cast<int>(GB_W * GB_H * BULK_CHANGE_FRAC);  // 6,912
+static uint16_t* s_prev_fb       = nullptr;   // 45 KB — raw previous frame
+static bool      s_prev_fb_valid = false;
 
-// Called after every gb_run_one_frame() when ghosting may be active.
+// s_flicker_pixel_curr / s_flicker_pixel_prev are declared in walnut_cgb.h.
+// apply_lcd_ghosting() owns their heap allocations.
+
+// Update per-sprite flicker counters and reset rendered flags for next frame.
+// Called once per frame from apply_lcd_ghosting().
+static inline void update_sprite_flicker_state() {
+    for (int s = 0; s < NUM_SPRITES; ++s) {
+        // Detect alternation immediately
+        bool alternated = s_sprite_rendered_curr[s] != s_sprite_rendered_prev[s];
+
+        // Advance flicker counter if alternated, otherwise reset
+        if (alternated)
+            s_sprite_flicker_cnt[s] = (s_sprite_flicker_cnt[s] < 255u)
+                                        ? s_sprite_flicker_cnt[s] + 1u : 255u;
+        else
+            s_sprite_flicker_cnt[s] = 0;
+
+        // Transfer current rendered flag to prev and reset curr for next frame
+        s_sprite_rendered_prev[s] = s_sprite_rendered_curr[s];
+        s_sprite_rendered_curr[s] = false;
+    }
+}
+
 inline void apply_lcd_ghosting() {
-    if (!g_lcd_ghosting) return;
-    if (ult::limitedMemory) return;
+    if (!g_lcd_ghosting || ult::limitedMemory) return;
+    const int total = GB_W * GB_H;
 
     if (!s_prev_fb) {
-        s_prev_fb = static_cast<uint16_t*>(malloc(GB_W * GB_H * sizeof(uint16_t)));
+        s_prev_fb = static_cast<uint16_t*>(malloc(total * sizeof(uint16_t)));
         if (!s_prev_fb) return;
     }
-    if (!s_flicker_mask) {
-        s_flicker_mask = static_cast<uint8_t*>(calloc(GB_W * GB_H, 1));
-        if (!s_flicker_mask) return;
+    if (!s_flicker_pixel_curr) {
+        s_flicker_pixel_curr = static_cast<uint8_t*>(calloc(total, 1));
+        if (!s_flicker_pixel_curr) return;
+    }
+    if (!s_flicker_pixel_prev) {
+        s_flicker_pixel_prev = static_cast<uint8_t*>(calloc(total, 1));
+        if (!s_flicker_pixel_prev) return;
     }
 
     if (!s_prev_fb_valid) {
-        // Seed on the first frame — no blend yet, just capture state.
-        memcpy(s_prev_fb, g_gb_fb, GB_W * GB_H * sizeof(uint16_t));
-        memset(s_flicker_mask, 0, GB_W * GB_H);
+        memcpy(s_prev_fb, g_gb_fb, total * sizeof(uint16_t));
+        memset(s_flicker_pixel_curr, 0, total);
+        memset(s_flicker_pixel_prev, 0, total);
         s_prev_fb_valid = true;
+        update_sprite_flicker_state();
         return;
     }
 
-    static constexpr uint8_t FLICKER_THRESHOLD = 3u;
-    static constexpr int     total             = GB_W * GB_H; // 23040, divisible by 8
+    // Blend pass.
+    //
+    // For every pixel marked as a flickering-sprite pixel (curr OR prev flag set),
+    // output the exact midpoint between this frame and the previous frame:
+    //
+    //   output = (curr + prev) >> 1
+    //
+    // Addition is commutative, so ON frame and OFF frame produce identical output:
+    //   ON  frame: (sprite + bg)   >> 1 = X
+    //   OFF frame: (bg    + sprite) >> 1 = X        ← same X, zero oscillation ✓
+    //
+    // No ramp-up delay: blend fires at full 50/50 on frame 1.
+    // No bulk-change early-return: background pixels are never marked as flicker
+    // pixels, so scrolling the camera never affects the blend at sprite positions.
+    //
+    // Non-flickering sprites (Link, outlines):
+    //   walnut clears curr[i] AND prev[i] whenever a non-flickering sprite draws
+    //   over a pixel → is_flicker=false instantly → no blend, no ghost trail. ✓
+    for (int i = 0; i < total; ++i) {
+        const uint16_t curr = g_gb_fb[i];
+        const uint16_t prev = s_prev_fb[i];
 
-    // ── Pre-pass: bulk-transition detection — NEON, 8 pixels/cycle ──────────
-    // Counts changed pixels with early exit: once BULK_CHANGE_LIMIT is
-    // exceeded we already know the answer and stop scanning.
-    // total=23040 is exactly divisible by 8, so no scalar tail is needed.
-    int changed_count = 0;
-    {
-        uint32x4_t acc = vdupq_n_u32(0);
-        int i = 0;
-        for (; i < total; i += 8) {
-            const uint16x8_t a   = vld1q_u16(g_gb_fb   + i);
-            const uint16x8_t b   = vld1q_u16(s_prev_fb + i);
-            // neq lane: 0xFFFF where different, 0x0000 where same
-            const uint16x8_t neq = vmvnq_u16(vceqq_u16(a, b));
-            // Convert to 0x0001/0x0000 so pairwise-add gives a per-pair count
-            acc = vaddq_u32(acc, vpaddlq_u16(vshrq_n_u16(neq, 15)));
-            // Early exit: check every 256 elements (32 NEON iterations)
-            if (__builtin_expect((i & 0xFF) == 0 && i >= 256, 0)) {
-                const uint64x2_t s64 = vpaddlq_u32(acc);
-                if ((int)(vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1)) > BULK_CHANGE_LIMIT) {
-                    changed_count = BULK_CHANGE_LIMIT + 1;
-                    goto pre_pass_done;
-                }
+        if ((s_flicker_pixel_curr[i] | s_flicker_pixel_prev[i]) && curr != prev) {
+            if (g_fb_is_rgb565) {
+                const uint8_t cr = (uint8_t)((((curr >> 11) & 0x1Fu) + ((prev >> 11) & 0x1Fu)) >> 1);
+                const uint8_t cg = (uint8_t)((((curr >>  5) & 0x3Fu) + ((prev >>  5) & 0x3Fu)) >> 1);
+                const uint8_t cb = (uint8_t)(( (curr        & 0x1Fu) + ( prev        & 0x1Fu)) >> 1);
+                g_gb_fb[i] = (uint16_t)((cr << 11) | (cg << 5) | cb);
+            } else {
+                const uint8_t cr = (uint8_t)(( (curr        & 0xFu) + ( prev        & 0xFu)) >> 1);
+                const uint8_t cg = (uint8_t)((((curr >>  4) & 0xFu) + ((prev >>  4) & 0xFu)) >> 1);
+                const uint8_t cb = (uint8_t)((((curr >>  8) & 0xFu) + ((prev >>  8) & 0xFu)) >> 1);
+                const uint8_t ca = (uint8_t)(  (curr >> 12) & 0xFu);
+                g_gb_fb[i] = (uint16_t)((ca << 12) | (cb << 8) | (cg << 4) | cr);
             }
         }
-        {
-            const uint64x2_t s64 = vpaddlq_u32(acc);
-            changed_count = (int)(vgetq_lane_u64(s64, 0) + vgetq_lane_u64(s64, 1));
-        }
-    }
-    pre_pass_done:;
-
-    // ── Bulk-transition fast path ────────────────────────────────────────────
-    // During a scroll or map-cut the loop body degenerates to:
-    //   mask[i] = 0 (always, because every changed pixel resets, every
-    //                stable pixel also resets via the else-0 branch)
-    //   prev[i] = curr[i] (unconditionally)
-    //   g_gb_fb[i] unchanged (no blend fires — mask was ≥threshold only if
-    //               it had been building, but it gets reset before the blend
-    //               check, so the blend condition is false)
-    // Replace the entire 23K-pixel loop with two memory operations.
-    if (changed_count > BULK_CHANGE_LIMIT) {
-        memset(s_flicker_mask, 0, total);
-        memcpy(s_prev_fb, g_gb_fb, total * sizeof(uint16_t));
-        return;
+        
+        s_prev_fb[i] = curr;
     }
 
-    // ── Normal frame: NEON blend + mask update, 8 pixels/cycle ─────────────
-    // bulk_transition is false here, so the mask update simplifies to:
-    //   changed_now ? saturating_inc(mask) : 0
-    // Blend fires when changed_now && mask >= FLICKER_THRESHOLD.
-    // We compute blended values unconditionally then select with vbslq —
-    // cheaper than branching on a per-pixel condition.
+    update_sprite_flicker_state();
 
-    const uint16x8_t v_thresh = vdupq_n_u16(FLICKER_THRESHOLD);
-    const uint8x8_t  v_one8   = vdup_n_u8(1);
-
-    if (g_fb_is_rgb565) {
-        // CGB path: RGB565 in g_gb_fb, blend R5/G6/B5 channels.
-        const uint16x8_t m1f = vdupq_n_u16(0x001Fu); // 5-bit mask
-        const uint16x8_t m3f = vdupq_n_u16(0x003Fu); // 6-bit mask (green)
-
-        for (int i = 0; i < total; i += 8) {
-            const uint16x8_t curr_v = vld1q_u16(g_gb_fb   + i);
-            const uint16x8_t prev_v = vld1q_u16(s_prev_fb + i);
-            const uint8x8_t  mask_v = vld1_u8  (s_flicker_mask + i);
-
-            // Difference mask: 0xFFFF where pixel changed, 0x0000 where same
-            const uint16x8_t neq = vmvnq_u16(vceqq_u16(curr_v, prev_v));
-
-            // Blend condition: changed && mask >= FLICKER_THRESHOLD
-            const uint16x8_t mask16     = vmovl_u8(mask_v);
-            const uint16x8_t blend_cond = vandq_u16(neq, vcgeq_u16(mask16, v_thresh));
-
-            // 50/50 RGB565 blend (computed unconditionally, selected below)
-            const uint16x8_t r = vshrq_n_u16(vaddq_u16(
-                vandq_u16(vshrq_n_u16(curr_v, 11), m1f),
-                vandq_u16(vshrq_n_u16(prev_v, 11), m1f)), 1);
-            const uint16x8_t g = vshrq_n_u16(vaddq_u16(
-                vandq_u16(vshrq_n_u16(curr_v,  5), m3f),
-                vandq_u16(vshrq_n_u16(prev_v,  5), m3f)), 1);
-            const uint16x8_t b = vshrq_n_u16(vaddq_u16(
-                vandq_u16(curr_v, m1f),
-                vandq_u16(prev_v, m1f)), 1);
-            const uint16x8_t blended =
-                vorrq_u16(vorrq_u16(vshlq_n_u16(r, 11), vshlq_n_u16(g, 5)), b);
-
-            // Write blended or raw depending on condition
-            vst1q_u16(g_gb_fb + i, vbslq_u16(blend_cond, blended, curr_v));
-
-            // Mask update: changed ? saturating_inc(mask) : 0
-            // vqadd saturates at 255; vand zeros lanes where not changed.
-            const uint8x8_t changed8 = vmovn_u16(neq); // 0xFF or 0x00
-            vst1_u8(s_flicker_mask + i, vand_u8(vqadd_u8(mask_v, v_one8), changed8));
-
-            // Always store raw curr for next frame's comparison
-            vst1q_u16(s_prev_fb + i, curr_v);
-        }
-    } else {
-        // DMG path: RGBA4444 in g_gb_fb, blend R/G/B nibbles; alpha=0xF fixed.
-        const uint16x8_t m0f    = vdupq_n_u16(0x000Fu);
-        const uint16x8_t v_alpha = vdupq_n_u16(0xF000u);
-
-        for (int i = 0; i < total; i += 8) {
-            const uint16x8_t curr_v = vld1q_u16(g_gb_fb   + i);
-            const uint16x8_t prev_v = vld1q_u16(s_prev_fb + i);
-            const uint8x8_t  mask_v = vld1_u8  (s_flicker_mask + i);
-
-            const uint16x8_t neq = vmvnq_u16(vceqq_u16(curr_v, prev_v));
-
-            const uint16x8_t mask16     = vmovl_u8(mask_v);
-            const uint16x8_t blend_cond = vandq_u16(neq, vcgeq_u16(mask16, v_thresh));
-
-            // 50/50 RGBA4444 blend: average each 4-bit RGB nibble, keep A=0xF
-            const uint16x8_t r = vshrq_n_u16(vaddq_u16(
-                vandq_u16(curr_v,                  m0f),
-                vandq_u16(prev_v,                  m0f)), 1);
-            const uint16x8_t g = vshrq_n_u16(vaddq_u16(
-                vandq_u16(vshrq_n_u16(curr_v, 4),  m0f),
-                vandq_u16(vshrq_n_u16(prev_v, 4),  m0f)), 1);
-            const uint16x8_t b = vshrq_n_u16(vaddq_u16(
-                vandq_u16(vshrq_n_u16(curr_v, 8),  m0f),
-                vandq_u16(vshrq_n_u16(prev_v, 8),  m0f)), 1);
-            const uint16x8_t blended = vorrq_u16(
-                vorrq_u16(r, vorrq_u16(vshlq_n_u16(g, 4), vshlq_n_u16(b, 8))),
-                v_alpha);
-
-            vst1q_u16(g_gb_fb + i, vbslq_u16(blend_cond, blended, curr_v));
-
-            const uint8x8_t changed8 = vmovn_u16(neq);
-            vst1_u8(s_flicker_mask + i, vand_u8(vqadd_u8(mask_v, v_one8), changed8));
-
-            vst1q_u16(s_prev_fb + i, curr_v);
-        }
-    }
+    // Carry this frame's flicker marks to prev, clear curr for next frame.
+    // This keeps is_flicker=true on the OFF frame: prev[i] holds the mark
+    // that walnut set during the previous ON frame.
+    memcpy(s_flicker_pixel_prev, s_flicker_pixel_curr, total);
+    memset(s_flicker_pixel_curr, 0, total);
 }
 
-// Invalidate ghosting state — next apply_lcd_ghosting() call re-seeds instead
-// of blending.  Does NOT free allocations; keeps them live for reuse on ROM switch.
+// Invalidate ghosting state on ROM switch or reset.
+// Resets all sprite-flicker tracking so stale counters from the old game
+// cannot bleed into the new one.  Does NOT free heap; keeps allocations live.
 inline void reset_lcd_ghosting() {
     s_prev_fb_valid = false;
+    memset(s_sprite_rendered_curr, 0, sizeof(s_sprite_rendered_curr));
+    memset(s_sprite_rendered_prev, 0, sizeof(s_sprite_rendered_prev));
+    memset(s_sprite_flicker_cnt,   0, sizeof(s_sprite_flicker_cnt));
+    if (s_prev_fb)            memset(s_prev_fb,            0, GB_W * GB_H * sizeof(uint16_t));
+    if (s_flicker_pixel_curr) memset(s_flicker_pixel_curr, 0, GB_W * GB_H);
+    if (s_flicker_pixel_prev) memset(s_flicker_pixel_prev, 0, GB_W * GB_H);
 }
-
-// Release all ghosting heap memory.  Call from gb_unload_rom() so the ~68 KB
-// returns to the heap when no game is running.
+// Release all ghosting heap memory.  Called from gb_unload_rom() so the
+// memory returns to the heap when no game is running.
 inline void free_lcd_ghosting() {
-    free(s_prev_fb);      s_prev_fb      = nullptr;
-    free(s_flicker_mask); s_flicker_mask = nullptr;
-    s_prev_fb_valid = false;
+    free(s_prev_fb);
+    free(s_flicker_pixel_curr);
+    free(s_flicker_pixel_prev);
+    s_prev_fb            = nullptr;
+    s_flicker_pixel_curr = nullptr;
+    s_flicker_pixel_prev = nullptr;
+    s_prev_fb_valid      = false;
+    memset(s_sprite_rendered_curr, 0, sizeof(s_sprite_rendered_curr));
+    memset(s_sprite_rendered_prev, 0, sizeof(s_sprite_rendered_prev));
+    memset(s_sprite_flicker_cnt,   0, sizeof(s_sprite_flicker_cnt));
 }
 
 // -- GB screen render (Ultimate Switch NEON, fully vectorized, contiguous run detection)
@@ -543,6 +550,11 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
     
 
     render_gb_screen_chunk(renderer, g_fb_is_rgb565, 0, GB_H);
+
+    // LCD grid overlay — post-pass that darkens the last pixel of every
+    // scaled source-pixel block to simulate the dark gap between LCD cells.
+    // No-op when g_lcd_grid is false (single branch at function entry).
+    render_gb_grid_overlay(renderer);
 
     //const bool is565 = g_fb_is_rgb565;
     //if (!ult::expandedMemory) {

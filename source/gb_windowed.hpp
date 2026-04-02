@@ -22,13 +22,14 @@
  *     Scale 2: 320×288 px  — VI space 480×432   (2× integer scaled)
  *     Scale 3: 480×432 px  — VI space 720×648   (3× integer scaled)
  *     Scale 4: 640×576 px  — VI space 960×864   (4× integer scaled)
+ *     Scale 5: 800×720 px  — VI space 1200×1080 (5× integer scaled; requires 8 MB+ heap)
  *
  *   Pixel blit:
  *     LUTs encode the Tesla block-linear address formula for the scaled
  *     framebuffer.  OWV (outer-width-value, the inter-strip stride) depends on
  *     framebuffer width and is recomputed per scale.  For each source GB pixel
  *     (sx, sy) the blit writes g_win_scale × g_win_scale destination pixels.
- *     s_win_col / s_win_row are sized for max 4× (640 / 576 entries).
+ *     s_win_col / s_win_row are sized for max 5× (800 / 720 entries).
  *
  *   Touch drag:
  *     Same scheme as 1× — polls HID directly.  Window size in touch space
@@ -75,9 +76,9 @@
 //   row_part(y) = ((((y&127)>>4) + ((y>>7)*OWV))<<9)
 //                + ((y&8)<<5) + ((y&6)<<4) + ((y&1)<<3)
 //
-// Arrays are sized for maximum 3× scale: 480 cols, 432 rows.
-static uint32_t s_win_col[GB_W * 4];  // up to 640 entries (4× scale)
-static uint32_t s_win_row[GB_H * 4];  // up to 576 entries (4× scale)
+// Arrays are sized for maximum 5× scale: 800 cols, 720 rows.
+static uint32_t s_win_col[GB_W * 5];  // up to 800 entries (5× scale)
+static uint32_t s_win_row[GB_H * 5];  // up to 720 entries (5× scale)
 static bool     s_win_lut_ready = false;
 // Set true by GBWindowedGui::handleInput while a touch-drag reposition is active.
 // Read by GBWindowedElement::draw to overlay a 4-pixel red border on the frame.
@@ -163,32 +164,61 @@ public:
         //   (sx*N .. sx*N+N-1, sy*N .. sy*N+N-1).
         // Uses public setPixelAtOffset() — getCurrentFramebuffer() is private.
         // tsl::Color is 16-bit RGBA4444, same bit layout as our packed uint16_t.
+        //
+        // LCD_GRID template parameter: when true, the last row (dy==scale-1)
+        // and last column (dx==scale-1) of each scaled block are written with a
+        // heavily dimmed (~12.5 %) version of the pixel colour, simulating the
+        // dark gap between LCD sub-pixels.  Disabled at 1× (no room for a gap).
+        // The template is instantiated for both states so the compiler eliminates
+        // all grid branches in the LCD_GRID=false path.
         if (!s_win_lut_ready) init_win_luts(g_win_scale);
 
         const int  scale     = g_win_scale;
         const bool is565     = g_fb_is_rgb565;
         const bool prepacked = g_fb_is_prepacked;
 
-        for (int sy = 0; sy < GB_H; ++sy) {
-            const uint16_t* src_row = g_gb_fb + sy * GB_W;
-            for (int sx = 0; sx < GB_W; ++sx) {
-                const uint16_t src = src_row[sx];
-                uint16_t packed;
-                if (prepacked)    packed = src;
-                else if (is565)   packed = rgb565_to_packed(src);
-                else              packed = rgb555_to_packed(src);
-                const tsl::Color& col = reinterpret_cast<const tsl::Color&>(packed);
+        // win_blit<LCD_GRID> — templated inner blit; zero overhead when false.
+        const auto win_blit = [&]<bool LCD_GRID>() __attribute__((always_inline)) {
+            for (int sy = 0; sy < GB_H; ++sy) {
+                const uint16_t* src_row = g_gb_fb + sy * GB_W;
+                for (int sx = 0; sx < GB_W; ++sx) {
+                    const uint16_t src = src_row[sx];
+                    uint16_t packed;
+                    if (prepacked)    packed = src;
+                    else if (is565)   packed = rgb565_to_packed(src);
+                    else              packed = rgb555_to_packed(src);
+                    const tsl::Color& col = reinterpret_cast<const tsl::Color&>(packed);
 
-                // Write scale×scale destination pixels for this source pixel.
-                for (int dy = 0; dy < scale; ++dy) {
-                    const uint32_t row_base = s_win_row[sy * scale + dy];
-                    for (int dx = 0; dx < scale; ++dx) {
-                        renderer->setPixelAtOffset(
-                            row_base + s_win_col[sx * scale + dx], col);
+                    // Grid colour: dimmed version of the same pixel (computed
+                    // once per source pixel; the if-constexpr is a compile-time
+                    // guard so grid_packed is never evaluated in the false path).
+                    uint16_t grid_packed;
+                    if constexpr (LCD_GRID)
+                        grid_packed = dim_packed_grid(packed);
+
+                    for (int dy = 0; dy < scale; ++dy) {
+                        const uint32_t row_base = s_win_row[sy * scale + dy];
+                        for (int dx = 0; dx < scale; ++dx) {
+                            if constexpr (LCD_GRID) {
+                                const bool is_grid = (dy == scale - 1) | (dx == scale - 1);
+                                renderer->setPixelAtOffset(
+                                    row_base + s_win_col[sx * scale + dx],
+                                    is_grid ? reinterpret_cast<const tsl::Color&>(grid_packed)
+                                            : col);
+                            } else {
+                                renderer->setPixelAtOffset(
+                                    row_base + s_win_col[sx * scale + dx], col);
+                            }
+                        }
                     }
                 }
             }
-        }
+        };
+
+        if (g_lcd_grid && scale >= 2)
+            win_blit.operator()<true>();
+        else
+            win_blit.operator()<false>();
 
         // ── Pass-through flash border + drag overlay ─────────────────────────
         // fw/fh computed once here; used by both conditional blocks below.
@@ -635,7 +665,10 @@ public:
 
         // ── Right/Left stick click: resize window ────────────────────────────
         // Right stick click steps up one scale; left stick click steps down.
-        // Cycles 1× → 2× → 3× → 4× (capped at 3× on 4 MB heap).
+        // Cycles 1× → 2× → 3× → 4× → 5× (capped by heap tier).
+        //   4 MB heap  : max 3×
+        //   6 MB heap  : max 4×
+        //   8 MB+ heap : max 5×
         //
         // Both are disabled while pass-through is active so the background
         // app receives the stick click undisturbed.
@@ -646,18 +679,23 @@ public:
             const bool rstick = (keysDown & KEY_RSTICK && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK));
             const bool lstick = (keysDown & KEY_LSTICK && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK));
             if (rstick || lstick) {
-                const bool limitedMem =
-                    (ult::getCurrentHeapSize() == ult::OverlayHeapSize::Size_4MB);
-                const int max_scale = limitedMem ? 3 : 4;
+                const auto currentHeapSize    = ult::getCurrentHeapSize();
+                const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
+                const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+
+                const int max_scale = earlyLimited      ? 3
+                                    : earlyRegularMemory ? 4
+                                    :                      5;  // 8 MB+ heap
                 const int new_scale = rstick
                     ? std::min(g_win_scale + 1, max_scale)
                     : std::max(g_win_scale - 1, 1);
                 if (new_scale != g_win_scale) {
                     // Persist new scale and ROM path so the relaunch picks them up.
                     const char* sv =
-                        (new_scale == 1) ? "1" :
-                        (new_scale == 2) ? "2" :
-                        (new_scale == 3) ? "3" : "4";
+                        (new_scale == 5) ? "5" :
+                        (new_scale == 4) ? "4" :
+                        (new_scale == 3) ? "3" :
+                        (new_scale == 2) ? "2" : "1";
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinScale, sv, "");
                     if (g_gb.romPath[0])
                         ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom,

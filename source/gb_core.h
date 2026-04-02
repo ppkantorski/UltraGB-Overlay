@@ -977,12 +977,20 @@ static void gb_lcd_draw_line(struct gb_s* gb,
                 // Load 8 pixel indices
                 uint8x8_t px8 = vld1_u8(pixels + x);
 
-                // --- Fully vectorized fixPalette load ---
-                uint16x8_t rgb;
-                rgb = vcombine_u16(
-                    vld1_u16(&gb->cgb.fixPalette[px8[0]]),  // low 4 pixels
-                    vld1_u16(&gb->cgb.fixPalette[px8[4]])   // high 4 pixels
-                );
+                // --- Per-pixel scatter-load from fixPalette ---
+                // Each pixel independently indexes fixPalette at px8[i] — these
+                // are non-contiguous addresses, so vld1_u16 (sequential load) is
+                // wrong here.  Load each entry individually into its own lane.
+                uint16x8_t rgb = {
+                    gb->cgb.fixPalette[px8[0]],
+                    gb->cgb.fixPalette[px8[1]],
+                    gb->cgb.fixPalette[px8[2]],
+                    gb->cgb.fixPalette[px8[3]],
+                    gb->cgb.fixPalette[px8[4]],
+                    gb->cgb.fixPalette[px8[5]],
+                    gb->cgb.fixPalette[px8[6]],
+                    gb->cgb.fixPalette[px8[7]]
+                };
 
                 // Extract R/G/B channels (5-bit each)
                 uint16x8_t r  = vandq_u16(vshrq_n_u16(rgb, 11), vdupq_n_u16(0x1F));
