@@ -208,21 +208,34 @@ inline void set_vp_scale(const bool want_2x) {
 extern bool g_lcd_grid;  // false = off (default), true = show LCD grid
 
 // Dim a packed RGBA4444 pixel to ~75 % brightness, alpha kept.
-// Each RGB channel is reduced by one quarter: new = ch - (ch >> 2).
-// This sits in the sweet spot where the grid line is visibly darker than the
-// lit cell but the underlying colour still reads clearly — comparable to the
-// GBC LCD gap tint.  No inter-field carry: each channel is extracted before
-// the arithmetic.
+//
+// Exact same result as:
+//   ch' = ch - (ch >> 2)
+// for each 4-bit RGB nibble, but done in parallel with nibble-safe masked
+// arithmetic instead of extracting / repacking each channel separately.
+//
+// RGB mask = 0x0FFF (keep alpha nibble untouched)
+// Quarter-per-channel is computed with a nibble-local right shift:
+//   (rgb >> 2) & 0x0333
+//
+// This avoids cross-nibble bleed while producing the exact same values as the
+// original per-channel implementation.
+
+// Dim a packed RGBA4444 pixel to ~75 % brightness, alpha kept.
+// Exact same as: ch' = ch - (ch >> 2) per 4-bit RGB nibble
 static inline uint16_t dim_packed_grid(const uint16_t p) {
-    const uint16_t r = (p      ) & 0xFu;
-    const uint16_t g = (p >>  4) & 0xFu;
-    const uint16_t b = (p >>  8) & 0xFu;
-    return static_cast<uint16_t>(
-        (p & 0xF000u)
-        | ((b - (b >> 2u)) << 8u)
-        | ((g - (g >> 2u)) << 4u)
-        |  (r - (r >> 2u)));
+    const uint16_t rgb = p & 0x0FFFu;
+    return static_cast<uint16_t>((p & 0xF000u) | (rgb - ((rgb >> 2) & 0x0333u)));
 }
+
+// Vectorized version for NEON (horizontal / vertical)
+static inline uint16x8_t dim_packed_grid_vec(uint16x8_t px) {
+    const uint16x8_t mask = vdupq_n_u16(0x0FFFu);     // RGB mask
+    const uint16x8_t rgb  = vandq_u16(px, mask);
+    const uint16x8_t dim  = vsubq_u16(rgb, vandq_u16(vshrq_n_u16(rgb, 2), vdupq_n_u16(0x0333u)));
+    return vbslq_u16(mask, dim, px); // keep alpha intact
+}
+
 
 // Post-pass: darken grid-line pixels in the overlay viewport.
 //
@@ -240,34 +253,40 @@ static inline uint16_t dim_packed_grid(const uint16_t p) {
 inline void render_gb_grid_overlay(tsl::gfx::Renderer* renderer) {
     if (!g_lcd_grid) return;
 
-    tsl::Color* fb = static_cast<tsl::Color*>(renderer->getCurrentFramebuffer());
+    auto* fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
     const int cvp_w = vp_w();
 
-    // ── Horizontal grid lines ─────────────────────────────────────────────
-    // For each GB source row sy, darken every pixel in the last dest-row of
-    // that row's scaled block: oy = s_dy1[sy] - 1.
+    // Precompute vertical offsets
+    uint32_t v_cols[GB_W];
+    for (int sx = 0; sx < GB_W; ++sx)
+        v_cols[sx] = s_col_lut[s_dx1[sx] - 1];
+
+    // ── Horizontal lines (fully vectorized, unrolled)
     for (int sy = 0; sy < GB_H; ++sy) {
-        const uint32_t row_off = s_row_lut[s_dy1[sy] - 1];
-        for (int ox = 0; ox < cvp_w; ++ox) {
-            uint16_t& px = reinterpret_cast<uint16_t&>(fb[row_off + s_col_lut[ox]]);
-            px = dim_packed_grid(px);
+        uint16_t* row_ptr = fb + s_row_lut[s_dy1[sy] - 1];
+        for (int ox = 0; ox < cvp_w; ox += 8) {
+            uint16x8_t px = vld1q_u16(&row_ptr[s_col_lut[ox]]);
+            vst1q_u16(&row_ptr[s_col_lut[ox]], dim_packed_grid_vec(px));
         }
     }
 
-    // ── Vertical grid lines ───────────────────────────────────────────────
-    // For each dest-row that is NOT itself a horizontal grid line, darken the
-    // last dest-col of each GB source column: ox = s_dx1[sx] - 1.
-    // Skipping the grid rows avoids reprocessing intersections (no visible
-    // difference, but saves writes and avoids a second dim pass darkening them
-    // to ~1.5 % — they stay at the single-pass ~12.5 %).
+    // ── Vertical lines (fully vectorized, unrolled)
     for (int sy = 0; sy < GB_H; ++sy) {
-        const int oy_end = s_dy1[sy] - 1;   // exclusive upper bound (the grid row itself)
+        const int oy_end = s_dy1[sy] - 1; // skip horizontal grid row
         for (int oy = s_dy0[sy]; oy < oy_end; ++oy) {
-            const uint32_t row_off = s_row_lut[oy];
-            for (int sx = 0; sx < GB_W; ++sx) {
-                uint16_t& px = reinterpret_cast<uint16_t&>(
-                    fb[row_off + s_col_lut[s_dx1[sx] - 1]]);
-                px = dim_packed_grid(px);
+            uint16_t* row_ptr = fb + s_row_lut[oy];
+            for (int sx = 0; sx < GB_W; sx += 8) {
+                // Load 8 columns into temp vector
+                uint16_t temp[8];
+
+                for (int i = 0; i < 8; ++i)
+                    temp[i] = row_ptr[v_cols[sx + i]];
+
+                uint16x8_t px = vld1q_u16(temp);
+                vst1q_u16(temp, dim_packed_grid_vec(px));
+                
+                for (int i = 0; i < 8; ++i)
+                    row_ptr[v_cols[sx + i]] = temp[i];
             }
         }
     }
