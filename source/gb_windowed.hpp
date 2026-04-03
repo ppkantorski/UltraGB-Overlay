@@ -280,8 +280,9 @@ public:
         // so the audio thread flushes and restarts the stream on its next tick.
         // Cost in steady state: one bool comparison per display frame (~0 ns).
         {
-            static bool s_was_docked = ult::consoleIsDocked();
             const bool  is_docked    = ult::consoleIsDocked();
+            static bool s_was_docked = is_docked;
+            
             if (is_docked != s_was_docked) {
                 s_was_docked = is_docked;
                 gb_audio_request_resync();

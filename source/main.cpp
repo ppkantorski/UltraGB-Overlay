@@ -86,7 +86,6 @@ static const std::string kKeySaveDir      {"save_dir"};
 static const std::string kKeyLastRom      {"last_rom"};
 static const std::string kKeyVolume       {"volume"};
 static const std::string kKeyVolBackup    {"vol_backup"};
-static const std::string kKeyOverlay      {"overlay"};
 static const std::string kKeyLcdGrid      {"lcd_grid"};
 static const std::string kKeyWindowed     {"windowed"};
 static const std::string kKeyIngameHaptics{"ingame_haptics"};
@@ -278,11 +277,6 @@ static void load_config() {
     { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolBackup), v))
         g_vol_backup = static_cast<u8>(std::clamp(v, 1, 100)); }
 
-    // overlay — 0 = 2.5× (default), 1 = 2× pixel-perfect
-    const std::string ovl_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOverlay);
-    if (!ovl_val.empty())
-        g_vp_2x = (ovl_val == "1");
-
     // lcd_grid — 0 = off (default), 1 = LCD grid effect enabled
     const std::string grid_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyLcdGrid);
     if (!grid_val.empty())
@@ -352,7 +346,6 @@ static void write_default_config_if_missing() {
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
     set_if_missing("win_output",    "720");
-    set_if_missing("overlay",       "1");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -363,11 +356,6 @@ static void save_last_rom(const char* fullPath) {
     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyLastRom, base, "");
 }
 
-// Persist the current scale mode to config.ini.
-static void save_overlay_scale() {
-    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOverlay,
-                         g_vp_2x ? "1" : "0", "");
-}
 
 // Persist the LCD grid toggle to config.ini.
 static void save_lcd_grid() {
@@ -665,6 +653,25 @@ static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
     ult::setIniFileValue(cfgPath, kConfigSection, "lcd_ghosting", enabled ? "1" : "0", "");
 }
 
+// =============================================================================
+// Per-game no-sprite-limit helpers
+// Stored in CONFIGURE_DIR/<rom>.ini under [config] no_sprite_limit = "0" | "1".
+// Default is ON (absent key → true) — matches the hardcoded default in walnut.
+// =============================================================================
+static bool load_game_no_sprite_limit(const char* romPath) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    const std::string val = ult::parseValueFromIniSection(cfgPath, kConfigSection, "no_sprite_limit");
+    return val != "0";  // absent or "1" → true (on by default)
+}
+
+static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    ult::createDirectory(CONFIGURE_DIR);
+    ult::setIniFileValue(cfgPath, kConfigSection, "no_sprite_limit", enabled ? "1" : "0", "");
+}
+
 
 // ROM buffer is allocated in gb_load_rom and freed in gb_unload_rom.
 // The wallpaper is always evicted BEFORE the ROM buffer is allocated, so that
@@ -677,7 +684,6 @@ static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for
 PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC title-lookup by default
 bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
 bool g_fb_is_prepacked        = false;  // true when g_gb_fb stores RGBA4444 (DMG games)
-bool g_vp_2x                  = true;   // true=2× pixel-perfect (default), false=2.5×
 bool g_lcd_ghosting           = false;  // 50/50 frame blend — simulates GBC LCD persistence; per-game, off by default
 bool g_lcd_grid               = false;  // LCD grid overlay — darkens inter-pixel gaps to simulate real GB Color LCD
 bool g_fast_forward           = false;  // true while ZR double-click-hold is active
@@ -1601,6 +1607,10 @@ bool gb_load_rom(const char* path) {
     }
 
     gb_init_lcd(g_gb.gb, gb_lcd_draw_line);
+    // Apply per-game no-sprite-limit preference (on by default).
+    // gb_init_lcd sets no_sprite_limit=true; override here for games that
+    // have the hardware cap re-enabled in their config.
+    g_gb.gb->direct.no_sprite_limit = load_game_no_sprite_limit(path);
 
     // Allocate the framebuffer — ~45 KB heap, only resident during active gameplay.
     g_gb_fb = static_cast<uint16_t*>(calloc(GB_W * GB_H, sizeof(uint16_t)));
@@ -1622,6 +1632,9 @@ bool gb_load_rom(const char* path) {
     // version, truncated) we fall through to a normal cold boot — no harm done.
     bool apu_restored = false;
     const bool resumed = load_state(g_gb, &apu_restored);
+    // load_state calls gb_init_lcd internally to re-patch function pointers,
+    // which resets no_sprite_limit to true.  Re-apply the per-game preference.
+    g_gb.gb->direct.no_sprite_limit = load_game_no_sprite_limit(path);
 
     if (!apu_restored) {
         // No v3 APU snapshot available (cold boot, v1 file, or read error).
@@ -2400,6 +2413,26 @@ public:
             list->addItem(palItem);
         }
 
+        // No Sprite Limit — per-game, on by default.
+        // When on, lifts the 10-sprites-per-scanline hardware cap so games
+        // that flicker sprites to fake transparency show all sprites every
+        // frame.  Disable only if a specific game relies on the hardware
+        // cap for correct behavior.
+        {
+            const bool nslOn = load_game_no_sprite_limit(romPath.c_str());
+            auto* nsl_item = new tsl::elm::ToggleListItem("No Sprite Limit", nslOn,
+                                                           ult::ON, ult::OFF);
+            nsl_item->setStateChangedListener([romPath](bool state) {
+                save_game_no_sprite_limit(romPath.c_str(), state);
+                // Apply live if this ROM is currently loaded
+                if (g_gb.rom && g_gb.gb &&
+                    strncmp(g_gb.romPath, romPath.c_str(), sizeof(g_gb.romPath)) == 0) {
+                    g_gb.gb->direct.no_sprite_limit = state;
+                }
+            });
+            list->addItem(nsl_item);
+        }
+
         // LCD Ghosting — per-game, off by default.
         // Available only on furtherExpandedMemory (10 MB+ heap, any ROM), or on
         // expandedMemory (8 MB heap) with a ROM < 4 MB.  All other tiers —
@@ -2632,26 +2665,6 @@ public:
             list->addItem(out_item);
         }
 
-        // ── Overlay Scale ─────────────────────────────────────────────────────
-        // Cycles 2.5× (default, fills overlay width) ↔ 2× (integer pixel-perfect)
-        // on each A press.  Also togglable in-game by tapping the screen or RS.
-        // Uses set_vp_scale() to invalidate the swizzle/coord LUTs together with
-        // the flag — direct assignment to g_vp_2x alone would leave stale LUTs.
-        {
-            const char* scale_labels[] = { "2.5x", "2x" };
-            auto* scale_item = new tsl::elm::ListItem("Overlay Scale",
-                                                       scale_labels[g_vp_2x ? 1 : 0]);
-            scale_item->setClickListener([scale_item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                set_vp_scale(!g_vp_2x);
-                save_overlay_scale();
-                static constexpr const char* labels[] = { "2.5x", "2x" };
-                scale_item->setValue(labels[g_vp_2x ? 1 : 0]);
-                return true;
-            });
-            list->addItem(scale_item);
-        }
-
         // ── LCD Grid ──────────────────────────────────────────────────────────
         // Simulates the dark inter-pixel gap of a real Game Boy Color LCD by
         // dimming the last row and column of each scaled source-pixel block to
@@ -2746,7 +2759,7 @@ public:
         const bool simulatedNext = ult::simulatedNextPage.exchange(
             false, std::memory_order_acq_rel);
         // Only block page navigation if the volume slider itself is focused AND unlocked.
-        // If focus has moved to another item (e.g. Overlay Scale), allowSlide being true
+        // If focus has moved to another item, allowSlide being true
         // is irrelevant and should not prevent page changes.
         const bool sliderActive = m_vol_slider && m_vol_slider->hasFocus()
                                   && ult::allowSlide.load(std::memory_order_acquire);
@@ -3250,7 +3263,8 @@ public:
             }
             // loadWallpaperFileWhenSafe() is normally called by UltraGBOverlayFrame's
             // constructor; since we bypass that frame here, trigger it explicitly.
-            ult::loadWallpaperFileWhenSafe();
+            if (ult::expandedMemory)
+                ult::loadWallpaperFileWhenSafe();
             strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
             g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
             g_overlay_rom_path[0] = '\0';  // consumed

@@ -119,8 +119,9 @@ public:
         // so the audio thread flushes and restarts the stream on its next tick.
         // Cost in steady state: one bool comparison per display frame (~0 ns).
         {
-            static bool s_was_docked = ult::consoleIsDocked();
             const bool  is_docked    = ult::consoleIsDocked();
+            static bool s_was_docked = is_docked;
+            
             if (is_docked != s_was_docked) {
                 s_was_docked = is_docked;
                 gb_audio_request_resync();
@@ -305,10 +306,6 @@ public:
 class GBOverlayGui : public tsl::Gui {
     bool m_waitForRelease = true;  // ignore input until all buttons are released
     u64  m_prevTouchKeys  = 0;     // track previous touch state
-    bool m_vp_tap_pending = false; // true while a screen-region tap is in progress
-    int  m_vp_tap_frames  = 0;     // frames held so far for the current tap
-    bool m_rs_tap_pending = false; // true while an RS quick-release is in progress
-    int  m_rs_tap_frames  = 0;     // frames RS has been held so far
     bool m_load_failed    = false; // deferred load failed; swap back to selector in update()
     bool m_restoreHapticState = false;
     bool runOnce = true;
@@ -481,69 +478,6 @@ public:
         const int  ty       = static_cast<int>(touchPos.y);
         const bool touching = (touchPos.x != 0 || touchPos.y != 0) &&
                               ty < FOOTER_Y;
-
-        // ── Screen-region tap → scale toggle ─────────────────────────────────
-        // A quick tap (< 20 frames, ~333 ms) anywhere on the GB screen area
-        // that doesn't hit a game button toggles between 2.5× and 2× scale.
-        // Game buttons are below the screen so there is zero overlap — the VP
-        // is a completely dead zone for all other input.
-        {
-            const bool in_vp = touching &&
-                tx >= vp_x() && tx < vp_x() + vp_w() &&
-                ty >= vp_y() && ty < vp_y() + vp_h();
-
-            if (in_vp && !m_vp_tap_pending) {
-                // Touch just entered the screen region — arm the tap detector.
-                m_vp_tap_pending = true;
-                m_vp_tap_frames  = 0;
-            }
-            if (m_vp_tap_pending) {
-                if (!touching) {
-                    // Finger lifted — it was a quick tap, fire the toggle.
-                    if (m_vp_tap_frames < 20) {
-                        toggle_vp_scale();
-                        save_overlay_scale();
-                    }
-                    m_vp_tap_pending = false;
-                } else if (!in_vp) {
-                    // Finger dragged out of the VP without releasing — not a tap.
-                    m_vp_tap_pending = false;
-                } else {
-                    ++m_vp_tap_frames;
-                }
-            }
-        }
-
-        // ── RS quick-release → scale toggle ──────────────────────────────────
-        // A quick press-and-release of RS (right stick click) with no other
-        // buttons held toggles between 2.5× and 2× pixel-perfect scale and
-        // persists the choice to config.ini.  "Quick" = released within 20
-        // frames (~333 ms).  Requiring keysHeld == KEY_RSTICK during the hold
-        // ensures accidental combos (e.g. RS + ZL for system overlay) don't fire.
-        {
-            const bool rs_down      = (keysDown & KEY_RSTICK);
-            const bool rs_held_alone = (keysHeld == KEY_RSTICK);
-
-            if (rs_down && !m_rs_tap_pending) {
-                m_rs_tap_pending = true;
-                m_rs_tap_frames  = 0;
-            }
-            if (m_rs_tap_pending) {
-                if (!(keysHeld & KEY_RSTICK)) {
-                    // RS released — fire toggle only if it was a quick solo tap.
-                    if (m_rs_tap_frames < 20) {
-                        toggle_vp_scale();
-                        save_overlay_scale();
-                    }
-                    m_rs_tap_pending = false;
-                } else if (!rs_held_alone) {
-                    // Another button joined the hold — abort, treat as a combo.
-                    m_rs_tap_pending = false;
-                } else {
-                    ++m_rs_tap_frames;
-                }
-            }
-        }
 
         // ── ZR double-click-hold → fast-forward ──────────────────────────────
         // First ZR press arms the detector.  A second ZR press within

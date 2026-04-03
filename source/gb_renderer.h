@@ -42,17 +42,14 @@ extern bool g_fb_is_rgb565;
 extern bool g_fb_is_prepacked;
 // PaletteMode defined in gb_core.h (included above)
 
-// ── Runtime viewport scale toggle ─────────────────────────────────────────────
-// false = 2.5× (400×360, default), true = 2× (320×288, pixel-perfect integer).
-// Toggled by a quick tap on the screen region.
-// VP_X/VP_Y/VP_W/VP_H constexpr values in gb_core.h are the 2.5× maximums and
-// still used for static array sizing — runtime queries go through these inlines.
-extern bool g_vp_2x;
-inline int vp_x() { return g_vp_2x ? 64  : VP_X; }         // 2×: (448-320)/2 = 64
-inline int vp_y() { return g_vp_2x ? VP_Y + (VP_H-288)/2   // 2×: centre on same midpoint
-                                    : VP_Y; }               // 2.5×: original position
-inline int vp_w() { return g_vp_2x ? 320 : VP_W; }
-inline int vp_h() { return g_vp_2x ? 288 : VP_H; }
+// ── Fixed 2× pixel-perfect viewport constants ─────────────────────────────────
+// Overlay always renders at integer 2× scale (320×288, pixel-perfect).
+// VP_X/VP_Y/VP_W/VP_H in gb_core.h are the outer border dimensions and
+// still used for letterbox sizing and static array bounds.
+static constexpr int VP2_X = 64;                        // (448 - 320) / 2
+static constexpr int VP2_W = 320;
+static constexpr int VP2_H = 288;
+static constexpr int VP2_Y = VP_Y + (VP_H - VP2_H) / 2; // centred on outer border
 
 // -- Colour conversion to packed RGBA4444 uint16 ------------------------------
 // tsl::Color layout (little-endian struct): r4 | g4<<4 | b4<<8 | a4<<12
@@ -135,10 +132,12 @@ static inline void build_row_lut(uint32_t* dst, int start_y, int count, uint32_t
 }
 
 // LUTs indexed by viewport-relative coordinates:
-//   s_col_lut[ox]  for ox in [0, VP_W)  ->  col_part(VP_X + ox)
-//   s_row_lut[oy]  for oy in [0, VP_H)  ->  row_part(VP_Y + oy)
-static uint32_t s_col_lut[VP_W];   // 1600 bytes
-static uint32_t s_row_lut[VP_H];   // 1440 bytes
+//   s_col_lut[ox]  for ox in [0, VP2_W)  ->  col_part(VP2_X + ox)
+//   s_row_lut[oy]  for oy in [0, VP2_H)  ->  row_part(VP2_Y + oy)
+// Sized to the inner 2x viewport (VP2_W/VP2_H), not the full outer frame.
+// The outer frame LUTs below (s_outer_col_lut / s_outer_row_lut) cover VP_W/VP_H.
+static uint32_t s_col_lut[VP2_W];  // 1280 bytes  (320 entries × 4)
+static uint32_t s_row_lut[VP2_H];  // 1152 bytes  (288 entries × 4)
 static bool     s_lut_ready = false;
 
 // Outer LUTs cover the fixed outer viewport frame (VP_X..VP_X+VP_W, VP_Y..VP_Y+VP_H).
@@ -157,49 +156,11 @@ static void init_outer_lut() {
 }
 
 static void init_swizzle_lut() {
-    build_col_lut(s_col_lut, vp_x(), vp_w());
-    build_row_lut(s_row_lut, vp_y(), vp_h(), OWV);
+    build_col_lut(s_col_lut, VP2_X, VP2_W);
+    build_row_lut(s_row_lut, VP2_Y, VP2_H, OWV);
     s_lut_ready = true;
 }
 
-// -- Source-pixel coordinate LUTs ---------------------------------------------
-// Maps each GB source pixel index to its output viewport extent (VP-relative).
-static bool s_coord_ready = false;
-static int  s_dx0[GB_W], s_dx1[GB_W];   // int: no sign-extension in hot loop
-static int  s_dy0[GB_H], s_dy1[GB_H];
-
-static void init_coord_lut() {
-    const int cvp_w = vp_w(), cvp_h = vp_h();
-    for (int i = 0; i < GB_W; ++i) {
-        s_dx0[i] = i       * cvp_w / GB_W;
-        s_dx1[i] = (i + 1) * cvp_w / GB_W;
-    }
-    for (int i = 0; i < GB_H; ++i) {
-        s_dy0[i] = i       * cvp_h / GB_H;
-        s_dy1[i] = (i + 1) * cvp_h / GB_H;
-    }
-    s_coord_ready = true;
-}
-
-// Toggle between 2.5× and 2× scale.  Invalidates both LUTs so they rebuild
-// on the very next draw() call — zero overhead on every other frame.
-inline void toggle_vp_scale() {
-    g_vp_2x = !g_vp_2x;
-    s_lut_ready   = false;
-    s_coord_ready = false;
-}
-
-// Set the viewport scale to an explicit value and invalidate the LUTs.
-// Use this instead of toggle_vp_scale() when the caller already knows the
-// desired state (e.g. a MiniToggleListItem listener, where the framework
-// has already flipped its own internal state before calling the listener).
-// Calling toggle_vp_scale() there would double-flip g_vp_2x and leave the
-// LUTs rebuilt at the WRONG scale — the exact bug the Settings toggle had.
-inline void set_vp_scale(const bool want_2x) {
-    g_vp_2x       = want_2x;
-    s_lut_ready   = false;
-    s_coord_ready = false;
-}
 
 // -- LCD grid effect ----------------------------------------------------------
 // When enabled, darkens the last destination row and column of each GB source
@@ -264,55 +225,52 @@ static inline void neon_lut_fill(uint16_t* __restrict__ row_ptr,
 
 // Post-pass: darken grid-line pixels in the overlay viewport.
 //
-// Runs after render_gb_screen_chunk — both s_coord_ready and s_lut_ready are
-// guaranteed true at that point.
+// Runs after render_gb_screen_chunk — s_lut_ready is guaranteed true at that point.
 //
-// Complexity:
-//   Horizontal lines: GB_H × vp_w()   writes   (last dest-row of each GB row)
-//   Vertical   lines: GB_H × (avg_cell_h-1) × GB_W   writes   (last dest-col
-//     of each GB col, excluding rows already processed as horizontal lines)
-//
-// At 2.5×: ≈ 144×400 + 144×1.5×160 ≈ 92 K writes per frame when enabled.
-// At 2×:   ≈ 144×320 + 144×1×160   ≈ 69 K writes per frame when enabled.
-// Either way < 0.1 ms on the Switch CPU — negligible.
+// At 2×: ≈ 144×320 + 144×1×160 ≈ 69 K writes per frame when enabled.
+// < 0.1 ms on the Switch CPU — negligible.
 inline void render_gb_grid_overlay(tsl::gfx::Renderer* renderer) {
     if (!g_lcd_grid) return;
 
     auto* fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
-    const int cvp_w = vp_w();
 
-    // Precompute vertical offsets
-    uint32_t v_cols[GB_W];
-    for (int sx = 0; sx < GB_W; ++sx)
-        v_cols[sx] = s_col_lut[s_dx1[sx] - 1];
+    // At fixed 2× scale: each GB source pixel sx maps to dest cols sx*2 and sx*2+1.
+    // Grid column = last dest col of each source pixel = sx*2+1.
+    // Grid row    = last dest row of each source pixel = sy*2+1.
+    // The first dest row (sy*2) is the non-grid row for vertical lines.
 
-    // ── Horizontal lines (fully vectorized, unrolled)
+    // Precompute vertical offsets — static cache: s_col_lut is write-once
+    // after s_lut_ready flips, so these offsets never change at runtime.
+    // Eliminates a 160-iteration loop and 640 bytes of stack every frame.
+    static uint32_t v_cols[GB_W];
+    static bool     v_cols_ready = false;
+    if (!v_cols_ready) {
+        for (int sx = 0; sx < GB_W; ++sx)
+            v_cols[sx] = s_col_lut[sx * 2 + 1];
+        v_cols_ready = true;
+    }
+
+    // ── Horizontal lines: darken last dest row of each GB source row
     for (int sy = 0; sy < GB_H; ++sy) {
-        uint16_t* row_ptr = fb + s_row_lut[s_dy1[sy] - 1];
-        for (int ox = 0; ox < cvp_w; ox += 8) {
+        uint16_t* row_ptr = fb + s_row_lut[sy * 2 + 1];
+        for (int ox = 0; ox < VP2_W; ox += 8) {
             uint16x8_t px = vld1q_u16(&row_ptr[s_col_lut[ox]]);
             vst1q_u16(&row_ptr[s_col_lut[ox]], dim_packed_grid_vec(px));
         }
     }
 
-    // ── Vertical lines (fully vectorized, unrolled)
+    // ── Vertical lines: darken last dest col of each GB source col,
+    //    only on the first dest row (sy*2) — the horizontal pass covers sy*2+1.
     for (int sy = 0; sy < GB_H; ++sy) {
-        const int oy_end = s_dy1[sy] - 1; // skip horizontal grid row
-        for (int oy = s_dy0[sy]; oy < oy_end; ++oy) {
-            uint16_t* row_ptr = fb + s_row_lut[oy];
-            for (int sx = 0; sx < GB_W; sx += 8) {
-                // Load 8 columns into temp vector
-                uint16_t temp[8];
-
-                for (int i = 0; i < 8; ++i)
-                    temp[i] = row_ptr[v_cols[sx + i]];
-
-                uint16x8_t px = vld1q_u16(temp);
-                vst1q_u16(temp, dim_packed_grid_vec(px));
-                
-                for (int i = 0; i < 8; ++i)
-                    row_ptr[v_cols[sx + i]] = temp[i];
-            }
+        uint16_t* row_ptr = fb + s_row_lut[sy * 2];
+        for (int sx = 0; sx < GB_W; sx += 8) {
+            uint16_t temp[8];
+            for (int i = 0; i < 8; ++i)
+                temp[i] = row_ptr[v_cols[sx + i]];
+            uint16x8_t px = vld1q_u16(temp);
+            vst1q_u16(temp, dim_packed_grid_vec(px));
+            for (int i = 0; i < 8; ++i)
+                row_ptr[v_cols[sx + i]] = temp[i];
         }
     }
 }
@@ -487,80 +445,66 @@ inline void free_lcd_ghosting() {
     memset(s_sprite_flicker_cnt,   0, sizeof(s_sprite_flicker_cnt));
 }
 
-// -- GB screen render (Ultimate Switch NEON, fully vectorized, contiguous run detection)
-// Hot path summary per frame:
-//   - Outer loop: 144 GB source rows
-//   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
-//   - Per run: colour conversion fires exactly once
-//   - Per run: contiguity check fires exactly once (hoisted above oy loop)
-//   - Per run x output row: NEON vector store, 16 pixels in one go when contiguous
-// Template parameters:
-//   IS565 — true for CGB games (RGB565 source), false for DMG (RGB555 or pre-packed)
-//
-// IS_PREPACKED is a runtime bool rather than a template dimension.  It only changes
-// one line per RLE run (packed = run_pix vs the conversion), fires once per run not
-// per pixel, and the branch is perfectly predicted (constant for the whole session).
-// Making it runtime eliminates one full ~200-line function copy from .text.
-template <bool IS565>
-static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
-                                        const bool prepacked,
-                                        const int sy_start, const int sy_end) {
-    // Cache the framebuffer pointer once per call — eliminates a pointer load from
-    // renderer->m_currentFramebuffer on every destination row of every colour run.
-    // Safe to share across threads: getCurrentFramebuffer() returns a stable pointer
-    // for the entire frame; each thread writes to disjoint row bands.
+// -- GB screen render (fixed 2× integer scale, NEON-accelerated)
+// Hot path per frame:
+//   - Outer loop: GB_H source rows; each maps to exactly 2 dest rows (sy*2, sy*2+1).
+//   - RLE scan groups identical source pixels into runs (~2000–4000 total).
+//   - Colour conversion fires once per run; oy loop is manually unrolled to 2 writes.
+//   - is565 / prepacked are session-constant → perfectly predicted runtime branches.
+//     Using runtime bools (not templates) keeps a single .text copy of the function.
+static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
+                                   const bool is565,
+                                   const int sy_start, const int sy_end) {
     uint16_t* __restrict__ fb = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+    const bool prepacked = g_fb_is_prepacked;
 
     for (int sy = sy_start; sy < sy_end; ++sy) {
-        const int oy0 = s_dy0[sy];
-        const int oy1 = s_dy1[sy];
+        const int oy0 = sy * 2;           // always exactly 2 dest rows at 2× scale
         const uint16_t* __restrict__ src = g_gb_fb + sy * GB_W;
 
-        int run_sx  = 0;
+        int      run_sx  = 0;
         uint16_t run_pix = src[0];
 
         for (int sx = 1; sx <= GB_W; ++sx) {
             const uint16_t pix = (sx < GB_W) ? src[sx] : static_cast<uint16_t>(~run_pix);
             if (pix == run_pix) [[likely]] continue;
 
-            const int ox0   = s_dx0[run_sx];
-            const int ox1   = s_dx1[sx - 1];
+            // At 2× each source pixel maps to 2 dest columns: ox = src_x * 2.
+            const int ox0   = run_sx * 2;
+            const int ox1   = sx * 2;
             const int run_w = ox1 - ox0;
 
-            // Colour conversion: once per run.
-            // prepacked branch: constant for the session → perfectly predicted.
+            // Colour conversion: once per run (session-constant branch, perfectly predicted).
             uint16_t packed;
-            if constexpr (IS565) {
+            if (is565)
                 packed = rgb565_to_packed(run_pix);
-            } else {
+            else
                 packed = prepacked ? run_pix : rgb555_to_packed(run_pix);
-            }
 
             const uint32_t* __restrict__ cl = s_col_lut + ox0;
 
-            // Contiguity check: depends only on cl and run_w, both constant across
-            // the oy loop.  Hoisting it here fires it once per run instead of once
-            // per (run × oy), and allows the compiler to emit two clean oy loops
-            // with no branch inside either.
+            // Contiguity check: hoisted above the oy unroll so it fires once per run.
             if (cl[0] + run_w - 1 == cl[run_w - 1]) {
-                // --- Contiguous path: vst1q_u16 × 2 = 16 pixels per store ---
-                // vcol set up once per run (not per oy) now that we're outside.
+                // --- Contiguous path: two unrolled vst1q_u16 row writes ---
                 const uint16x8_t vcol = vdupq_n_u16(packed);
-                for (int oy = oy0; oy < oy1; ++oy) {
-                    uint16_t* row_ptr = fb + s_row_lut[oy];
-                    int ox = 0;
-                    while (ox + 15 < run_w) {
-                        vst1q_u16(row_ptr + cl[ox],     vcol);
-                        vst1q_u16(row_ptr + cl[ox + 8], vcol);
-                        ox += 16;
-                    }
-                    for (; ox < run_w; ++ox)
-                        row_ptr[cl[ox]] = packed;
+                uint16_t* row0 = fb + s_row_lut[oy0];
+                uint16_t* row1 = fb + s_row_lut[oy0 + 1];
+                int ox = 0;
+                while (ox + 15 < run_w) {
+                    vst1q_u16(row0 + cl[ox],     vcol);
+                    vst1q_u16(row0 + cl[ox + 8], vcol);
+                    vst1q_u16(row1 + cl[ox],     vcol);
+                    vst1q_u16(row1 + cl[ox + 8], vcol);
+                    ox += 16;
+                }
+                for (; ox < run_w; ++ox) {
+                    row0[cl[ox]] = packed;
+                    row1[cl[ox]] = packed;
                 }
             } else {
-                // --- Scattered path: neon_lut_fill with absolute col indices ---
-                for (int oy = oy0; oy < oy1; ++oy)
-                    neon_lut_fill(fb + s_row_lut[oy], s_col_lut, ox0, ox1, packed);
+                // --- Scattered path: two unrolled neon_lut_fill calls ---
+                neon_lut_fill(fb + s_row_lut[oy0],     s_col_lut, ox0, ox1, packed);
+                neon_lut_fill(fb + s_row_lut[oy0 + 1], s_col_lut, ox0, ox1, packed);
             }
 
             run_sx  = sx;
@@ -569,26 +513,15 @@ static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
     }
 }
 
-// Thin wrapper — dispatch is one branch per thread launch, outside the pixel loop.
-static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
-                                   const bool is565,
-                                   const int sy_start, const int sy_end) {
-    if (is565)
-        render_gb_screen_chunk_impl<true> (renderer, false,               sy_start, sy_end);
-    else
-        render_gb_screen_chunk_impl<false>(renderer, g_fb_is_prepacked,   sy_start, sy_end);
-}
-
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
-    if (!s_lut_ready)   init_swizzle_lut();
-    if (!s_coord_ready) init_coord_lut();
+    if (!s_lut_ready) init_swizzle_lut();
 
     if (!ult::expandedMemory) {
         // Single-thread path — no thread overhead.
         render_gb_screen_chunk(renderer, g_fb_is_rgb565, 0, GB_H);
     } else {
         // Multi-thread path — split source rows across the wallpaper render pool.
-        // render_gb_screen_chunk_impl caches getCurrentFramebuffer() once inside,
+        // render_gb_screen_chunk caches getCurrentFramebuffer() once inside,
         // so all threads share the same stable fb pointer and write to disjoint
         // row bands — no synchronisation needed.
         const int numT  = static_cast<int>(std::min(
@@ -618,12 +551,10 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
 // Only drawn in 2× (pixel-perfect) mode.
 // The border always spans the full 2.5× outer frame (VP_X/Y/W/H).
 // In 2× mode the game image is 288px tall, leaving a 36px gap at the bottom:
-//   gap top    = vp_y() + vp_h() = 144 + 288 = 432
-//   gap bottom = VP_Y   + VP_H   = 108 + 360 = 468
+//   gap top    = VP2_Y + VP2_H = 144 + 288 = 432
+//   gap bottom = VP_Y  + VP_H  = 108 + 360 = 468
 //   gap height = 36px → 4px padding each side → font size 18.
 inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
-    if (!g_vp_2x) return;
-
     static constexpr int LOGO_SIZE = 18;
     // gap top=432, gap bottom=468, centred baseline:
     static constexpr int LOGO_Y    = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1;
@@ -695,7 +626,7 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
 //
 // Using a=0xF (fully opaque) instead of the previous a=0xE to allow direct writes.
 // The visual difference over any wallpaper is imperceptible for near-black fills.
-// No-op in 2.5× mode (g_vp_2x == false).
+// Always active — overlay always renders at 2× pixel-perfect scale.
 static inline void fill_letterbox_rect(tsl::gfx::Renderer* renderer,
                                        const int ox0, const int ox1,
                                        const int oy0, const int oy1,
@@ -723,7 +654,6 @@ static inline void fill_letterbox_rect(tsl::gfx::Renderer* renderer,
 }
 
 inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
-    if (!g_vp_2x) return;
     if (!s_outer_lut_ready) init_outer_lut();
 
     static constexpr uint16_t PACKED_LB = 0xE111u;
