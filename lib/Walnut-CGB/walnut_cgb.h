@@ -3525,8 +3525,8 @@ void __gb_draw_line(struct gb_s *gb)
 						/* Set pixel colour. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;  // add 0x20 to differentiate from BG
 						/* Ghosting: track sprite visibility and mark flicker pixels. */
-						s_sprite_rendered_curr[s] = true;
 						if (s_flicker_pixel_curr) {
+						    s_sprite_rendered_curr[s] = true;
 						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
 						}
 					}
@@ -3541,8 +3541,8 @@ void __gb_draw_line(struct gb_s *gb)
 						/* no_obj_priority=true: sprite wins unconditionally. */
 						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;
 						/* Ghosting: track sprite visibility and mark flicker pixels. */
-						s_sprite_rendered_curr[s] = true;
 						if (s_flicker_pixel_curr) {
+						    s_sprite_rendered_curr[s] = true;
 						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
 						}
 					}
@@ -3586,8 +3586,8 @@ void __gb_draw_line(struct gb_s *gb)
 					pixels[disp_x] &= ~LCD_PALETTE_BG;
 #endif
 					/* Ghosting: track sprite visibility and mark flicker pixels. */
-					s_sprite_rendered_curr[s] = true;
 					if (s_flicker_pixel_curr) {
+					    s_sprite_rendered_curr[s] = true;
 					    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
 					}
 				}
