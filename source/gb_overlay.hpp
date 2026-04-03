@@ -330,7 +330,8 @@ public:
     virtual tsl::elm::Element* createUI() override {
         tsl::disableHiding = true;
         // ALWAYS release ult::Audio's audio session in windowed mode.
-        ult::Audio::exit();
+        if (ult::useSoundEffects && !ult::limitedMemory) ult::Audio::exit();
+        
         // ── Deferred ROM load ─────────────────────────────────────────────────
         // g_pending_rom_path is set by the click listener instead of calling
         // gb_load_rom() there.  By the time createUI() runs, ~RomSelectorGui()

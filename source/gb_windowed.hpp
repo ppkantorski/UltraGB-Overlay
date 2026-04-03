@@ -570,7 +570,7 @@ public:
     // ── createUI ─────────────────────────────────────────────────────────────
     tsl::elm::Element* createUI() override {
         // ALWAYS release ult::Audio's audio session in windowed mode.
-        ult::Audio::exit();
+        if (ult::useSoundEffects && !ult::limitedMemory) ult::Audio::exit();
 
         // Ensure screenshots work.
         screenshotsAreDisabled.store(false, std::memory_order_release);

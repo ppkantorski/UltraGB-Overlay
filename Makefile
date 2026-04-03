@@ -17,7 +17,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.4.5
+APP_VERSION := 0.7.0
 TARGET      := gbemu
 BUILD       := build
 SOURCES     := source

@@ -209,11 +209,7 @@ static void save_vol_backup() {
 // Parse "1"/"2"/"3"/"4"/"5"/"6" win_scale string → int; anything else → 1.
 // Avoids duplicating the identical 6-branch if/else at three sites in main().
 static int parse_win_scale_str(const std::string& sv) {
-    if (sv == "6") return 6;
-    if (sv == "5") return 5;
-    if (sv == "4") return 4;
-    if (sv == "3") return 3;
-    if (sv == "2") return 2;
+    if (sv.size() == 1 && sv[0] >= '2' && sv[0] <= '6') return sv[0] - '0';
     return 1;
 }
 
@@ -389,12 +385,7 @@ static void save_win_output() {
 // The new scale takes effect the next time the user launches a ROM in
 // windowed mode (setNextOverlay reads it before Tesla initialises the layer).
 static void save_win_scale() {
-    const char* s = (g_win_scale == 6) ? "6"
-                  : (g_win_scale == 5) ? "5"
-                  : (g_win_scale == 4) ? "4"
-                  : (g_win_scale == 3) ? "3"
-                  : (g_win_scale == 2) ? "2"
-                  :                      "1";
+    const char s[2] = { static_cast<char>('0' + g_win_scale), '\0' };
     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinScale, s, "");
 }
 
@@ -584,6 +575,20 @@ static void build_game_config_path(const char* romPath, char* out, size_t outSz)
     snprintf(out, outSz, "%s%s.ini", CONFIGURE_DIR, base);
 }
 
+// Generic per-game config helpers — shared by all load_game_* / save_game_*
+// functions below.  Both keep the cfgPath on the stack; no heap allocation.
+static std::string load_game_cfg_str(const char* romPath, const char* key) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    return ult::parseValueFromIniSection(cfgPath, kConfigSection, key);
+}
+static void save_game_cfg_str(const char* romPath, const char* key, const char* value) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    ult::createDirectory(CONFIGURE_DIR);
+    ult::setIniFileValue(cfgPath, kConfigSection, key, value, "");
+}
+
 static const char* palette_mode_to_str(PaletteMode m) {
     switch (m) {
         case PaletteMode::SGB:    return "SGB";
@@ -601,17 +606,11 @@ static PaletteMode str_to_palette_mode(const std::string& s) {
 }
 
 static PaletteMode load_game_palette_mode(const char* romPath) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    return str_to_palette_mode(
-        ult::parseValueFromIniSection(cfgPath, kConfigSection, "palette_mode"));
+    return str_to_palette_mode(load_game_cfg_str(romPath, "palette_mode"));
 }
 
 static void save_game_palette_mode(const char* romPath, PaletteMode m) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    ult::createDirectory(CONFIGURE_DIR);
-    ult::setIniFileValue(cfgPath, kConfigSection, "palette_mode", palette_mode_to_str(m), "");
+    save_game_cfg_str(romPath, "palette_mode", palette_mode_to_str(m));
 }
 
 // ── Palette cycling helpers ───────────────────────────────────────────────────
@@ -640,17 +639,11 @@ static const char* palette_mode_label(PaletteMode m) {
 // Default is OFF (absent key → false) — ghosting is opt-in per game.
 // =============================================================================
 static bool load_game_lcd_ghosting(const char* romPath) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    const std::string val = ult::parseValueFromIniSection(cfgPath, kConfigSection, "lcd_ghosting");
-    return val == "1";
+    return load_game_cfg_str(romPath, "lcd_ghosting") == "1";
 }
 
 static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    ult::createDirectory(CONFIGURE_DIR);
-    ult::setIniFileValue(cfgPath, kConfigSection, "lcd_ghosting", enabled ? "1" : "0", "");
+    save_game_cfg_str(romPath, "lcd_ghosting", enabled ? "1" : "0");
 }
 
 // =============================================================================
@@ -659,17 +652,11 @@ static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
 // Default is ON (absent key → true) — matches the hardcoded default in walnut.
 // =============================================================================
 static bool load_game_no_sprite_limit(const char* romPath) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    const std::string val = ult::parseValueFromIniSection(cfgPath, kConfigSection, "no_sprite_limit");
-    return val != "0";  // absent or "1" → true (on by default)
+    return load_game_cfg_str(romPath, "no_sprite_limit") != "0";  // absent or "1" → true (on by default)
 }
 
 static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
-    char cfgPath[PATH_BUFFER_SIZE];
-    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    ult::createDirectory(CONFIGURE_DIR);
-    ult::setIniFileValue(cfgPath, kConfigSection, "no_sprite_limit", enabled ? "1" : "0", "");
+    save_game_cfg_str(romPath, "no_sprite_limit", enabled ? "1" : "0");
 }
 
 
@@ -1057,45 +1044,43 @@ static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t
     read_timestamp_from(tsPath, out, outSz);
 }
 
-// Returns the label ("Slot N") of the most-recently written slot file,
-// or "" if all slots are empty.  Uses the .ts file mtime so the comparison
-// is byte-exact regardless of the DIVIDER_SYMBOL encoding.
-static std::string newest_state_slot_label(const char* romPath) {
+// "Slot 0"–"Slot 9" (6–7 chars) fit within ARM64 libstdc++ SSO (≤15 chars) — no heap alloc.
+static std::string make_slot_label(int slot) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Slot %d", slot);
+    return buf;
+}
+
+// Shared newest-slot scanner — finds the most-recently written .ts file across
+// all 10 slots and returns its label, or "" if all slots are empty.
+// buildTs is one of build_user_slot_ts_path / build_save_backup_slot_ts_path.
+static std::string newest_slot_label(const char* romPath,
+    void(*buildTs)(const char*, int, char*, size_t)) {
     time_t best = -1;
     int    best_slot = -1;
     for (int i = 0; i < 10; ++i) {
         char tsPath[PATH_BUFFER_SIZE] = {};
-        build_user_slot_ts_path(romPath, i, tsPath, sizeof(tsPath));
+        buildTs(romPath, i, tsPath, sizeof(tsPath));
         struct stat st{};
         if (::stat(tsPath, &st) == 0 && st.st_mtime > best) {
             best = st.st_mtime;
             best_slot = i;
         }
     }
-    if (best_slot < 0) return "";
-    char label[16];
-    snprintf(label, sizeof(label), "Slot %d", best_slot);
-    return label;
+    return best_slot >= 0 ? make_slot_label(best_slot) : std::string{};
+}
+
+// Returns the label ("Slot N") of the most-recently written slot file,
+// or "" if all slots are empty.  Uses the .ts file mtime so the comparison
+// is byte-exact regardless of the DIVIDER_SYMBOL encoding.
+static std::string newest_state_slot_label(const char* romPath) {
+    return newest_slot_label(romPath, build_user_slot_ts_path);
 }
 
 static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz); // forward declare
 
 static std::string newest_save_backup_slot_label(const char* romPath) {
-    time_t best = -1;
-    int    best_slot = -1;
-    for (int i = 0; i < 10; ++i) {
-        char tsPath[PATH_BUFFER_SIZE] = {};
-        build_save_backup_slot_ts_path(romPath, i, tsPath, sizeof(tsPath));
-        struct stat st{};
-        if (::stat(tsPath, &st) == 0 && st.st_mtime > best) {
-            best = st.st_mtime;
-            best_slot = i;
-        }
-    }
-    if (best_slot < 0) return "";
-    char label[16];
-    snprintf(label, sizeof(label), "Slot %d", best_slot);
-    return label;
+    return newest_slot_label(romPath, build_save_backup_slot_ts_path);
 }
 
 // =============================================================================
@@ -1832,8 +1817,10 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
         cx += renderer->drawString(ult::SPLIT_PROJECT_NAME_1, false, cx, y, fontSize, tsl::logoColor1).first;
     }
     cx += renderer->drawString("GB",  false, cx, y, fontSize, tsl::logoColor2).first;
-    if (quickModeSymbol && g_directMode)
-        cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, tsl::RGB888("6ea0f0")).first;
+    if (quickModeSymbol && g_directMode) {
+        static const auto directModeColor = tsl::RGB888("6ea0f0");
+        cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, directModeColor).first;
+    }
     return cx;
 }
 
@@ -1913,11 +1900,9 @@ public:
             if (save_user_slot(romPath.c_str(), slot)) {
                 triggerEnterFeedback();
                 // Return to SaveStatesGui, jumping back to the correct slot item
-                char label[16];
-                snprintf(label, sizeof(label), "Slot %d", slot);
                 //triggerEnterFeedback();
                 triggerRumbleClick.store(true, std::memory_order_release);
-                tsl::swapTo<SaveStatesGui>(romPath, displayName, label);
+                tsl::swapTo<SaveStatesGui>(romPath, displayName, make_slot_label(slot));
                 show_notify("State saved.");
             } else {
                 triggerWallFeedback();
@@ -1983,11 +1968,7 @@ public:
             delete_file(tsPath);
             
             // Return to SaveStatesGui, scrolling back to this slot
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", slot);
-            
-
-            tsl::swapTo<SaveStatesGui>(romPath, displayName, label);
+            tsl::swapTo<SaveStatesGui>(romPath, displayName, make_slot_label(slot));
             triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
             show_notify("Slot deleted.");
             return true;
@@ -2006,9 +1987,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", m_slot);
-            tsl::swapTo<SaveStatesGui>(m_rom_path, m_display_name, label);
+            tsl::swapTo<SaveStatesGui>(m_rom_path, m_display_name, make_slot_label(m_slot));
             return true;
         }
         return false;
@@ -2049,11 +2028,9 @@ public:
             if (!(keys & KEY_A)) return false;
             
             if (backup_save_data_slot(romPath.c_str(), slot)) {
-                char label[16];
-                snprintf(label, sizeof(label), "Slot %d", slot);
                 triggerEnterFeedback();
                 show_notify("Save data backed up.");
-                tsl::swapTo<SaveDataGui>(romPath, displayName, label);
+                tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
             } else {
                 triggerWallFeedback();
                 show_notify("No save data found.");
@@ -2081,9 +2058,7 @@ public:
                 return true;
             }
             
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", slot);
-            tsl::swapTo<SaveDataGui>(romPath, displayName, label);
+            tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
             triggerEnterFeedback();
             show_notify("Save data restored.");
             return true;
@@ -2107,11 +2082,7 @@ public:
             build_save_backup_slot_ts_path(romPath.c_str(), slot, tsPath, sizeof(tsPath));
             delete_file(tsPath);
             
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", slot);
-            triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
-            
-            tsl::swapTo<SaveDataGui>(romPath, displayName, label);
+            tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
             triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
             show_notify("Slot deleted.");
             return true;
@@ -2130,9 +2101,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", m_slot);
-            tsl::swapTo<SaveDataGui>(m_rom_path, m_display_name, label);
+            tsl::swapTo<SaveDataGui>(m_rom_path, m_display_name, make_slot_label(m_slot));
             return true;
         }
         return false;
@@ -2170,11 +2139,8 @@ public:
             char ts[48] = {};
             read_save_backup_timestamp(romPath.c_str(), i, ts, sizeof(ts));
 
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", i);
-
-            auto* item = new tsl::elm::MiniListItem(label, ts);
             const int slot = i;
+            auto* item = new tsl::elm::MiniListItem(make_slot_label(i), ts);
             item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
                 tsl::swapTo<SaveDataSlotActionGui>(romPath, displayName, slot);
@@ -2240,11 +2206,8 @@ public:
             char ts[48] = {};
             read_slot_timestamp(romPath.c_str(), i, ts, sizeof(ts));
 
-            char label[16];
-            snprintf(label, sizeof(label), "Slot %d", i);
-
-            auto* item = new tsl::elm::MiniListItem(label, ts);
             const int slot = i;
+            auto* item = new tsl::elm::MiniListItem(make_slot_label(i), ts);
             item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
                 tsl::swapTo<SlotActionGui>(romPath, displayName, slot);
@@ -3317,6 +3280,32 @@ public:
     }
 };
 
+// Clamp g_win_scale to the maximum the current heap tier can support.
+// romPath is used only for the earlyExpanded (8 MB) 6× check; pass nullptr
+// when the ROM path is not yet known (forces 5× on that tier).
+// Called from main() before the framebuffer is sized — must run before tsl::loop.
+static void clamp_win_scale(bool earlyLimited, bool earlyRegularMemory,
+                             bool earlyExpanded, const char* romPath) {
+    if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
+    if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
+    if (g_win_scale < 6) return;
+    // earlyExpanded == true means EXACTLY 8 MB.
+    // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
+    const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
+    const bool consoleIsDocked = ult::consoleIsDocked();
+    if (isFurtherExpanded) {
+        // 10 MB+: 6× allowed for any ROM size; need docked + 1080p.
+        if (!(consoleIsDocked && g_win_1080)) g_win_scale = 5;
+    } else if (earlyExpanded) {
+        // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
+        const size_t rsz = (romPath && romPath[0]) ? get_rom_size(romPath) : 0;
+        if (!(consoleIsDocked && g_win_1080 && rsz < kROM_4MB)) g_win_scale = 5;
+    } else {
+        // 4 MB / 6 MB — unreachable (already clamped to 3 or 4 above).
+        g_win_scale = 5;
+    }
+}
+
 int main(int argc, char* argv[]) {
     // Build the full path to this overlay so setNextOverlay can relaunch us.
     // argv[0] on NX is just the bare filename (e.g. "gbemu.ovl"), NOT a full
@@ -3420,35 +3409,17 @@ int main(int argc, char* argv[]) {
                         g_win_1080 = (out_val == "1080");
                     }
 
-                    // Read win_scale and apply the same early-memory clamps
-                    // used in the -windowed block below.
-                    {
-                        g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
-                        if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
-                        if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
-                        if (g_win_scale >= 6) {
-                            // earlyExpanded == true means EXACTLY 8 MB.
-                            // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
-                            const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
-                            if (isFurtherExpanded) {
-                                // 10 MB+: 6× allowed for any ROM; need docked + 1080p.
-                                if (!(ult::consoleIsDocked() && g_win_1080))
-                                    g_win_scale = 5;
-                            } else if (earlyExpanded) {
-                                // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
-                                if (!(ult::consoleIsDocked() && g_win_1080 && get_rom_size(fullPath.c_str()) < kROM_4MB))
-                                    g_win_scale = 5;
-                            } else {
-                                // 4 MB / 6 MB — unreachable (already clamped above).
-                                g_win_scale = 5;
-                            }
-                        }
-                    }
+                    // Read win_scale and clamp to the effective heap-tier maximum.
+                    // Memory tiers and limits are documented in clamp_win_scale().
+                    // The stored config value is intentionally NOT written back;
+                    // the user's intent is preserved for higher-memory sessions.
+                    g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
+                    clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded, fullPath.c_str());
 
                     // Write to config so WindowedOverlay::initServices() picks
                     // them up (it always reads from config.ini, not from globals).
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, fullPath, "");
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, fullPath);
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1");
 
                     // Lock so WindowedOverlay::initServices() → load_config()
                     // does not restore the raw stored win_scale over the clamped value.
@@ -3480,44 +3451,17 @@ int main(int argc, char* argv[]) {
                     kConfigFile, kConfigSection, kKeyWinScale));
 
                 // Clamp scale to the maximum the current heap tier can support.
-                // These clamps mirror what load_config() would apply in a normal
-                // overlay session, but must be done here (before tsl::loop) because
-                // the framebuffer is sized BEFORE Tesla / load_config initialises.
-                //
-                // Memory tiers:
-                //   4 MB (earlyLimited):       max 3×
-                //   6 MB (earlyRegularMemory): max 4×
-                //   8 MB (earlyExpanded):      max 5×; 6× only for docked+1080p+ROM<4MB
-                //  10 MB+ (none of the above): max 6× for docked+1080p (any ROM size)
-                //
+                // Memory tiers and limits are documented in clamp_win_scale().
                 // The stored config value is intentionally NOT written back; the user's
                 // intent is preserved for higher-memory sessions.
-
-                if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
-                if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
-                if (g_win_scale >= 6) {
-                    // earlyExpanded == true means EXACTLY 8 MB.
-                    // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
-                    const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
-                    if (isFurtherExpanded) {
-                        // 10 MB+: 6× allowed for any ROM size; need docked + 1080p.
-                        if (!(ult::consoleIsDocked() && g_win_1080))
-                            g_win_scale = 5;
-                    } else if (earlyExpanded) {
-                        // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
-                        // Read the windowed ROM path (written to config by the caller
-                        // before setNextOverlay).  Key is erased in initServices() —
-                        // reading it here does not consume it.
-                        const std::string wrom = ult::parseValueFromIniSection(
-                            kConfigFile, kConfigSection, kKeyWindowedRom);
-                        const size_t wrsz = wrom.empty() ? 0 : get_rom_size(wrom.c_str());
-                        if (!(ult::consoleIsDocked() && g_win_1080 && wrsz < kROM_4MB))
-                            g_win_scale = 5;
-                    } else {
-                        // 4 MB / 6 MB — unreachable (already clamped to 3 or 4 above).
-                        g_win_scale = 5;
-                    }
-                }
+                //
+                // For the 8 MB 6× check, read the windowed ROM path that the caller
+                // wrote to config before setNextOverlay.  The key is erased in
+                // initServices() — reading it here does not consume it.
+                const std::string wrom = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeyWindowedRom);
+                clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
+                                wrom.empty() ? nullptr : wrom.c_str());
             }
             // Lock g_win_scale so WindowedOverlay::initServices() → load_config()
             // does not read the raw stored value back from config.ini and override
@@ -3532,8 +3476,6 @@ int main(int argc, char* argv[]) {
 
     // ── Normal launch ─────────────────────────────────────────────────────────
     normal_overlay_launch:
-    //if (!g_returning_from_windowed)
-    //    g_directMode = false;
     returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }

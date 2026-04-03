@@ -241,12 +241,13 @@ inline void render_gb_grid_overlay(tsl::gfx::Renderer* renderer) {
 
     // Precompute vertical offsets — static cache: s_col_lut is write-once
     // after s_lut_ready flips, so these offsets never change at runtime.
-    // Eliminates a 160-iteration loop and 640 bytes of stack every frame.
-    static uint32_t v_cols[GB_W];
+    // Eliminates a 160-iteration loop and 320 bytes of stack every frame.
+    // uint16_t is safe: max col_part value for this viewport is 45207 < 65535.
+    static uint16_t v_cols[GB_W];
     static bool     v_cols_ready = false;
     if (!v_cols_ready) {
         for (int sx = 0; sx < GB_W; ++sx)
-            v_cols[sx] = s_col_lut[sx * 2 + 1];
+            v_cols[sx] = static_cast<uint16_t>(s_col_lut[sx * 2 + 1]);
         v_cols_ready = true;
     }
 
@@ -412,23 +413,27 @@ inline void apply_lcd_ghosting() {
     update_sprite_flicker_state();
 
     // Carry this frame's flicker marks to prev, clear curr for next frame.
-    // This keeps is_flicker=true on the OFF frame: prev[i] holds the mark
-    // that walnut set during the previous ON frame.
-    memcpy(s_flicker_pixel_prev, s_flicker_pixel_curr, total);
+    // Pointer swap instead of memcpy+memset: old curr becomes new prev,
+    // old prev becomes new curr and is zeroed.  Eliminates the 23 KB copy.
+    uint8_t* tmp      = s_flicker_pixel_prev;
+    s_flicker_pixel_prev = s_flicker_pixel_curr;
+    s_flicker_pixel_curr = tmp;
     memset(s_flicker_pixel_curr, 0, total);
 }
 
 // Invalidate ghosting state on ROM switch or reset.
 // Resets all sprite-flicker tracking so stale counters from the old game
 // cannot bleed into the new one.  Does NOT free heap; keeps allocations live.
+//
+// Buffer memsets are intentionally omitted: s_prev_fb_valid = false causes
+// apply_lcd_ghosting() to overwrite s_prev_fb via memcpy and zero both
+// flicker pixel buffers on the very first frame it runs after a reset,
+// before any blend logic executes.  Zeroing them here would be redundant.
 inline void reset_lcd_ghosting() {
     s_prev_fb_valid = false;
     memset(s_sprite_rendered_curr, 0, sizeof(s_sprite_rendered_curr));
     memset(s_sprite_rendered_prev, 0, sizeof(s_sprite_rendered_prev));
     memset(s_sprite_flicker_cnt,   0, sizeof(s_sprite_flicker_cnt));
-    if (s_prev_fb)            memset(s_prev_fb,            0, GB_W * GB_H * sizeof(uint16_t));
-    if (s_flicker_pixel_curr) memset(s_flicker_pixel_curr, 0, GB_W * GB_H);
-    if (s_flicker_pixel_prev) memset(s_flicker_pixel_prev, 0, GB_W * GB_H);
 }
 // Release all ghosting heap memory.  Called from gb_unload_rom() so the
 // memory returns to the heap when no game is running.
