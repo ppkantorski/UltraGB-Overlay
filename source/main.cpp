@@ -22,11 +22,10 @@
 #include <ultra.hpp>
 #include <tesla.hpp>
 
-#include "gb_audio.h"       // ← GB APU → audout bridge  (must precede gb_core.h)
-#include "gb_core.h"
-#include "gb_renderer.h"
 #include "elm_volume.hpp"    // ← VolumeTrackBar
 #include "elm_ultraframe.hpp" // ← UltraGBOverlayFrame (two-page frame)
+#include "gb_utils.hpp"      // ← globals + all shared helpers
+                             //   (pulls in gb_globals.hpp → gb_audio.h, gb_core.h, gb_renderer.h)
 
 #include <dirent.h>
 #include <ctime>
@@ -37,168 +36,8 @@
 using namespace ult;
 
 // =============================================================================
-// Paths / config
+// Paths, globals, and data-coupled helpers → gb_globals.hpp (via gb_utils.hpp)
 // =============================================================================
-static constexpr const char* CONFIG_DIR        = "sdmc:/config/ultragb/";
-static constexpr const char* CONFIG_FILE       = "sdmc:/config/ultragb/config.ini";
-static constexpr const char* SAVE_BASE_DIR     = "sdmc:/config/ultragb/saves/";
-static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
-static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
-//static constexpr const char* INTERNAL_SAVE_BASE_DIR  = "sdmc:/config/ultragb/saves/internal/";  // live .sav files
-static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
-
-static constexpr size_t PATH_BUFFER_SIZE = 128;
-static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
-static char g_save_dir[PATH_BUFFER_SIZE]            = "sdmc:/config/ultragb/saves/internal/";
-static char g_last_rom_path[PATH_BUFFER_SIZE]       = {};   // basename of last-played ROM, persisted to config.ini
-static char g_pending_rom_path[PATH_BUFFER_SIZE]    = {};   // path deferred from click listener → loaded in GBOverlayGui::createUI()
-static char g_rom_selector_scroll[PATH_BUFFER_SIZE] = {};  // last ROM the user interacted with in the selector; used to restore scroll on page flip
-static char g_settings_scroll[64]                   = {};  // last focused item label in SettingsGui; cleared on game launch, restored on page flip
-
-
-static constexpr const char* NOT_ENOUGH_MEMORY_WARNING = "Not enough memory.";
-static constexpr const char* SLOT_IS_EMPTY_WARNING = "Slot is empty.";
-static constexpr const char* REQUIRES_AT_LEAST_6MB = "Requires at least 6MB.";
-static constexpr const char* REQUIRES_AT_LEAST_8MB = "Requires at least 8MB.";
-static constexpr const char* REQUIRES_AT_LEAST_10MB = "Requires at least 10MB.";
-
-// Set true by GBOverlayGui when it exits to RomSelectorGui via X.
-// RomSelectorGui reads and clears this in its constructor, then blocks all
-// navigation input (and keeps clearing jumpToTop/Bottom/skipUp/skipDown) until every
-// physical key is released — preventing L/R/ZL/ZR presses made in-game from
-// firing a list-jump the moment the ROM selector appears.
-static bool g_waitForInputRelease = false;
-
-// Persistent config path string — avoids a heap alloc on every setIniFileValue call
-// (CONFIG_FILE is 31 chars, exceeds ARM64 libstdc++ SSO threshold of 15, so each
-// std::string(CONFIG_FILE) temporary heap-allocates.  This single persistent instance
-// is reused everywhere in place of per-call temporaries).
-static const std::string kConfigFile{CONFIG_FILE};
-
-// INI section name and key constants.
-// All ult:: INI helpers take const std::string& — using string literals directly
-// constructs a temporary std::string (heap alloc) on every call.  These static
-// instances are constructed once at startup and reused for the lifetime of the
-// process, eliminating those per-call allocations.
-static const std::string kConfigSection   {"config"};
-static const std::string kKeyRomDir       {"rom_dir"};
-static const std::string kKeySaveDir      {"save_dir"};
-static const std::string kKeyLastRom      {"last_rom"};
-static const std::string kKeyVolume       {"volume"};
-static const std::string kKeyVolBackup    {"vol_backup"};
-static const std::string kKeyLcdGrid      {"lcd_grid"};
-static const std::string kKeyWindowed     {"windowed"};
-static const std::string kKeyIngameHaptics{"ingame_haptics"};
-static const std::string kKeyIngameWallpaper{"ingame_wallpaper"};
-static const std::string kKeyWinPosX      {"win_pos_x"};
-static const std::string kKeyWinPosY      {"win_pos_y"};
-static const std::string kKeyWinScale     {"win_scale"};
-static const std::string kKeyWinOutput    {"win_output"};   // "720" or "1080"
-static const std::string kKeyWindowedRom  {"windowed_rom"};
-static const std::string kKeyWinQuickExit {"win_quick_exit"};
-static const std::string kKeySettingsScroll{"settings_scroll"};
-static const std::string kKeyPlayerRom    {"overlay_rom"};      // ROM path for -overlay relaunch
-
-// Stack-only integer-to-string for 0–100 volume values.
-// std::to_string heap-allocates; this writes into a caller-supplied char[4] buffer.
-// Returns a pointer to buf (always null-terminated).
-static const char* vol_to_str(u8 v, char (&buf)[4]) {
-    if (v == 100) { buf[0]='1'; buf[1]='0'; buf[2]='0'; buf[3]='\0'; }
-    else if (v >= 10) { buf[0]='0'+v/10; buf[1]='0'+v%10; buf[2]='\0'; }
-    else               { buf[0]='0'+v;                      buf[1]='\0'; }
-    return buf;
-}
-
-// Unmute backup volume — the last positive volume before muting.
-// Persisted to vol_backup in config.ini so it survives app exit.
-// Always > 0; initialized to 50 as a safe default.
-static u8 g_vol_backup = 50;
-
-// ── Windowed mode ─────────────────────────────────────────────────────────────
-// When true the ROM selector relaunches this overlay with -windowed <path>,
-// rendering the Game Boy screen as a small draggable window with no UI chrome.
-static bool g_windowed_mode  = false;
-static bool g_ingame_haptics = true;
-static bool g_ingame_wallpaper = false;  // off by default; only relevant when expandedMemory is true
-
-// Set true by main() when the overlay is relaunched with the -returning argument
-// (i.e. the user exited windowed mode via the launch combo back to the normal UI).
-// Read and cleared in Overlay::initServices() to restore the settings scroll
-// position that was persisted to config.ini just before the windowed relaunch.
-static bool g_returning_from_windowed = false;
-
-static bool g_directMode = false;
-
-// Full path to this .ovl — captured from argv[0] so WindowedOverlay can
-// pass it to setNextOverlay when the launch combo is pressed to return here.
-static char g_self_path[PATH_BUFFER_SIZE] = {};
-
-// ROM path received via the -windowed <path> argument.
-// Set in main(), consumed by WindowedOverlay::loadInitialGui().
-static char g_win_rom_path[PATH_BUFFER_SIZE] = {};
-
-// Quick-launch combo string (raw, e.g. "L+R+DDOWN"). Empty = none configured.
-// Populated from overlays.ini mode_combos[0] in register_quick_launch_mode().
-static char g_quick_combo[64] = {};
-
-// Set true by main() when launched with the -quicklaunch mode argument.
-// Causes loadInitialGui() to skip the ROM selector and boot directly into
-// the last played ROM.  KEY_X (overlay) and the hide combo (windowed) then
-// close the overlay entirely instead of returning to the menu.
-static bool g_quick_launch = false;
-
-// Set true by main() when launched with the -overlay argument.
-// Causes loadInitialGui() to skip the ROM selector and boot directly into the
-// last-written overlay_rom (stored in config.ini by launch_overlay_mode()).
-// The overlay combo (launchCombo) closes the overlay entirely; X returns to the
-// ROM selector by relaunching the overlay with -returning.
-static bool g_overlay_mode = false;
-
-// ROM path received via the -overlay argument.
-// Written to config.ini by launch_overlay_mode() and read in
-// Overlay::initServices().  Consumed by loadInitialGui() on first use.
-static char g_overlay_rom_path[PATH_BUFFER_SIZE] = {};
-
-// Set true when a windowed quick-launch is triggered from loadInitialGui().
-// Written to config.ini as "win_quick_exit=1" before the -windowed relaunch so
-// WindowedOverlay::initServices() can read and clear it across the process boundary.
-// When true, GBWindowedGui's exit combo closes the overlay entirely without
-// relaunching the normal Overlay to return to the menu.
-static bool g_win_quick_exit = false;
-
-// Window position in VI-space (1920×1080).
-// WIN_VI_W = 1920*160/1280 = 240, WIN_VI_H = 1080*144/720 = 216.
-// Default: centred on the display.
-static int g_win_pos_x = (1920 - 240) / 2;   // 840  (1× default centre)
-static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
-
-// Windowed display scale: 1–6 (integer pixel scale factor).
-// 1× = 160×144 VI layer   2× = 320×288   3× = 480×432
-// 4× = 640×576            5× = 800×720   6× = 960×864
-//
-// g_win_scale serves two roles:
-//  • Normal overlay  — holds the RAW stored value from config.ini so the
-//    SettingsGui display can show the user's intent (make_label caps it to
-//    the current session's maxScale via std::min).  load_config() sets this
-//    value but does NOT write it back, preserving the stored intent.
-//  • Windowed session — holds the EFFECTIVE (hardware-safe) value clamped in
-//    main() before the framebuffer is sized.  load_config() must not override
-//    it after that point; g_win_scale_locked prevents it from doing so.
-//
-// g_win_scale is read in main() before tsl::loop so the framebuffer is sized
-// correctly before Tesla initialises.
-static int  g_win_scale        = 1;
-// Set true in main() after the framebuffer-sizing clamp so that
-// WindowedOverlay::initServices() → load_config() does not re-read win_scale
-// from config and override the correctly-clamped framebuffer-matching value.
-static bool g_win_scale_locked = false;
-
-// Windowed output resolution mode.
-// false = 720p-scaled (default): VI layer is ×1.5 the framebuffer size (LayerMaxWidth=1280 divisor).
-// true  = 1080p pixel-perfect:   VI layer equals the framebuffer exactly (LayerMaxWidth=1920 divisor).
-//         Each framebuffer pixel maps to exactly one display pixel — required for a clean LCD Grid.
-// Read from config.ini as "win_output" ("720" / "1080"); takes effect on next windowed launch.
-static bool g_win_1080 = false;
 
 static void save_vol_backup() {
     char buf[4];
@@ -206,31 +45,6 @@ static void save_vol_backup() {
                          vol_to_str(g_vol_backup, buf), "");
 }
 
-// Parse "1"/"2"/"3"/"4"/"5"/"6" win_scale string → int; anything else → 1.
-// Avoids duplicating the identical 6-branch if/else at three sites in main().
-static int parse_win_scale_str(const std::string& sv) {
-    if (sv.size() == 1 && sv[0] >= '2' && sv[0] <= '6') return sv[0] - '0';
-    return 1;
-}
-
-// Persist a label string into g_settings_scroll (max 63 chars + NUL).
-// Replaces the repeated strncpy + null-clamp pattern at three call sites.
-static void set_settings_scroll(const char* label) {
-    strncpy(g_settings_scroll, label, sizeof(g_settings_scroll) - 1);
-    g_settings_scroll[sizeof(g_settings_scroll) - 1] = '\0';
-}
-
-// Digit-safe unsigned integer parser (no std::stoi — exceptions disabled).
-// Returns true and writes out on success; false if s is empty or non-digit.
-static bool parse_uint(const std::string& s, int& out) {
-    if (s.empty()) return false;
-    int v = 0;
-    for (char c : s) {
-        if (c < '0' || c > '9') return false;
-        v = v * 10 + (c - '0');
-    }
-    out = v; return true;
-}
 
 static void load_config() {
     const std::string& path = kConfigFile;
@@ -416,12 +230,6 @@ static constexpr const char* const g_defaultCombos[] = {
     "ZL+ZR+LS",     "ZL+ZR+RS",     "ZL+ZR+L",        "ZL+ZR+R",    "ZL+ZR+LS+RS"
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-static bool combo_pressed(u64 keysDown, u64 keysHeld) {
-    return (keysDown & tsl::cfg::launchCombo) && \
-        (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo);
-}
-
 
 // Remove keyCombo from every overlay's key_combo AND mode_combos list in
 // overlays.ini, skipping our own section.  Called before assigning the combo
@@ -439,6 +247,7 @@ static bool combo_pressed(u64 keysDown, u64 keysHeld) {
 // skipOwnModeCombos=false (picker path, default): our section is fully
 //   processed.  save_combo() writes the fresh combo right after this call, so
 //   clearing our own mode_combos here is safe and produces a clean state.
+[[gnu::noinline]]
 static void remove_quick_combo_from_others(const std::string& keyCombo,
                                            bool skipOwnModeCombos = false) {
     if (keyCombo.empty()) return;
@@ -660,115 +469,6 @@ static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
 }
 
 
-// ROM buffer is allocated in gb_load_rom and freed in gb_unload_rom.
-// The wallpaper is always evicted BEFORE the ROM buffer is allocated, so that
-// the new malloc sees the maximum possible contiguous free region.
-
-GBState  g_gb;
-uint16_t* g_gb_fb = nullptr;   // ~45 KB heap-allocated on game load, freed on unload
-static bool g_emu_active = false;
-static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for a large ROM
-PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC title-lookup by default
-bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
-bool g_fb_is_prepacked        = false;  // true when g_gb_fb stores RGBA4444 (DMG games)
-bool g_lcd_ghosting           = false;  // 50/50 frame blend — simulates GBC LCD persistence; per-game, off by default
-bool g_lcd_grid               = false;  // LCD grid overlay — darkens inter-pixel gaps to simulate real GB Color LCD
-bool g_fast_forward           = false;  // true while ZR double-click-hold is active
-
-// Monotonically incrementing display-frame counter used for double-click timing.
-static uint32_t g_frame_count = 0;
-
-// Active DMG palette sub-arrays — written by gb_select_dmg_palette(), read every scanline.
-uint16_t g_dmg_flat_pal[64]  = {};   // filled by gb_select_dmg_palette()
-int  g_gbc_pal_idx   = -1;           // index into GBC_TITLE_TABLE (-1 = not found)
-bool g_gbc_pal_found = false;        // true if ROM was recognised in GBC_TITLE_TABLE
-// =============================================================================
-// Virtual on-screen button layout (Game GB skin)
-// All coordinates are in overlay pixels (448 × 720).
-// The screen bottom sits at VP_Y + VP_H = 140 + 360 = 500, leaving 220 px of
-// controller area below it.  Layout mirrors a real DMG Game GB:
-//   D-pad   — lower-left
-//   B / A   — lower-right, staggered (B lower-left of A, matching real GB)
-//   Start   — centre, near bottom
-//
-// Draw positions (top-left x, baseline y) are compile-time constants.
-// Hit-test centres are derived at runtime from getTextDimensions() so they
-// track the glyph's actual visual centre regardless of font metrics.
-// =============================================================================
-
-// D-pad — \uE110
-static constexpr int DPAD_DRAW_X = 29;    // left edge — fixed, glyph grows right
-static constexpr int DPAD_DRAW_Y = 634+4-4+14-4-2-2-2-10+4-2;   // baseline
-static constexpr int DPAD_SIZE   = 134;   // 112 × 1.2 — 20% larger, grows right/down from fixed top-left
-static constexpr int DPAD_R      = 65;    // 54 × 1.2 — hit radius scaled to match
-
-// A button — \uE0E0
-static constexpr int ABTN_DRAW_X = 344;   // left edge
-static constexpr int ABTN_DRAW_Y = 594-4-2-2-10+4-2;   // baseline
-static constexpr int ABTN_SIZE   = 72;
-static constexpr int ABTN_R      = 38;
-
-// B button — \uE0E1
-static constexpr int BBTN_DRAW_X = 289;   // left edge
-static constexpr int BBTN_DRAW_Y = 633-4-2-2-10+4-2;   // baseline
-static constexpr int BBTN_SIZE   = 58;
-static constexpr int BBTN_R      = 31;
-
-// Start (+) — \uE0EF   and   Select (−) — \uE0F0
-// Both buttons are centred symmetrically about the overlay midline (FB_W/2 = 224).
-// A gap of 16 px separates the two glyphs (8 px each side of centre).
-// IMPORTANT: must stay above FOOTER_Y (FB_H - 73 = 647).  Any touch whose
-// *initial* y is >= FOOTER_Y is treated by the framework as a footer button
-// press (back / select), firing rumble and injecting KEY_B / KEY_A even when
-// the bottom bar is not rendered.
-static constexpr int FOOTER_Y     = FB_H;   // 720
-static constexpr int BTN_GAP_HALF = 10;     // half-gap between the two symbols (px)
-static constexpr int START_SIZE   = 30;
-static constexpr int START_R      = 24;
-// Plus sits to the RIGHT of centre: its left edge is at (FB_W/2 + BTN_GAP_HALF).
-static constexpr int START_DRAW_X = FB_W / 2 + BTN_GAP_HALF;
-static constexpr int START_DRAW_Y = 626 + 44 + 10;    // baseline — lowered 6 px, keep below FOOTER_Y
-// Select size matches Start for a balanced look.
-static constexpr int SELECT_SIZE  = START_SIZE;
-static constexpr int SELECT_R     = START_R;
-// Minus sits to the LEFT of centre: its right edge is at (FB_W/2 - BTN_GAP_HALF),
-// so its left edge (draw origin) is (FB_W/2 - BTN_GAP_HALF - SELECT_SIZE).
-static constexpr int SELECT_DRAW_X = FB_W / 2 - BTN_GAP_HALF - SELECT_SIZE;
-static constexpr int SELECT_DRAW_Y = START_DRAW_Y;   // same baseline as Start
-
-// Solid grey — fully opaque so glyphs read clearly against the wallpaper
-static const tsl::Color& VBTN_COLOR = tsl::buttonColor;
-
-
-// Hit-test centres, populated on first draw from getTextDimensions().
-// Initialised to geometric centres so they work even before measurement.
-static int g_dpad_hx  = DPAD_DRAW_X  + DPAD_SIZE  / 2;
-static int g_dpad_hy  = DPAD_DRAW_Y  - DPAD_SIZE  / 2;
-static int g_abtn_hx  = ABTN_DRAW_X  + ABTN_SIZE  / 2;
-static int g_abtn_hy  = ABTN_DRAW_Y  - ABTN_SIZE  / 2;
-static int g_bbtn_hx  = BBTN_DRAW_X  + BBTN_SIZE  / 2;
-static int g_bbtn_hy  = BBTN_DRAW_Y  - BBTN_SIZE  / 2;
-static int g_start_hx  = START_DRAW_X  + START_SIZE  / 2;
-static int g_start_hy  = START_DRAW_Y  - START_SIZE  / 2;
-static int g_select_hx = SELECT_DRAW_X + SELECT_SIZE / 2;
-static int g_select_hy = SELECT_DRAW_Y - SELECT_SIZE / 2;
-static bool g_btns_measured = false;
-static int  g_div_half_w   = 0;  // half-width of DIVIDER_SYMBOL at START_SIZE, set on first draw
-static float g_dpad_glyph_w = 0.f; // measured width  of "\uE115" at DPAD_SIZE (set with g_btns_measured)
-static float g_dpad_glyph_h = 0.f; // measured height of "\uE115" at DPAD_SIZE (set with g_btns_measured)
-
-// Virtual key bitmask accumulated each frame from touch input.
-static u64 g_touch_keys = 0;
-
-// True GB frame period: 70224 T-cycles / 4194304 Hz ≈ 16.743 ms (59.73 fps).
-// Used to rate-limit gb_run_one_frame() independently of the 60 fps display vsync.
-static constexpr int64_t GB_RENDER_FRAME_NS =
-    (int64_t)70224 * 1'000'000'000LL / (int64_t)4194304;  // 16742706 ns
-
-//static constexpr int64_t GB_RENDER_FRAME_NS = 16'666'667LL;  // exactly 60fps
-
-// GB frame clock: 0 = unanchored, set to real time on first draw after load/resume.
-static int64_t g_gb_frame_next_ns = 0;
 
 // =============================================================================
 // Save helpers
@@ -1211,14 +911,6 @@ static bool load_user_slot(const char* romPath, int slot) {
 
 
 
-// Post a notification banner.  The null-check and string concatenation is
-// duplicated at every call site — one helper eliminates five copies of the
-// ult::NOTIFY_HEADER + "literal" temporary construction.
-static void show_notify(const char* msg) {
-    if (tsl::notification)
-        tsl::notification->showNow(ult::NOTIFY_HEADER + msg);
-}
-
 // Reload the wallpaper that was evicted to make room for a large ROM,
 // but only if we actually evicted it.  Clears the flag on success.
 // Appears verbatim at five sites in gb_load_rom and one in gb_unload_rom.
@@ -1244,15 +936,6 @@ static void gb_cancel_load() {
     free(g_gb_fb);
     g_gb_fb = nullptr;
     maybe_reload_wallpaper();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared helpers — eliminate repeated patterns across the codebase
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Exit UI audio if sound effects are enabled.  Repeated at three launch sites.
-static inline void audio_exit_if_enabled() {
-    if (ult::useSoundEffects && !ult::limitedMemory) ult::Audio::exit();
 }
 
 // Attempt a windowed relaunch for romPath.  Writes the path to config.ini,
@@ -1321,6 +1004,19 @@ static void launch_overlay_mode(const char* romPath) {
     tsl::Overlay::get()->close();
 }
 
+// Exit UI audio, mark last-played, then launch in windowed or overlay mode.
+// Replaces the identical 4-statement sequence at three call sites:
+//   SlotActionGui::Load, GameConfigGui::Reset, RomSelectorGui click.
+// Returns true unconditionally so callers can write: return launch_game(path);
+[[gnu::noinline]]
+static bool launch_game(const char* romPath) {
+    audio_exit_if_enabled();
+    save_last_rom(romPath);
+    if (launch_windowed_mode(romPath)) return true;
+    launch_overlay_mode(romPath);
+    return true;
+}
+
 // ROM size thresholds — shared by gb_load_rom, rom_is_playable, GameConfigGui.
 static constexpr size_t kROM_2MB = 2u << 20;
 static constexpr size_t kROM_4MB = 4u << 20;
@@ -1354,16 +1050,16 @@ bool gb_load_rom(const char* path) {
     //   furtherExpandedMemory= >8 MB heap → max ROM 6 MB
     //
     // Notify the user with an actionable message before touching any state.
-    if (ult::limitedMemory && sz >= kROM_2MB && sz < kROM_4MB) {
+    if (ult::limitedMemory && sz >= kROM_2MB && sz < kROM_4MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_6MB);
         fclose(f); return false;
     }
     // Default (6 MB heap): reject ROMs > 2 MB.
-    if (!ult::expandedMemory && sz >= kROM_4MB && sz < kROM_6MB) {
+    if (!ult::expandedMemory && sz >= kROM_4MB && sz < kROM_6MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_8MB);
         fclose(f); return false;
     }
-    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) {
+    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_10MB);
         fclose(f); return false;
     }
@@ -1824,7 +1520,6 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
     return cx;
 }
 
-// =============================================================================
 // In-game overlay — GBOverlayElement / GBOverlayGui.
 // Included here so it has access to draw_ultragb_title and all globals and
 // helpers defined above.  Must come before class Overlay below.
@@ -1840,16 +1535,7 @@ class SaveDataGui;          // forward declare
 class SaveDataSlotActionGui; // forward declare
 class QuickComboSelectorGui; // forward declare
 
-// Shared header string for slot sub-screens ("Slot N ◆ GameName").
-// Extracted because the identical 4-concatenation expression appeared verbatim
-// in two separate virtual createUI() bodies; virtual functions are never inlined
-// so each copy compiled to its own instruction sequence in .text.
-static std::string make_slot_detail_header(int slot, const std::string& name) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Slot %d %s %s",
-             slot, ult::DIVIDER_SYMBOL.c_str(), name.c_str());
-    return buf;
-}
+// make_slot_detail_header — moved to gb_utils.hpp
 
 // Deferred normal ROM launch: relaunch this overlay with -overlay so GBOverlayGui
 // always starts in a fresh process (no residual menu heap / glyph state).
@@ -1932,19 +1618,7 @@ public:
                 return true;
             }
             // Launch the game — gb_load_rom will find the internal state and resume
-            audio_exit_if_enabled();
-            // Mark as last-played so the ROM selector shows the inProgress
-            // indicator and scrolls to this game when we return via X.
-            save_last_rom(romPath.c_str());
-            // Windowed mode: relaunch self with -windowed so the game runs in
-            // the small draggable window, matching what the ROM selector does.
-            if (launch_windowed_mode(romPath.c_str())) {
-                //triggerEnterSound.store(true, std::memory_order_release);
-                return true;
-            }
-            //triggerEnterFeedback();
-            launch_overlay_mode(romPath.c_str());
-            return true;
+            return launch_game(romPath.c_str());
         });
         list->addItem(loadItem);
 
@@ -1975,9 +1649,7 @@ public:
         });
         list->addItem(deleteItem);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -2089,9 +1761,7 @@ public:
         });
         list->addItem(deleteItem);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -2157,9 +1827,7 @@ public:
         if (!jumpTarget.empty())
             list->jumpToItem(jumpTarget, "", true);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -2224,9 +1892,7 @@ public:
         if (!jumpTarget.empty())
             list->jumpToItem(jumpTarget, "", true);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -2310,20 +1976,7 @@ public:
                                 STATE_DIR, ".state");
             delete_file(internalPath);
             // Launch the game — no state file means cold boot
-            audio_exit_if_enabled();
-            // Mark as last-played so the ROM selector shows the inProgress
-            // indicator and scrolls to this game when we return via X.
-            save_last_rom(romPath.c_str());
-            
-            // Windowed mode: relaunch self with -windowed so the game runs in
-            // the small draggable window, matching what the ROM selector does.
-            if (launch_windowed_mode(romPath.c_str())) {
-                //triggerEnterSound.store(true, std::memory_order_release);
-                return true;
-            }
-            //triggerEnterFeedback();
-            launch_overlay_mode(romPath.c_str());
-            return true;
+            return launch_game(romPath.c_str());
         });
         list->addItem(resetItem);
 
@@ -2448,9 +2101,7 @@ public:
         if (!m_jump_to.empty())
             list->jumpToItem(m_jump_to, "", true);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -2587,7 +2238,7 @@ public:
                 const std::string full = std::string(g_rom_dir) + g_last_rom_path;
                 return get_rom_size(full.c_str()) < kROM_4MB;
             }();
-            const bool can6x   = ult::expandedMemory && ult::consoleIsDocked() && g_win_1080 && romSmall;
+            const bool can6x   = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
             const int maxScale = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (can6x ? 6 : 5));
 
             auto make_label = [maxScale]() -> std::string {
@@ -2889,9 +2540,7 @@ public:
         if (!jumpTarget.empty())
             list->jumpToItem(jumpTarget, "", true);
 
-        auto* frame = new UltraGBOverlayFrame("", "");
-        frame->setContent(list);
-        return frame;
+        return make_bare_frame(list);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
@@ -3022,12 +2671,7 @@ public:
                     }
                     if (!(keys & KEY_A)) return false;
                     if (!playable) { gb_load_rom(p); return false; }
-                    audio_exit_if_enabled();
-                    save_last_rom(p);
-                    if (launch_windowed_mode(p)) return true;
-                    launch_overlay_mode(p);
-
-                    return true;
+                    return launch_game(p);
                 });
                 list->addItem(item);
 
@@ -3288,11 +2932,19 @@ static void clamp_win_scale(bool earlyLimited, bool earlyRegularMemory,
                              bool earlyExpanded, const char* romPath) {
     if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
     if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
+    // 8 MB heap with a 4 MB+ ROM: the ROM itself consumes most of the heap,
+    // leaving insufficient room for the scale-5 framebuffer (~1.1 MB extra).
+    // Cap at 4× regardless of output mode.  ROM < 4 MB falls through to the
+    // 6× logic below where docked + 1080p is still allowed.
+    if (earlyExpanded && g_win_scale >= 5) {
+        const size_t rsz = (romPath && romPath[0]) ? get_rom_size(romPath) : 0;
+        if (rsz >= kROM_4MB) { g_win_scale = 4; return; }
+    }
     if (g_win_scale < 6) return;
     // earlyExpanded == true means EXACTLY 8 MB.
     // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
     const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
-    const bool consoleIsDocked = ult::consoleIsDocked();
+    const bool consoleIsDocked = poll_console_docked();
     if (isFurtherExpanded) {
         // 10 MB+: 6× allowed for any ROM size; need docked + 1080p.
         if (!(consoleIsDocked && g_win_1080)) g_win_scale = 5;
@@ -3304,6 +2956,16 @@ static void clamp_win_scale(bool earlyLimited, bool earlyRegularMemory,
         // 4 MB / 6 MB — unreachable (already clamped to 3 or 4 above).
         g_win_scale = 5;
     }
+}
+
+// Finalise the windowed VI layer configuration after g_win_scale and g_win_1080
+// are resolved.  Called from both the -quicklaunch and -windowed argv paths in
+// main() — the 4-line block was identical at both sites.
+static void setup_windowed_framebuffer() {
+    g_win_scale_locked             = true;
+    ult::DefaultFramebufferWidth   = GB_W * g_win_scale;
+    ult::DefaultFramebufferHeight  = GB_H * g_win_scale;
+    ult::windowedLayerPixelPerfect = g_win_1080 && poll_console_docked();
 }
 
 int main(int argc, char* argv[]) {
@@ -3423,10 +3085,7 @@ int main(int argc, char* argv[]) {
 
                     // Lock so WindowedOverlay::initServices() → load_config()
                     // does not restore the raw stored win_scale over the clamped value.
-                    g_win_scale_locked = true;
-                    ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
-                    ult::DefaultFramebufferHeight = GB_H * g_win_scale;
-                    ult::windowedLayerPixelPerfect = g_win_1080 && ult::consoleIsDocked();
+                    setup_windowed_framebuffer();
                     return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
                 }
             }
@@ -3466,10 +3125,7 @@ int main(int argc, char* argv[]) {
             // Lock g_win_scale so WindowedOverlay::initServices() → load_config()
             // does not read the raw stored value back from config.ini and override
             // the correctly-clamped framebuffer-matching scale set just above.
-            g_win_scale_locked = true;
-            ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
-            ult::DefaultFramebufferHeight = GB_H * g_win_scale;
-            ult::windowedLayerPixelPerfect = g_win_1080 && ult::consoleIsDocked();
+            setup_windowed_framebuffer();
             return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
         }
     }

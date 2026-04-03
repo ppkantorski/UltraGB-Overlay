@@ -46,6 +46,13 @@
 // Forward-declare the signature so the compiler is happy if included earlier.
 static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
 
+// draw_wallpaper_direct is defined in gb_utils.hpp, which is included after
+// this header in main.cpp.  Forward-declare for the same reason.
+// Default parameters produce a full-screen blit with no skip region.
+static void draw_wallpaper_direct(tsl::gfx::Renderer*,
+                                   u32 = 720u, u32 = 720u,
+                                   u32 = 0u,   u32 = 0u);
+
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
     explicit UltraGBOverlayFrame(std::string pageLeftName  = "",
@@ -66,7 +73,7 @@ public:
     // -----------------------------------------------------------------------
     void draw(tsl::gfx::Renderer* renderer) override {
         renderer->fillScreen(a(tsl::defaultBackgroundColor));
-        renderer->drawWallpaper();
+        draw_wallpaper_direct(renderer);
 
 #if USING_WIDGET_DIRECTIVE
         renderer->drawWidget();

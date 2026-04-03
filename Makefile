@@ -18,7 +18,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
 APP_VERSION := 0.7.0
-TARGET      := gbemu
+TARGET      := ultragb
 BUILD       := build
 SOURCES     := source
 INCLUDES    := source include lib/Walnut-CGB

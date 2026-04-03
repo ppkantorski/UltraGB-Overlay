@@ -80,20 +80,25 @@ public:
         ult::hasNextPageButton.store(false, std::memory_order_release);
         renderer->fillScreen(renderer->a(tsl::defaultBackgroundColor));
 
-        // Draw the full wallpaper in a single pass regardless of game state.
+        // Draw the wallpaper, skipping the GB viewport region that render_gb_screen
+        // and render_gb_letterbox will fully overwrite with opaque pixels.
         //
-        // Previous approach: 4 scissored drawWallpaper calls when running,
-        // each iterating all 720 rows with an early-continue for excluded rows.
-        // Total cost: 4 × 720 row iterations even though ~360 rows per pass
-        // were skipped — more row-loop overhead than a single full-framebuffer pass.
+        // VP_X=24 and VP_X+VP_W=424 are exact multiples of 8, so the skip
+        // boundaries fall cleanly on group edges (groups 3..52 skipped in
+        // rows VP_Y..VP_Y+VP_H-1).  This avoids blending 144,000 pixels
+        // (44.6% of the frame) that are immediately discarded.
         //
-        // Current approach: one drawWallpaper call covers the entire 448×720
-        // framebuffer.  render_gb_letterbox and render_gb_screen both use direct
-        // setPixelAtOffset writes with a=0xF (fully opaque), so they overwrite
-        // the wallpaper pixels in the game viewport area.  The extra ~92K pixels
-        // blended under the viewport cost far less than the 3 saved full passes.
+        // Previous approach: 4 scissored drawWallpaper calls, each iterating
+        // all 720 rows with per-row early-continue — more loop overhead than
+        // a single pass.  Current approach: draw_wallpaper_direct with a skip
+        // region splits into three branch-free bands and uses NEON 8-pixel
+        // stores throughout.
         if (ult::expandedMemory && g_ingame_wallpaper)
-            renderer->drawWallpaper();
+            draw_wallpaper_direct(renderer,
+                static_cast<u32>(VP_Y),           // skip_row_start = 108
+                static_cast<u32>(VP_Y + VP_H),    // skip_row_end   = 468
+                static_cast<u32>(VP_X) / 8u,      // skip_grp_start = 3
+                static_cast<u32>(VP_X + VP_W) / 8u); // skip_grp_end = 53
     
         //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
         
@@ -117,9 +122,11 @@ public:
         // When the mode changes the audio output device changes and the kernel
         // silently invalidates all queued DMA buffers.  Request an async resync
         // so the audio thread flushes and restarts the stream on its next tick.
-        // Cost in steady state: one bool comparison per display frame (~0 ns).
+        // poll_console_docked() rate-limits the underlying IPC call to once per
+        // kDockCheckInterval frames (~1 s); cost in steady state is one uint32
+        // comparison per frame.
         {
-            const bool  is_docked    = ult::consoleIsDocked();
+            const bool  is_docked    = poll_console_docked();
             static bool s_was_docked = is_docked;
             
             if (is_docked != s_was_docked) {
@@ -289,6 +296,28 @@ public:
             FB_W / 2 - g_div_half_w, START_DRAW_Y + 1, START_SIZE, 0xF444);
         renderer->drawString("\uE0EF", false, START_DRAW_X,  START_DRAW_Y  + 1, START_SIZE,  VBTN_COLOR);
 
+        // ── Focus pass-through flash border ──────────────────────────────────
+        // Draws a 4-pixel coloured border for g_focus_flash frames after the
+        // ZL double-click-hold gesture toggles pass-through:
+        //   red   = foreground focus released (background now owns HID)
+        //   green = foreground focus regained
+        // Alpha fades out over the last 15 frames so the border disappears
+        // smoothly instead of cutting off.
+        if (g_focus_flash > 0) {
+            const u8 al = g_focus_flash > 15
+                ? static_cast<u8>(0xF)
+                : static_cast<u8>(g_focus_flash * 0xF / 15);
+            const tsl::Color fc = g_focus_flash_red
+                ? tsl::Color{0xF, 0x0, 0x0, al}
+                : tsl::Color{0x0, 0xF, 0x0, al};
+            static constexpr int B = 4;
+            renderer->drawRect(0,        0,         FB_W, B,             fc);
+            renderer->drawRect(0,        FB_H - B,  FB_W, B,             fc);
+            renderer->drawRect(0,        B,         B,    FB_H - B * 2,  fc);
+            renderer->drawRect(FB_W - B, B,         B,    FB_H - B * 2,  fc);
+            --g_focus_flash;
+        }
+
         if (!ult::useRightAlignment)
             renderer->drawRect(447, 0, 448, 720, a(tsl::edgeSeparatorColor));
         else
@@ -310,49 +339,23 @@ class GBOverlayGui : public tsl::Gui {
     bool m_restoreHapticState = false;
     bool runOnce = true;
 
-    // ── ZR double-click-hold → fast-forward ───────────────────────────────
-    // First ZR press arms the detector; a second press within ZR_DCLICK_WINDOW
-    // frames that is then held activates fast-forward until ZR is released.
-    static constexpr int ZR_DCLICK_WINDOW = 20; // ~333 ms at 60 fps
     bool     m_zr_first_seen  = false; // true after first ZR press is recorded
     uint32_t m_zr_first_frame = 0;     // g_frame_count when first press fired
+    ZLPassThroughState m_zl_state;     // ZL double-click-hold pass-through toggle
 
 public:
     ~GBOverlayGui() {
-        if (m_restoreHapticState) {
-            ult::useHapticFeedback = false;
-            m_restoreHapticState = false;
-        }
+        restore_haptic_if_needed(m_restoreHapticState);
         //tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
         tsl::disableHiding = false;
     }
 
     virtual tsl::elm::Element* createUI() override {
         tsl::disableHiding = true;
-        // ALWAYS release ult::Audio's audio session in windowed mode.
-        if (ult::useSoundEffects && !ult::limitedMemory) ult::Audio::exit();
+        audio_exit_if_enabled();
         
         // ── Deferred ROM load ─────────────────────────────────────────────────
-        // g_pending_rom_path is set by the click listener instead of calling
-        // gb_load_rom() there.  By the time createUI() runs, ~RomSelectorGui()
-        // has already destroyed all MiniListItem objects and their std::string
-        // labels, so the heap is fully defragmented before we call malloc(ROM).
-        // We also clear the glyph cache here (belt-and-suspenders: ~RomSelectorGui
-        // already cleared it, but a second clear is free if the cache is empty).
-        if (g_pending_rom_path[0] != '\0') {
-            tsl::gfx::FontManager::clearCache(); // ensure glyphs are gone
-
-            char path[PATH_BUFFER_SIZE];
-            strncpy(path, g_pending_rom_path, sizeof(path) - 1);
-            path[sizeof(path) - 1] = '\0';
-            g_pending_rom_path[0] = '\0'; // consume before the load attempt
-
-            if (!gb_load_rom(path)) {
-                // Load failed (OOM, bad ROM, etc.) — notification already shown
-                // by gb_load_rom.  Signal update() to swap back to the selector.
-                m_load_failed = true;
-            }
-        }
+        consume_pending_rom(m_load_failed);
 
         if (m_load_failed) {
             // Don't activate the emulator; update() will swap back immediately.
@@ -379,23 +382,14 @@ public:
             tsl::swapTo<RomSelectorGui>();
         }
 
-        if (runOnce) {
-            if (g_ingame_haptics && !ult::useHapticFeedback) {
-                ult::useHapticFeedback = true;
-                m_restoreHapticState = true;
-            }
-            if (g_self_path[0]) {
-                returnOverlayPath = std::string(g_self_path);
-            }
-            runOnce = false;
-        }
+        run_once_setup(runOnce, m_restoreHapticState);
     }
 
     virtual bool handleInput(u64 keysDown, u64 keysHeld,
                              const HidTouchState& touchPos,
                              HidAnalogStickState leftJoy,
                              HidAnalogStickState rightJoy) override {
-        (void)leftJoy; (void)rightJoy;
+        //(void)leftJoy; (void)rightJoy;
 
         // Block all input until the buttons that launched us are fully released.
         // keysHeld stays non-zero as long as any button remains physically held,
@@ -481,44 +475,22 @@ public:
                               ty < FOOTER_Y;
 
         // ── ZR double-click-hold → fast-forward ──────────────────────────────
-        // First ZR press arms the detector.  A second ZR press within
-        // ZR_DCLICK_WINDOW frames (~333 ms) that is then held activates
-        // fast-forward for as long as ZR remains held.
-        // On activate: audio is paused — the audio thread drains the SPSC ring
-        // silently and preserves all GBAPU state, so playback resumes cleanly.
-        // On release: audio resumes and the frame clock is re-anchored so there
-        // is no catch-up burst of normal frames after the fast-forward ends.
+        // Guarded by !pass_through so ZR reaches the background app undisturbed
+        // when foreground focus has been released.
         {
-            const bool zr_down = (keysDown & KEY_ZR);
-            const bool zr_held = (keysHeld  & KEY_ZR);
+            const bool zr_down = !m_zl_state.pass_through && (keysDown & KEY_ZR);
+            const bool zr_held = !m_zl_state.pass_through && (keysHeld  & KEY_ZR);
+            process_zr_fast_forward(zr_down, zr_held, m_zr_first_seen, m_zr_first_frame);
+        }
 
-            if (zr_down) {
-                if (m_zr_first_seen &&
-                    (g_frame_count - m_zr_first_frame) <= (uint32_t)ZR_DCLICK_WINDOW) {
-                    // Second press within window — activate fast-forward
-                    if (!g_fast_forward) {
-                        g_fast_forward = true;
-                        gb_audio_pause();
-                    }
-                    m_zr_first_seen = false;
-                } else {
-                    // First press — arm the double-click detector
-                    m_zr_first_seen  = true;
-                    m_zr_first_frame = g_frame_count;
-                }
-            }
-
-            // Expire the first-press if the window elapsed with no second press
-            if (m_zr_first_seen &&
-                (g_frame_count - m_zr_first_frame) > (uint32_t)ZR_DCLICK_WINDOW)
-                m_zr_first_seen = false;
-
-            // Disengage when ZR is released
-            if (g_fast_forward && !zr_held) {
-                g_fast_forward     = false;
-                g_gb_frame_next_ns = 0;   // re-anchor so no catch-up burst
-                gb_audio_resume();
-            }
+        // ── ZL double-click-hold: toggle background pass-through ─────────────
+        // Same gesture as windowed mode: double-tap ZL then hold ~300 ms.
+        // The d-pad key exclusion is omitted here because in overlay mode the
+        // physical d-pad is already dedicated to GB input and cannot conflict.
+        {
+            const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
+            const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
+            process_zl_pass_through(zl_down, zl_held, m_zl_state);
         }
 
         // ── Touch → virtual button state ──────────────────────────────────────
@@ -535,7 +507,7 @@ public:
         // We simply ignore those touches so they never reach the GB core.
         // tx / ty / touching are already resolved above.
         g_touch_keys = 0;
-        if (touching) {
+        if (touching && !m_zl_state.pass_through) {
             // D-pad — stop-sign layout aligned to the drawn black rectangles.
             //
             // The cross is divided into 9 zones matching the physical shape:
@@ -612,23 +584,25 @@ public:
 
         // Trigger rumble ONLY on new touch presses (not holds)
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
-        if (newTouchPresses && g_ingame_haptics) {
+        if (newTouchPresses && g_ingame_haptics && !m_zl_state.pass_through) {
             triggerRumbleClick.store(true, std::memory_order_release);
         }
         m_prevTouchKeys = g_touch_keys;
 
         // Pass physical button state and virtual touch keys to the GB core.
-        // keysDown is always a subset of keysHeld in libnx (padGetButtonsDown
-        // returns only buttons that transitioned to held this update, all of
-        // which are already present in padGetButtons), so OR-ing keysDown in
+        // Suppressed when pass-through is active — the background app owns HID
+        // natively via requestForeground(false); we must not double-route input.
+        // keysDown is always a subset of keysHeld in libnx, so OR-ing it in
         // separately is redundant — keysHeld alone covers every pressed button.
-        gb_set_input(keysHeld | g_touch_keys);
+        if (!m_zl_state.pass_through) {
+            gb_set_input(keysHeld | g_touch_keys);
 
-        // Trigger rumble on ANY new button press
-        if (g_ingame_haptics &&
-            (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
-                         KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT))) {
-            triggerRumbleClick.store(true, std::memory_order_release);
+            // Trigger rumble on ANY new physical button press
+            if (g_ingame_haptics &&
+                (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
+                             KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT))) {
+                triggerRumbleClick.store(true, std::memory_order_release);
+            }
         }
 
         return true;  // consume all input while in-game
