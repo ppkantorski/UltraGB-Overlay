@@ -28,6 +28,38 @@
 // sufficient because swapTo only uses the type as a template argument.
 class RomSelectorGui;
 
+// -- Shared emulation clock tick ----------------------------------------------
+// Defined here so it sees the static globals declared in main.cpp:
+//   g_frame_count, g_gb_frame_next_ns, GB_RENDER_FRAME_NS, g_fast_forward.
+// gb_windowed.hpp is #included after this file in main.cpp and therefore
+// sees this definition automatically — no duplication, one copy in .text.
+//
+// Increments the display-frame counter and rate-limits the GB CPU to its
+// true 59.73 fps clock regardless of the 60 fps display vsync.
+// See GBOverlayElement::draw() for the full timing rationale.
+#ifndef GB_TICK_FRAME_DEFINED
+#define GB_TICK_FRAME_DEFINED
+inline void gb_tick_frame() {
+    ++g_frame_count;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+    if (g_gb_frame_next_ns == 0)
+        g_gb_frame_next_ns = now_ns;  // anchor on first draw after load/resume
+    if (g_fast_forward) {
+        for (int f = 0; f < 4; ++f) gb_run_one_frame();
+        g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
+    } else if (now_ns >= g_gb_frame_next_ns) {
+        gb_run_one_frame();
+        apply_lcd_ghosting();
+        gb_audio_submit();
+        g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
+        if (g_gb_frame_next_ns < now_ns)
+            g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
+    }
+}
+#endif
+
 // =============================================================================
 // GBOverlayElement — drawing only; no input handling (input lives on Gui)
 // =============================================================================
@@ -81,6 +113,20 @@ public:
             return;
         }
 
+        // Detect operation-mode change (handheld ↔ docked).
+        // When the mode changes the audio output device changes and the kernel
+        // silently invalidates all queued DMA buffers.  Request an async resync
+        // so the audio thread flushes and restarts the stream on its next tick.
+        // Cost in steady state: one bool comparison per display frame (~0 ns).
+        {
+            static bool s_was_docked = ult::consoleIsDocked();
+            const bool  is_docked    = ult::consoleIsDocked();
+            if (is_docked != s_was_docked) {
+                s_was_docked = is_docked;
+                gb_audio_request_resync();
+            }
+        }
+
         // Rate-limit the GB CPU to its true clock rate (59.73fps) regardless of
         // display vsync (60fps).  At 60fps the render thread would drive game logic
         // 0.45% faster than the audio thread plays it, accumulating ~1.35 seconds
@@ -93,39 +139,7 @@ public:
         // bypassing the clock gate entirely.  Audio is paused for the duration so
         // the SPSC ring doesn't overflow — the audio thread drains it silently and
         // preserves all GBAPU channel state, so playback resumes cleanly on release.
-        {
-            ++g_frame_count;
-
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
-
-            //const int64_t now_ns = ult::nowNs();
-
-            if (g_gb_frame_next_ns == 0)
-                g_gb_frame_next_ns = now_ns;  // anchor on first draw
-
-            if (g_fast_forward) {
-                // ── Fast-forward path ─────────────────────────────────────────
-                // Run 4 GB frames per display tick.  Audio is paused (set in
-                // handleInput when FF activates) so APU events are drained by the
-                // audio thread rather than accumulating.  Ghosting is also skipped —
-                // blending across 4 frames would produce motion smear.
-                for (int f = 0; f < 4; ++f)
-                    gb_run_one_frame();
-                // Re-anchor clock so that when FF releases we don't get a
-                // catch-up burst of normal frames.
-                g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-            } else if (now_ns >= g_gb_frame_next_ns) {
-                gb_run_one_frame();
-                apply_lcd_ghosting();   // 50/50 blend of raw current vs raw prev frame
-                gb_audio_submit();
-
-                g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
-                if (g_gb_frame_next_ns < now_ns)
-                    g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-            }
-        }
+        gb_tick_frame();
 
         render_gb_letterbox(renderer);
         render_gb_screen(renderer);

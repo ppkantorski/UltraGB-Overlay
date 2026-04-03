@@ -104,6 +104,36 @@ inline tsl::Color rgb565_to_tsl(const uint16_t c) {
 
 static constexpr uint32_t OWV = 112u;
 
+// -- Shared swizzle LUT construction helpers ----------------------------------
+// The block-linear col_part(x) / row_part(y) formula is identical for every
+// LUT in the project.  Centralising it here means the formula lives exactly
+// once; init_swizzle_lut, init_outer_lut, and init_win_luts all call these
+// instead of repeating the same loop body.
+//
+// build_col_lut: fills dst[0..count) with col_part(start_x + i).
+// build_row_lut: fills dst[0..count) with row_part(start_y + i, owv).
+//
+// Both are static inline — the compiler inlines the small loop into each
+// caller and the helpers produce zero additional .text symbols.
+static inline void build_col_lut(uint32_t* dst, int start_x, int count) {
+    for (int i = 0; i < count; ++i) {
+        const uint32_t x = static_cast<uint32_t>(start_x + i);
+        dst[i] = (((x >> 5u) << 3u) << 9u)
+               + ((x & 16u) << 3u)
+               + ((x &  8u) << 1u)
+               +  (x &  7u);
+    }
+}
+static inline void build_row_lut(uint32_t* dst, int start_y, int count, uint32_t owv) {
+    for (int i = 0; i < count; ++i) {
+        const uint32_t y = static_cast<uint32_t>(start_y + i);
+        dst[i] = ((((y & 127u) >> 4u) + ((y >> 7u) * owv)) << 9u)
+               + ((y &  8u) << 5u)
+               + ((y &  6u) << 4u)
+               + ((y &  1u) << 3u);
+    }
+}
+
 // LUTs indexed by viewport-relative coordinates:
 //   s_col_lut[ox]  for ox in [0, VP_W)  ->  col_part(VP_X + ox)
 //   s_row_lut[oy]  for oy in [0, VP_H)  ->  row_part(VP_Y + oy)
@@ -121,40 +151,14 @@ static uint32_t s_outer_row_lut[VP_H];   // row_part(VP_Y + oy), oy = 0..VP_H-1
 static bool     s_outer_lut_ready = false;
 
 static void init_outer_lut() {
-    for (int i = 0; i < VP_W; ++i) {
-        const uint32_t x = static_cast<uint32_t>(VP_X + i);
-        s_outer_col_lut[i] = (((x >> 5) << 3) << 9)
-                           + ((x & 16u) << 3)
-                           + ((x &  8u) << 1)
-                           +  (x &  7u);
-    }
-    for (int i = 0; i < VP_H; ++i) {
-        const uint32_t y = static_cast<uint32_t>(VP_Y + i);
-        s_outer_row_lut[i] = ((((y & 127u) >> 4) + ((y >> 7) * OWV)) << 9)
-                           + ((y &  8u) << 5)
-                           + ((y &  6u) << 4)
-                           + ((y &  1u) << 3);
-    }
+    build_col_lut(s_outer_col_lut, VP_X, VP_W);
+    build_row_lut(s_outer_row_lut, VP_Y, VP_H, OWV);
     s_outer_lut_ready = true;
 }
 
 static void init_swizzle_lut() {
-    const int cvp_x = vp_x(), cvp_y = vp_y();
-    const int cvp_w = vp_w(), cvp_h = vp_h();
-    for (int i = 0; i < cvp_w; ++i) {
-        const uint32_t x = static_cast<uint32_t>(cvp_x + i);
-        s_col_lut[i] = (((x >> 5) << 3) << 9)
-                     + ((x & 16u) << 3)
-                     + ((x &  8u) << 1)
-                     +  (x &  7u);
-    }
-    for (int i = 0; i < cvp_h; ++i) {
-        const uint32_t y = static_cast<uint32_t>(cvp_y + i);
-        s_row_lut[i] = ((((y & 127u) >> 4) + ((y >> 7) * OWV)) << 9)
-                     + ((y &  8u) << 5)
-                     + ((y &  6u) << 4)
-                     + ((y &  1u) << 3);
-    }
+    build_col_lut(s_col_lut, vp_x(), vp_w());
+    build_row_lut(s_row_lut, vp_y(), vp_h(), OWV);
     s_lut_ready = true;
 }
 
@@ -234,6 +238,27 @@ static inline uint16x8_t dim_packed_grid_vec(uint16x8_t px) {
     const uint16x8_t rgb  = vandq_u16(px, mask);
     const uint16x8_t dim  = vsubq_u16(rgb, vandq_u16(vshrq_n_u16(rgb, 2), vdupq_n_u16(0x0333u)));
     return vbslq_u16(mask, dim, px); // keep alpha intact
+}
+
+// Shared NEON fill helper — writes packed colour to destination columns [ox0, ox1)
+// via a precomputed swizzle LUT.
+//
+// The block-linear swizzle formula guarantees that lut[8k .. 8k+7] are always
+// consecutive (+0..+7), so vst1q_u16 at any 8-aligned ox is a valid sequential
+// store of 8 framebuffer pixels.  A scalar prefix loop aligns to the next
+// 8-column tile boundary; a scalar suffix handles the remaining tail.
+//
+// Used by both the overlay renderer (s_col_lut) and the windowed renderer
+// (s_win_col) so the logic lives exactly once.
+static inline void neon_lut_fill(uint16_t* __restrict__ row_ptr,
+                                  const uint32_t* __restrict__ lut,
+                                  int ox0, int ox1, uint16_t packed) {
+    const uint16x8_t vpk = vdupq_n_u16(packed);
+    int ox = ox0;
+    while (ox < ox1 && (ox & 7)) { row_ptr[lut[ox]] = packed; ++ox; }
+    for (; ox + 8 <= ox1; ox += 8)
+        vst1q_u16(row_ptr + lut[ox], vpk);
+    while (ox < ox1) { row_ptr[lut[ox]] = packed; ++ox; }
 }
 
 
@@ -466,14 +491,26 @@ inline void free_lcd_ghosting() {
 // Hot path summary per frame:
 //   - Outer loop: 144 GB source rows
 //   - RLE scan: groups same-colour source pixels into runs (~2000-4000 total)
-//   - Per run: colour conversion fires exactly once (or zero times if IS_PREPACKED)
-//   - Per run x output row: NEON vector store, 16–32 pixels in one go when possible
+//   - Per run: colour conversion fires exactly once
+//   - Per run: contiguity check fires exactly once (hoisted above oy loop)
+//   - Per run x output row: NEON vector store, 16 pixels in one go when contiguous
 // Template parameters:
-//   IS565       — true for CGB games
-//   IS_PREPACKED— true for DMG games
-template <bool IS565, bool IS_PREPACKED>
+//   IS565 — true for CGB games (RGB565 source), false for DMG (RGB555 or pre-packed)
+//
+// IS_PREPACKED is a runtime bool rather than a template dimension.  It only changes
+// one line per RLE run (packed = run_pix vs the conversion), fires once per run not
+// per pixel, and the branch is perfectly predicted (constant for the whole session).
+// Making it runtime eliminates one full ~200-line function copy from .text.
+template <bool IS565>
 static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
+                                        const bool prepacked,
                                         const int sy_start, const int sy_end) {
+    // Cache the framebuffer pointer once per call — eliminates a pointer load from
+    // renderer->m_currentFramebuffer on every destination row of every colour run.
+    // Safe to share across threads: getCurrentFramebuffer() returns a stable pointer
+    // for the entire frame; each thread writes to disjoint row bands.
+    uint16_t* __restrict__ fb = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+
     for (int sy = sy_start; sy < sy_end; ++sy) {
         const int oy0 = s_dy0[sy];
         const int oy1 = s_dy1[sy];
@@ -486,61 +523,44 @@ static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
             const uint16_t pix = (sx < GB_W) ? src[sx] : static_cast<uint16_t>(~run_pix);
             if (pix == run_pix) [[likely]] continue;
 
-            // Correct horizontal mapping: exclusive s_dx1
             const int ox0   = s_dx0[run_sx];
             const int ox1   = s_dx1[sx - 1];
             const int run_w = ox1 - ox0;
 
-            // Colour conversion: once per run
+            // Colour conversion: once per run.
+            // prepacked branch: constant for the session → perfectly predicted.
             uint16_t packed;
-            if constexpr (IS_PREPACKED) {
-                packed = run_pix;
-            } else if constexpr (IS565) {
+            if constexpr (IS565) {
                 packed = rgb565_to_packed(run_pix);
             } else {
-                packed = rgb555_to_packed(run_pix);
+                packed = prepacked ? run_pix : rgb555_to_packed(run_pix);
             }
 
-            uint16x8_t vcolor_lo = vdupq_n_u16(packed);
-            uint16x8_t vcolor_hi = vdupq_n_u16(packed);
+            const uint32_t* __restrict__ cl = s_col_lut + ox0;
 
-            for (int oy = oy0; oy < oy1; ++oy) {
-                // Base framebuffer pointer for this row
-                tsl::Color* framebuffer =
-                    static_cast<tsl::Color*>(renderer->getCurrentFramebuffer()) + s_row_lut[oy];
-                const uint32_t* __restrict__ cl = s_col_lut + ox0;
-
-                int ox = 0;
-
-                // --- Contiguous memory path ---
-                if (cl[0] + run_w - 1 == cl[run_w - 1]) {
+            // Contiguity check: depends only on cl and run_w, both constant across
+            // the oy loop.  Hoisting it here fires it once per run instead of once
+            // per (run × oy), and allows the compiler to emit two clean oy loops
+            // with no branch inside either.
+            if (cl[0] + run_w - 1 == cl[run_w - 1]) {
+                // --- Contiguous path: vst1q_u16 × 2 = 16 pixels per store ---
+                // vcol set up once per run (not per oy) now that we're outside.
+                const uint16x8_t vcol = vdupq_n_u16(packed);
+                for (int oy = oy0; oy < oy1; ++oy) {
+                    uint16_t* row_ptr = fb + s_row_lut[oy];
+                    int ox = 0;
                     while (ox + 15 < run_w) {
-                        vst1q_u16(reinterpret_cast<uint16_t*>(framebuffer + cl[ox + 0]), vcolor_lo);
-                        vst1q_u16(reinterpret_cast<uint16_t*>(framebuffer + cl[ox + 8]), vcolor_hi);
+                        vst1q_u16(row_ptr + cl[ox],     vcol);
+                        vst1q_u16(row_ptr + cl[ox + 8], vcol);
                         ox += 16;
                     }
-                    // leftover pixels
                     for (; ox < run_w; ++ox)
-                        framebuffer[cl[ox]] = *reinterpret_cast<tsl::Color*>(&packed);
-
-                } else {
-                    // --- Scattered memory path ---
-                    // 8-pixel unrolled stores
-                    const int limit = run_w & ~7; // largest multiple of 8 ≤ run_w
-                    for (; ox < limit; ox += 8) {
-                        framebuffer[cl[ox + 0]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 1]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 2]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 3]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 4]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 5]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 6]] = *reinterpret_cast<tsl::Color*>(&packed);
-                        framebuffer[cl[ox + 7]] = *reinterpret_cast<tsl::Color*>(&packed);
-                    }
-                    // leftover pixels
-                    for (; ox < run_w; ++ox)
-                        framebuffer[cl[ox]] = *reinterpret_cast<tsl::Color*>(&packed);
+                        row_ptr[cl[ox]] = packed;
                 }
+            } else {
+                // --- Scattered path: neon_lut_fill with absolute col indices ---
+                for (int oy = oy0; oy < oy1; ++oy)
+                    neon_lut_fill(fb + s_row_lut[oy], s_col_lut, ox0, ox1, packed);
             }
 
             run_sx  = sx;
@@ -549,53 +569,49 @@ static void render_gb_screen_chunk_impl(tsl::gfx::Renderer* renderer,
     }
 }
 
-// Thin wrapper with the original signature so std::thread(render_gb_screen_chunk, ...)
-// works without changes.  The dispatch is one branch per thread launch — entirely
-// outside the pixel loop — so the cost is negligible.
+// Thin wrapper — dispatch is one branch per thread launch, outside the pixel loop.
 static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
                                    const bool is565,
                                    const int sy_start, const int sy_end) {
-    if (g_fb_is_prepacked)
-        render_gb_screen_chunk_impl<false, true>(renderer, sy_start, sy_end);
-    else if (is565)
-        render_gb_screen_chunk_impl<true,  false>(renderer, sy_start, sy_end);
+    if (is565)
+        render_gb_screen_chunk_impl<true> (renderer, false,               sy_start, sy_end);
     else
-        render_gb_screen_chunk_impl<false, false>(renderer, sy_start, sy_end);
+        render_gb_screen_chunk_impl<false>(renderer, g_fb_is_prepacked,   sy_start, sy_end);
 }
 
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
     if (!s_lut_ready)   init_swizzle_lut();
     if (!s_coord_ready) init_coord_lut();
-    
 
-    render_gb_screen_chunk(renderer, g_fb_is_rgb565, 0, GB_H);
+    if (!ult::expandedMemory) {
+        // Single-thread path — no thread overhead.
+        render_gb_screen_chunk(renderer, g_fb_is_rgb565, 0, GB_H);
+    } else {
+        // Multi-thread path — split source rows across the wallpaper render pool.
+        // render_gb_screen_chunk_impl caches getCurrentFramebuffer() once inside,
+        // so all threads share the same stable fb pointer and write to disjoint
+        // row bands — no synchronisation needed.
+        const int numT  = static_cast<int>(std::min(
+            static_cast<size_t>(ult::numThreads), ult::renderThreads.size()));
+        const bool is565 = g_fb_is_rgb565;
+        const int chunk  = (GB_H + numT - 1) / numT;
+        int launched = 0;
+        for (int i = 0; i < numT; ++i) {
+            const int sy0 = i * chunk;
+            if (sy0 >= GB_H) break;
+            ult::renderThreads[i] = std::thread(
+                render_gb_screen_chunk, renderer, is565,
+                sy0, std::min(sy0 + chunk, GB_H));
+            ++launched;
+        }
+        for (int i = 0; i < launched; ++i)
+            ult::renderThreads[i].join();
+    }
 
     // LCD grid overlay — post-pass that darkens the last pixel of every
     // scaled source-pixel block to simulate the dark gap between LCD cells.
     // No-op when g_lcd_grid is false (single branch at function entry).
     render_gb_grid_overlay(renderer);
-
-    //const bool is565 = g_fb_is_rgb565;
-    //if (!ult::expandedMemory) {
-    //    render_gb_screen_chunk(renderer, is565, 0, GB_H);
-    //    return;
-    //}
-    //
-    //const int numThreads = static_cast<int>(ult::numThreads); // should be 4
-    //const int chunkSize  = (GB_H + numThreads - 1) / numThreads; // ceil divide
-    //
-    //for (int i = 0; i < numThreads; ++i) {
-    //    const int sy_start = i * chunkSize;
-    //    const int sy_end   = std::min(sy_start + chunkSize, GB_H);
-    //    
-    //    ult::renderThreads[i] = std::thread(
-    //        render_gb_screen_chunk,
-    //        renderer, is565, sy_start, sy_end
-    //    );
-    //}
-    //
-    //for (auto& t : ult::renderThreads)
-    //    t.join();
 }
 
 // -- Game Boy Color logo below pixel-perfect screen --------------------------

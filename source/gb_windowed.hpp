@@ -76,15 +76,18 @@
 //   row_part(y) = ((((y&127)>>4) + ((y>>7)*OWV))<<9)
 //                + ((y&8)<<5) + ((y&6)<<4) + ((y&1)<<3)
 //
-// Arrays are sized for maximum 5× scale: 800 cols, 720 rows.
-static uint32_t s_win_col[GB_W * 5];  // up to 800 entries (5× scale)
-static uint32_t s_win_row[GB_H * 5];  // up to 720 entries (5× scale)
+// Arrays are sized for maximum 6× scale: 960 cols, 864 rows.
+static uint32_t s_win_col[GB_W * 6];  // up to 960 entries (6× scale)
+static uint32_t s_win_row[GB_H * 6];  // up to 864 entries (6× scale)
 static bool     s_win_lut_ready = false;
 // Set true by GBWindowedGui::handleInput while a touch-drag reposition is active.
 // Read by GBWindowedElement::draw to overlay a 4-pixel red border on the frame.
 static bool     s_win_dragging  = false;
 static int      s_focus_flash   = 0;     // counts down each draw; 0 = hidden
 static bool     s_focus_flash_red = false; // true=red (focus lost), false=green (focus gained)
+// Set in draw() when the console undocks while windowedLayerPixelPerfect is active.
+// Consumed in WindowedOverlay::update() to trigger a clean relaunch with 720p sizing.
+static bool     s_undock_relaunch = false;
 
 // Update the notification hit-test offsets to match the current VI layer position.
 // Must be called whenever g_win_pos_x / g_win_pos_y change.
@@ -99,24 +102,160 @@ static void sync_notif_touch_offsets() {
 static void init_win_luts(int scale) {
     const int fw = GB_W * scale;
     const int fh = GB_H * scale;
-    // OWV = (fw / 32) * 8  — integer arithmetic, exact for all three scales.
-    const uint32_t OWV = (static_cast<uint32_t>(fw) >> 5u) << 3u;
-
-    for (int i = 0; i < fw; ++i) {
-        const uint32_t x = static_cast<uint32_t>(i);
-        s_win_col[i] = (((x >> 5u) << 3u) << 9u)
-                     + ((x & 16u) << 3u)
-                     + ((x &  8u) << 1u)
-                     +  (x &  7u);
-    }
-    for (int i = 0; i < fh; ++i) {
-        const uint32_t y = static_cast<uint32_t>(i);
-        s_win_row[i] = ((((y & 127u) >> 4u) + ((y >> 7u) * OWV)) << 9u)
-                     + ((y &  8u) << 5u)
-                     + ((y &  6u) << 4u)
-                     + ((y &  1u) << 3u);
-    }
+    const uint32_t owv = (static_cast<uint32_t>(fw) >> 5u) << 3u;
+    build_col_lut(s_win_col, 0, fw);
+    build_row_lut(s_win_row, 0, fh, owv);
     s_win_lut_ready = true;
+}
+
+// =============================================================================
+// Windowed pixel blit — multithreaded, RLE-compressed, NEON-accelerated.
+//
+// win_blit_rows<LCD_GRID, SCALE>
+//   Processes GB source rows [sy_start, sy_end) into the pre-fetched scaled
+//   framebuffer pointer.  Three compounding optimisations:
+//
+//   1. RLE grouping — scans each source row for runs of identical pixels.
+//      Colour conversion (rgb555/565 → RGBA4444) fires exactly once per run,
+//      not once per pixel.  For typical tile-heavy game content this halves
+//      conversion work.
+//
+//   2. NEON bulk fill — within any 8-column-aligned swizzle tile, destination
+//      addresses s_win_col[8k]..s_win_col[8k+7] are provably contiguous (+0..+7).
+//      A single vst1q_u16 therefore writes 8 framebuffer pixels per store
+//      vs. 8 separate scatter writes.  The prefix/suffix loop handles the
+//      unaligned edges.
+//
+//   3. Compile-time SCALE — SCALE is a template int, so the compiler fully
+//      unrolls the dy and (in the grid path) dx inner loops with zero branch
+//      overhead.  LCD_GRID branches are also compile-time eliminated.
+//
+// launch_win_blit<LCD_GRID, SCALE>
+//   Splits GB_H source rows across ult::renderThreads (the wallpaper render
+//   pool — idle in windowed mode).  Each thread writes disjoint destination
+//   row bands: thread i owns source rows [i*chunk, (i+1)*chunk) which maps
+//   to dest rows [i*chunk*SCALE, (i+1)*chunk*SCALE), guaranteed non-overlapping.
+//   No synchronisation is needed inside the threads.
+// =============================================================================
+
+// Inner per-thread blit kernel.
+// fb        — raw RGBA4444 framebuffer base pointer (cached once before launch).
+// src_fb    — g_gb_fb (160×144 source pixels).
+// is565     — source pixel format: true=RGB565 (CGB), false=RGB555 (DMG).
+// prepacked — source already holds RGBA4444 (DMG pre-packed palette path).
+// sy_start/end — half-open range of GB source rows this thread owns.
+template <bool LCD_GRID, int SCALE>
+static void win_blit_rows(uint16_t* __restrict__ fb,
+                          const uint16_t* __restrict__ src_fb,
+                          bool is565, bool prepacked,
+                          int sy_start, int sy_end) {
+    for (int sy = sy_start; sy < sy_end; ++sy) {
+        const uint16_t* src_row = src_fb + sy * GB_W;
+
+        // ── RLE: detect same-colour horizontal runs ───────────────────────────
+        int      run_sx  = 0;
+        uint16_t run_pix = src_row[0];
+
+        for (int sx = 1; sx <= GB_W; ++sx) {
+            // Sentinel at sx==GB_W forces a final flush of the last run.
+            const uint16_t pix = (sx < GB_W)
+                ? src_row[sx]
+                : static_cast<uint16_t>(~run_pix);
+            if (pix == run_pix) [[likely]] continue;
+
+            // ── Colour conversion — once per run, never per pixel ─────────────
+            uint16_t packed;
+            if (prepacked)  packed = run_pix;
+            else if (is565) packed = rgb565_to_packed(run_pix);
+            else            packed = rgb555_to_packed(run_pix);
+
+            // Grid colour: dimmed version of packed (compile-time branch).
+            uint16_t grid_packed = 0;
+            if constexpr (LCD_GRID)
+                grid_packed = dim_packed_grid(packed);
+
+            // Destination column span for this run [ox0, ox1).
+            const int ox0 = run_sx * SCALE;
+            const int ox1 = sx     * SCALE;
+
+            // ── Write SCALE destination rows ──────────────────────────────────
+            for (int dy = 0; dy < SCALE; ++dy) {
+                uint16_t* const row_ptr = fb + s_win_row[sy * SCALE + dy];
+
+                if constexpr (!LCD_GRID) {
+                    // ── Fast path: no grid, bulk-fill the entire run ──────────
+                    // neon_lut_fill (defined in gb_renderer.h) handles the
+                    // 8-column tile alignment, NEON bulk store, and scalar tail.
+                    neon_lut_fill(row_ptr, s_win_col, ox0, ox1, packed);
+
+                } else {
+                    // ── LCD-grid path ─────────────────────────────────────────
+                    // Last dest row of each source-pixel block → all columns dim.
+                    // Other dest rows → inner (SCALE-1) columns normal,
+                    //                    rightmost column dim.
+                    if (dy == SCALE - 1) {
+                        // Grid row: entire column span gets grid colour.
+                        neon_lut_fill(row_ptr, s_win_col, ox0, ox1, grid_packed);
+                    } else {
+                        // Normal row: per source-pixel block within the run —
+                        // SCALE-1 inner cols with normal colour, last col dim.
+                        for (int bsx = run_sx; bsx < sx; ++bsx) {
+                            const int bx0  = bsx * SCALE;
+                            const int bgx  = bx0 + SCALE - 1;  // grid (last) col
+                            for (int ox = bx0; ox < bgx; ++ox)
+                                row_ptr[s_win_col[ox]] = packed;
+                            row_ptr[s_win_col[bgx]] = grid_packed;
+                        }
+                    }
+                }
+            }
+
+            run_sx  = sx;
+            run_pix = pix;
+        }
+    }
+}
+
+// Thread-pool launcher.  Splits source rows across ult::renderThreads and
+// joins them before returning — caller sees a synchronous blit.
+//
+// ult::numThreads is always 4 and renderThreads always has 4 slots, regardless
+// of expandedMemory.  We guard on expandedMemory explicitly because:
+//   • expandedMemory false → scale ≤ 4, single-thread is fast enough, and we
+//     want zero thread-construction overhead.
+//   • expandedMemory true  → scale 5 or 6 (829 K+ writes/frame), 4-way
+//     parallelism gives ~3–4× blit throughput.
+// When the single-thread path is taken we call win_blit_rows directly on the
+// current (Tesla draw) thread — no std::thread construction, no join.
+template <bool LCD_GRID, int SCALE>
+static void launch_win_blit(uint16_t* fb, const uint16_t* src_fb,
+                             bool is565, bool prepacked) {
+    const int maxT = static_cast<int>(std::min(
+        static_cast<size_t>(ult::numThreads),
+        ult::renderThreads.size()));
+
+    // Single-thread fast path: no heap allocation, no OS thread overhead.
+    // Also taken when expandedMemory is false — numThreads is always 4 so
+    // maxT <= 1 would never trigger without this explicit guard.
+    if (!ult::expandedMemory || maxT <= 1) {
+        win_blit_rows<LCD_GRID, SCALE>(fb, src_fb, is565, prepacked, 0, GB_H);
+        return;
+    }
+
+    const int chunk = (GB_H + maxT - 1) / maxT;   // ceil-divide rows per thread
+
+    int launched = 0;
+    for (int i = 0; i < maxT; ++i) {
+        const int sy0 = i * chunk;
+        if (sy0 >= GB_H) break;
+        const int sy1 = std::min(sy0 + chunk, GB_H);
+        ult::renderThreads[i] = std::thread(
+            win_blit_rows<LCD_GRID, SCALE>,
+            fb, src_fb, is565, prepacked, sy0, sy1);
+        ++launched;
+    }
+    for (int i = 0; i < launched; ++i)
+        ult::renderThreads[i].join();
 }
 
 // =============================================================================
@@ -135,90 +274,70 @@ public:
             return;
         }
 
-        // ── Emulation clock ───────────────────────────────────────────────────
-        ++g_frame_count;
-        if (!s_win_dragging) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
-
-            if (g_gb_frame_next_ns == 0)
-                g_gb_frame_next_ns = now_ns;
-
-            if (g_fast_forward) {
-                for (int f = 0; f < 4; ++f) gb_run_one_frame();
-                g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
-            } else if (now_ns >= g_gb_frame_next_ns) {
-                gb_run_one_frame();
-                apply_lcd_ghosting();
-                gb_audio_submit();
-                g_gb_frame_next_ns += GB_RENDER_FRAME_NS;
-                if (g_gb_frame_next_ns < now_ns)
-                    g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
+        // Detect operation-mode change (handheld ↔ docked).
+        // When the mode changes the audio output device changes and the kernel
+        // silently invalidates all queued DMA buffers.  Request an async resync
+        // so the audio thread flushes and restarts the stream on its next tick.
+        // Cost in steady state: one bool comparison per display frame (~0 ns).
+        {
+            static bool s_was_docked = ult::consoleIsDocked();
+            const bool  is_docked    = ult::consoleIsDocked();
+            if (is_docked != s_was_docked) {
+                s_was_docked = is_docked;
+                gb_audio_request_resync();
+                // Relaunch whenever the dock state changes and the resulting
+                // pixel-perfect setting would differ from the current session:
+                //   • docked   + g_win_1080=true  → need 1080p sizing (was 720p)
+                //   • undocked + pixel-perfect=true → need 720p sizing (was 1080p)
+                // exitServices() saves SRAM/audio state before the process restarts.
+                if (( is_docked && g_win_1080) ||
+                    (!is_docked && ult::windowedLayerPixelPerfect))
+                    s_undock_relaunch = true;
             }
         }
 
+        // ── Emulation clock ───────────────────────────────────────────────────
+        // gb_tick_frame() (defined in gb_overlay.hpp, visible here because that
+        // header is included first in main.cpp) increments g_frame_count and
+        // rate-limits the GB CPU to 59.73 fps.  During a touch-drag the game is
+        // frozen, so timing is suppressed — but the display-frame counter still
+        // advances so double-click detectors keep working.
+        if (!s_win_dragging) gb_tick_frame();
+        else                 ++g_frame_count;
+
         // ── Scaled pixel blit ─────────────────────────────────────────────────
-        // For scale N, each source GB pixel (sx, sy) is replicated into an
-        // N×N block in the framebuffer at positions
-        //   (sx*N .. sx*N+N-1, sy*N .. sy*N+N-1).
-        // Uses public setPixelAtOffset() — getCurrentFramebuffer() is private.
-        // tsl::Color is 16-bit RGBA4444, same bit layout as our packed uint16_t.
-        //
-        // LCD_GRID template parameter: when true, the last row (dy==scale-1)
-        // and last column (dx==scale-1) of each scaled block are written with a
-        // heavily dimmed (~12.5 %) version of the pixel colour, simulating the
-        // dark gap between LCD sub-pixels.  Disabled at 1× (no room for a gap).
-        // The template is instantiated for both states so the compiler eliminates
-        // all grid branches in the LCD_GRID=false path.
+        // Delegates to launch_win_blit<LCD_GRID, SCALE> which:
+        //   • Caches the raw framebuffer pointer once (no per-pixel indirection).
+        //   • Splits source rows across ult::renderThreads (idle in windowed mode).
+        //   • Uses RLE to convert colour once per same-colour horizontal run.
+        //   • Uses NEON vst1q_u16 for 8-pixel aligned destination tile spans.
+        //   • Unrolls inner loops fully via compile-time SCALE template.
+        // See win_blit_rows / launch_win_blit above for the full implementation.
         if (!s_win_lut_ready) init_win_luts(g_win_scale);
 
-        const int  scale     = g_win_scale;
-        const bool is565     = g_fb_is_rgb565;
-        const bool prepacked = g_fb_is_prepacked;
+        // Cache framebuffer pointer once — eliminates per-pixel
+        // getCurrentFramebuffer() load that setPixelAtOffset() would perform.
+        uint16_t* const fb      = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+        const int        scale   = g_win_scale;
+        const bool       is565   = g_fb_is_rgb565;
+        const bool       prpk    = g_fb_is_prepacked;
+        const bool       do_grid = g_lcd_grid && scale >= 2;
 
-        // win_blit<LCD_GRID> — templated inner blit; zero overhead when false.
-        const auto win_blit = [&]<bool LCD_GRID>() __attribute__((always_inline)) {
-            for (int sy = 0; sy < GB_H; ++sy) {
-                const uint16_t* src_row = g_gb_fb + sy * GB_W;
-                for (int sx = 0; sx < GB_W; ++sx) {
-                    const uint16_t src = src_row[sx];
-                    uint16_t packed;
-                    if (prepacked)    packed = src;
-                    else if (is565)   packed = rgb565_to_packed(src);
-                    else              packed = rgb555_to_packed(src);
-                    const tsl::Color& col = reinterpret_cast<const tsl::Color&>(packed);
-
-                    // Grid colour: dimmed version of the same pixel (computed
-                    // once per source pixel; the if-constexpr is a compile-time
-                    // guard so grid_packed is never evaluated in the false path).
-                    uint16_t grid_packed;
-                    if constexpr (LCD_GRID)
-                        grid_packed = dim_packed_grid(packed);
-
-                    for (int dy = 0; dy < scale; ++dy) {
-                        const uint32_t row_base = s_win_row[sy * scale + dy];
-                        for (int dx = 0; dx < scale; ++dx) {
-                            if constexpr (LCD_GRID) {
-                                const bool is_grid = (dy == scale - 1) | (dx == scale - 1);
-                                renderer->setPixelAtOffset(
-                                    row_base + s_win_col[sx * scale + dx],
-                                    is_grid ? reinterpret_cast<const tsl::Color&>(grid_packed)
-                                            : col);
-                            } else {
-                                renderer->setPixelAtOffset(
-                                    row_base + s_win_col[sx * scale + dx], col);
-                            }
-                        }
-                    }
-                }
+        // Resolve SCALE at compile time so inner loops are fully unrolled.
+        // LCD_GRID branches are compile-time eliminated in each instantiation.
+        const auto dispatch = [&]<bool GRID>() __attribute__((always_inline)) {
+            switch (scale) {
+                case 1: launch_win_blit<GRID, 1>(fb, g_gb_fb, is565, prpk); break;
+                case 2: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
+                case 3: launch_win_blit<GRID, 3>(fb, g_gb_fb, is565, prpk); break;
+                case 4: launch_win_blit<GRID, 4>(fb, g_gb_fb, is565, prpk); break;
+                case 5: launch_win_blit<GRID, 5>(fb, g_gb_fb, is565, prpk); break;
+                case 6: launch_win_blit<GRID, 6>(fb, g_gb_fb, is565, prpk); break;
+                default: launch_win_blit<GRID, 1>(fb, g_gb_fb, is565, prpk); break;
             }
         };
-
-        if (g_lcd_grid && scale >= 2)
-            win_blit.operator()<true>();
-        else
-            win_blit.operator()<false>();
+        if (do_grid) dispatch.operator()<true>();
+        else         dispatch.operator()<false>();
 
         // ── Pass-through flash border + drag overlay ─────────────────────────
         // fw/fh computed once here; used by both conditional blocks below.
@@ -413,35 +532,34 @@ class GBWindowedGui : public tsl::Gui {
 
     // ── VI bounds helpers (scale-dependent) ───────────────────────────────────
     // VI space is 1920×1080.  The layer must fit entirely on screen.
-    // The VI layer is GB_W*scale × GB_H*scale framebuffer pixels, which the
-    // Switch display maps to (GB_W*scale × 3/2) × (GB_H*scale × 3/2) VI units.
     //
-    // Maximum safe VI origin (top-left of layer):
-    //   max_x = 1920 - GB_W * scale * 3 / 2
-    //   max_y = 1080 - GB_H * scale * 3 / 2
+    // Maximum safe VI-space position so the layer never crosses a screen edge.
     //
-    // All four scale factors produce exact integers:
-    //   1×: max_x=1680  max_y=864
-    //   2×: max_x=1440  max_y=648
-    //   3×: max_x=1200  max_y=432
-    //   4×: max_x= 960  max_y=216
-    // The VI layer is wider than the raw 1.5× scale when underscan correction
-    // is active (tesla.hpp adds a proportional fraction of horizontalUnderscanPixels
-    // to cfg::LayerWidth).  Subtract the same correction from the max-x bound so
-    // the right edge of the corrected layer can never exceed 1920 VI units.
-    static int vi_max_x() {
-        const int hcorr = static_cast<int>(
-            tsl::impl::currentUnderscanPixels.first *
-            (float(GB_W * g_win_scale) / float(tsl::cfg::LayerMaxWidth)) + 0.5f);
-        return 1920 - GB_W * g_win_scale * 3 / 2 - hcorr;
-    }
-    static int vi_max_y() { return 1080 - GB_H * g_win_scale * 3 / 2; }
+    // Derived from cfg::LayerWidth/Height (the actual dimensions Tesla set on
+    // the VI layer) rather than recomputing from scale + magic factors.  This
+    // is correct for both output modes and handles underscan automatically:
+    //
+    //   720p mode  – layer = FB * 1.5  [+ optional underscan correction]
+    //   1080p mode – layer = FB * 1.0  (pixel-perfect; no underscan needed)
+    //
+    // Using the live cfg values means a switch between modes simply re-clamps
+    // the saved position to the new valid range in createUI().
+    static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
+    static int vi_max_y() { return 1080 - static_cast<int>(tsl::cfg::LayerHeight); }
 
-    // Window footprint in HID touch space (0–1279 × 0–719):
-    //   width  = GB_W * scale   height = GB_H * scale
-    // (same numbers as framebuffer pixels, because touch→VI is exactly ×3/2)
-    static int touch_win_w() { return GB_W * g_win_scale; }
-    static int touch_win_h() { return GB_H * g_win_scale; }
+    // Window footprint in HID touch space (0–1279 × 0–719).
+    //
+    // HID touch is always delivered in 1280×720 regardless of output mode.
+    // The VI layer lives in 1920×1080 space, so the touch→VI ratio is always
+    // ×3/2.  The touch footprint of the layer is therefore LayerSize × 2/3.
+    //
+    //   720p mode  – LayerWidth = GB_W*scale*3/2  → touch_w = GB_W*scale
+    //   1080p mode – LayerWidth = GB_W*scale       → touch_w = GB_W*scale*2/3
+    //
+    // Using the live cfg value keeps hit-testing correct in both modes and
+    // automatically reflects any underscan correction applied to the layer.
+    static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
+    static int touch_win_h() { return static_cast<int>(tsl::cfg::LayerHeight) * 2 / 3; }
 
 public:
     ~GBWindowedGui() {
@@ -510,6 +628,23 @@ public:
             m_load_failed = false;
             if (g_self_path[0])
                 tsl::setNextOverlay(std::string(g_self_path));
+            tsl::Overlay::get()->close();
+        }
+        // Relaunch with 720p sizing when console undocks while in 1080p mode.
+        // exitServices() (called automatically on close) saves SRAM and audio
+        // snapshot so the restarted session resumes exactly where it left off.
+        // windowedLayerPixelPerfect will be false on next launch because
+        // consoleIsDocked() returns false, giving correct 720p VI sizing.
+        if (s_undock_relaunch) {
+            s_undock_relaunch = false;
+            if (g_gb.romPath[0])
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom,
+                                     std::string(g_gb.romPath), "");
+            if (g_win_quick_exit)
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+            launchComboHasTriggered.store(true, std::memory_order_release);
+            if (g_self_path[0])
+                tsl::setNextOverlay(std::string(g_self_path), "-windowed");
             tsl::Overlay::get()->close();
         }
         if (runOnce) {
@@ -665,10 +800,10 @@ public:
 
         // ── Right/Left stick click: resize window ────────────────────────────
         // Right stick click steps up one scale; left stick click steps down.
-        // Cycles 1× → 2× → 3× → 4× → 5× (capped by heap tier).
+        // Cycles 1× → 2× → 3× → 4× → 5× → (6×) capped by heap tier and mode.
         //   4 MB heap  : max 3×
         //   6 MB heap  : max 4×
-        //   8 MB+ heap : max 5×
+        //   8 MB+ heap : max 5×  (or 6× when expandedMemory + docked + 1080p)
         //
         // Both are disabled while pass-through is active so the background
         // app receives the stick click undisturbed.
@@ -679,19 +814,27 @@ public:
             const bool rstick = (keysDown & KEY_RSTICK && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK));
             const bool lstick = (keysDown & KEY_LSTICK && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK));
             if (rstick || lstick) {
-                const auto currentHeapSize    = ult::getCurrentHeapSize();
-                const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
-                const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+                const auto currentHeapSize      = ult::getCurrentHeapSize();
+                const bool earlyLimited         = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
+                const bool earlyRegularMemory   = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+                const bool earlyExpanded        = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
 
-                const int max_scale = earlyLimited      ? 3
-                                    : earlyRegularMemory ? 4
-                                    :                      5;  // 8 MB+ heap
+                // 6× is only available when expandedMemory + docked + 1080p pixel-perfect.
+                // On plain 8 MB heap (not furtherExpandedMemory), also requires ROM < 4 MB.
+                const bool romSmall = earlyExpanded
+                    ? (get_rom_size(g_gb.romPath) < kROM_4MB)
+                    : true;  // furtherExpandedMemory or smaller tiers — no extra ROM-size gate
+                const int max_scale = earlyLimited       ? 3
+                                    : earlyRegularMemory  ? 4
+                                    : (earlyExpanded && ult::consoleIsDocked() && ult::windowedLayerPixelPerfect && romSmall) ? 6
+                                    :                        5;
                 const int new_scale = rstick
                     ? std::min(g_win_scale + 1, max_scale)
                     : std::max(g_win_scale - 1, 1);
                 if (new_scale != g_win_scale) {
                     // Persist new scale and ROM path so the relaunch picks them up.
                     const char* sv =
+                        (new_scale == 6) ? "6" :
                         (new_scale == 5) ? "5" :
                         (new_scale == 4) ? "4" :
                         (new_scale == 3) ? "3" :
@@ -732,14 +875,16 @@ public:
 
         // ── Touch hold-to-drag (via direct HID poll) ──────────────────────────
         // Coordinate spaces:
-        //   Touch: 0..1279 × 0..719  (HID native, Switch screen pixels)
-        //   VI:    0..1919 × 0..1079 (× 1.5 display scale factor)
+        //   Touch: 0..1279 × 0..719  (HID native, always fixed)
+        //   VI:    0..1919 × 0..1079 (always fixed, touch→VI is ×3/2)
         //
         // Window in touch space:
-        //   origin:  (g_win_pos_x*2/3,  g_win_pos_y*2/3)
-        //   size:    GB_W*scale × GB_H*scale  (= framebuffer pixels at scale N)
+        //   origin: (g_win_pos_x*2/3, g_win_pos_y*2/3)   [VI pos ÷ 1.5, always]
+        //   size:   touch_win_w() × touch_win_h()
+        //             720p mode:  GB_W*scale  × GB_H*scale   (layer = FB×1.5 → touch = layer×2/3 = FB)
+        //             1080p mode: GB_W*scale*2/3 × GB_H*scale*2/3  (layer = FB×1.0 → touch = FB×2/3)
         //
-        // Converting touch delta → VI delta:  delta_vi = delta_touch * 3/2
+        // Converting touch delta → VI delta:  delta_vi = delta_touch * 3/2  (always, both modes)
         {
             int tx = 0, ty = 0;
             const bool touching = poll_touch(tx, ty);

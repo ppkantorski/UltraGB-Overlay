@@ -94,6 +94,7 @@ static const std::string kKeyIngameWallpaper{"ingame_wallpaper"};
 static const std::string kKeyWinPosX      {"win_pos_x"};
 static const std::string kKeyWinPosY      {"win_pos_y"};
 static const std::string kKeyWinScale     {"win_scale"};
+static const std::string kKeyWinOutput    {"win_output"};   // "720" or "1080"
 static const std::string kKeyWindowedRom  {"windowed_rom"};
 static const std::string kKeyWinQuickExit {"win_quick_exit"};
 static const std::string kKeySettingsScroll{"settings_scroll"};
@@ -172,14 +173,33 @@ static bool g_win_quick_exit = false;
 static int g_win_pos_x = (1920 - 240) / 2;   // 840  (1× default centre)
 static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
 
-// Windowed display scale: 1, 2, or 3 (integer pixel scale factor).
-// 1× = 160×144 VI layer (240×216 in VI space)
-// 2× = 320×288 VI layer (480×432 in VI space)
-// 3× = 480×432 VI layer (720×648 in VI space)
-// Read from config.ini as "win_scale"; default 1.
-// g_win_scale is read directly in main() before tsl::loop so the
-// framebuffer is sized correctly before Tesla initialises.
-static int g_win_scale = 1;
+// Windowed display scale: 1–6 (integer pixel scale factor).
+// 1× = 160×144 VI layer   2× = 320×288   3× = 480×432
+// 4× = 640×576            5× = 800×720   6× = 960×864
+//
+// g_win_scale serves two roles:
+//  • Normal overlay  — holds the RAW stored value from config.ini so the
+//    SettingsGui display can show the user's intent (make_label caps it to
+//    the current session's maxScale via std::min).  load_config() sets this
+//    value but does NOT write it back, preserving the stored intent.
+//  • Windowed session — holds the EFFECTIVE (hardware-safe) value clamped in
+//    main() before the framebuffer is sized.  load_config() must not override
+//    it after that point; g_win_scale_locked prevents it from doing so.
+//
+// g_win_scale is read in main() before tsl::loop so the framebuffer is sized
+// correctly before Tesla initialises.
+static int  g_win_scale        = 1;
+// Set true in main() after the framebuffer-sizing clamp so that
+// WindowedOverlay::initServices() → load_config() does not re-read win_scale
+// from config and override the correctly-clamped framebuffer-matching value.
+static bool g_win_scale_locked = false;
+
+// Windowed output resolution mode.
+// false = 720p-scaled (default): VI layer is ×1.5 the framebuffer size (LayerMaxWidth=1280 divisor).
+// true  = 1080p pixel-perfect:   VI layer equals the framebuffer exactly (LayerMaxWidth=1920 divisor).
+//         Each framebuffer pixel maps to exactly one display pixel — required for a clean LCD Grid.
+// Read from config.ini as "win_output" ("720" / "1080"); takes effect on next windowed launch.
+static bool g_win_1080 = false;
 
 static void save_vol_backup() {
     char buf[4];
@@ -187,9 +207,10 @@ static void save_vol_backup() {
                          vol_to_str(g_vol_backup, buf), "");
 }
 
-// Parse "1"/"2"/"3"/"4"/"5" win_scale string → int; anything else → 1.
-// Avoids duplicating the identical 5-branch if/else at three sites in main().
+// Parse "1"/"2"/"3"/"4"/"5"/"6" win_scale string → int; anything else → 1.
+// Avoids duplicating the identical 6-branch if/else at three sites in main().
 static int parse_win_scale_str(const std::string& sv) {
+    if (sv == "6") return 6;
     if (sv == "5") return 5;
     if (sv == "4") return 4;
     if (sv == "3") return 3;
@@ -285,18 +306,28 @@ static void load_config() {
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosX), v)) g_win_pos_x = v;
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosY), v)) g_win_pos_y = v; }
 
-    // win_scale — windowed display scale: 1, 2, 3, 4, or 5 (default 1).
+    // win_scale — windowed display scale: 1–6 (default 1).
     // Any absent or unrecognised value falls back to 1.
-    // Config value is never overwritten here; stored values are preserved for round-trip.
-    g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinScale));
+    //
+    // In the NORMAL overlay (g_win_scale_locked == false) we store the raw
+    // config value so the SettingsGui can display the user's stored intent —
+    // make_label caps the display to the current session's effective maximum
+    // via std::min(g_win_scale, maxScale) without touching the stored value.
+    //
+    // In the WINDOWED session (g_win_scale_locked == true) main() has already
+    // read, clamped, and used g_win_scale to size the framebuffer.  We must
+    // NOT override it here or the blit kernel will walk off the end of the
+    // framebuffer (g_win_scale > actual framebuffer scale → crash).
+    if (!g_win_scale_locked)
+        g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinScale));
 
-    // Clamp to the memory limit.
-    // 4 MB heap: max 3× (4× requires at least 6 MB).
-    // 6 MB / 8 MB heap: max 4× (5× requires at least 10 MB).
-    if (ult::limitedMemory && g_win_scale >= 4)
-        g_win_scale = 3;
-    if (!ult::limitedMemory && !ult::expandedMemory && g_win_scale >= 5)
-        g_win_scale = 4;
+    // win_output — "720" (default, 1.5× VI layer) or "1080" (pixel-perfect, 1:1 VI layer).
+    // Takes effect on the next windowed launch.
+    {
+        const std::string out_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyWinOutput);
+        if (!out_val.empty())
+            g_win_1080 = (out_val == "1080");
+    }
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -320,6 +351,8 @@ static void write_default_config_if_missing() {
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
+    set_if_missing("win_output",    "720");
+    set_if_missing("overlay",       "1");
 }
 
 // Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
@@ -357,11 +390,19 @@ static void save_win_pos() {
                          ult::to_string(g_win_pos_y), "");
 }
 
+// Persist the windowed output resolution mode to config.ini.
+// Takes effect on the next windowed launch (read before Tesla initialises the layer).
+static void save_win_output() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinOutput,
+                         g_win_1080 ? "1080" : "720", "");
+}
+
 // Persist the windowed scale (1/2/3) to config.ini.
 // The new scale takes effect the next time the user launches a ROM in
 // windowed mode (setNextOverlay reads it before Tesla initialises the layer).
 static void save_win_scale() {
-    const char* s = (g_win_scale == 5) ? "5"
+    const char* s = (g_win_scale == 6) ? "6"
+                  : (g_win_scale == 5) ? "5"
                   : (g_win_scale == 4) ? "4"
                   : (g_win_scale == 3) ? "3"
                   : (g_win_scale == 2) ? "2"
@@ -636,7 +677,7 @@ static bool g_wallpaper_evicted = false;  // true when wallpaper was cleared for
 PaletteMode g_palette_mode   = PaletteMode::GBC;  // per-game; GBC title-lookup by default
 bool g_fb_is_rgb565           = false;  // true when CGB mode; set in gb_load_rom
 bool g_fb_is_prepacked        = false;  // true when g_gb_fb stores RGBA4444 (DMG games)
-bool g_vp_2x                  = false;  // false=2.5× (default), true=2× pixel-perfect
+bool g_vp_2x                  = true;   // true=2× pixel-perfect (default), false=2.5×
 bool g_lcd_ghosting           = false;  // 50/50 frame blend — simulates GBC LCD persistence; per-game, off by default
 bool g_lcd_grid               = false;  // LCD grid overlay — darkens inter-pixel gaps to simulate real GB Color LCD
 bool g_fast_forward           = false;  // true while ZR double-click-hold is active
@@ -2537,15 +2578,25 @@ public:
         list->addItem(win_item);
 
         // ── Windowed Scale ────────────────────────────────────────────────────
-        // Cycles 1× → 2× → 3× → 4× → 1× on each A press.
+        // Cycles 1× → 2× → 3× → 4× → 5× → (6×) → 1× on each A press.
         // Capped at 3× on 4 MB heap sessions.  Takes effect on the next
         // windowed launch (framebuffer is sized before Tesla initialises).
+        // 6× is only available on expandedMemory + docked + 1080p.
+        // On the plain 8 MB heap (not furtherExpandedMemory), only ROMs < 4 MB
+        // have enough headroom; larger ROMs are capped at 5×.
         {
-            const int maxScale = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : 5);
+            const bool romSmall = [&]() -> bool {
+                if (ult::furtherExpandedMemory) return true;
+                if (!g_last_rom_path[0])        return false;
+                const std::string full = std::string(g_rom_dir) + g_last_rom_path;
+                return get_rom_size(full.c_str()) < kROM_4MB;
+            }();
+            const bool can6x   = ult::expandedMemory && ult::consoleIsDocked() && g_win_1080 && romSmall;
+            const int maxScale = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (can6x ? 6 : 5));
 
             auto make_label = [maxScale]() -> std::string {
                 const int s = std::min(g_win_scale, maxScale);
-                static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x"};
+                static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x"};
                 return lbs[s - 1];
             };
 
@@ -2559,6 +2610,26 @@ public:
                 return true;
             });
             list->addItem(scale_item);
+        }
+
+        // ── Windowed Docked ───────────────────────────────────────────────────
+        // "720p"  — VI layer is ×1.5 the framebuffer (default).  Larger window
+        //           on-screen but non-integer scaling; LCD Grid looks blurry.
+        // "1080p" — VI layer equals the framebuffer exactly (1:1 display pixels).
+        //           Pixel-perfect; LCD Grid renders with clean integer boundaries.
+        //           Window appears smaller since no enlargement is applied.
+        // Takes effect on the next windowed launch.
+        {
+            auto* out_item = new tsl::elm::ListItem("Windowed Docked",
+                                                     g_win_1080 ? "1080p" : "720p");
+            out_item->setClickListener([out_item](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                g_win_1080 = !g_win_1080;
+                save_win_output();
+                out_item->setValue(g_win_1080 ? "1080p" : "720p");
+                return true;
+            });
+            list->addItem(out_item);
         }
 
         // ── Overlay Scale ─────────────────────────────────────────────────────
@@ -3328,13 +3399,36 @@ int main(int argc, char* argv[]) {
                             goto normal_overlay_launch;
                     }
 
-                    // Read win_scale with the same early-memory clamps
+                    // Read win_output early — load_config() has not run yet.
+                    // Must precede the win_scale clamp (6× needs g_win_1080).
+                    {
+                        const std::string out_val = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput);
+                        g_win_1080 = (out_val == "1080");
+                    }
+
+                    // Read win_scale and apply the same early-memory clamps
                     // used in the -windowed block below.
                     {
-                    g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
+                        g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
                         if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
                         if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
-                        //if (earlyExpanded      && g_win_scale >= 5) g_win_scale = 5;
+                        if (g_win_scale >= 6) {
+                            // earlyExpanded == true means EXACTLY 8 MB.
+                            // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
+                            const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
+                            if (isFurtherExpanded) {
+                                // 10 MB+: 6× allowed for any ROM; need docked + 1080p.
+                                if (!(ult::consoleIsDocked() && g_win_1080))
+                                    g_win_scale = 5;
+                            } else if (earlyExpanded) {
+                                // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
+                                if (!(ult::consoleIsDocked() && g_win_1080 && get_rom_size(fullPath.c_str()) < kROM_4MB))
+                                    g_win_scale = 5;
+                            } else {
+                                // 4 MB / 6 MB — unreachable (already clamped above).
+                                g_win_scale = 5;
+                            }
+                        }
                     }
 
                     // Write to config so WindowedOverlay::initServices() picks
@@ -3342,8 +3436,12 @@ int main(int argc, char* argv[]) {
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, fullPath, "");
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
 
+                    // Lock so WindowedOverlay::initServices() → load_config()
+                    // does not restore the raw stored win_scale over the clamped value.
+                    g_win_scale_locked = true;
                     ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
                     ult::DefaultFramebufferHeight = GB_H * g_win_scale;
+                    ult::windowedLayerPixelPerfect = g_win_1080 && ult::consoleIsDocked();
                     return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
                 }
             }
@@ -3354,23 +3452,66 @@ int main(int argc, char* argv[]) {
             // load_config() has not run yet at this point (it runs inside
             // WindowedOverlay::initServices(), which tsl::loop calls after
             // the framebuffer is already created).  We must read win_scale
-            // directly so we can size the VI layer correctly before Tesla
-            // initialises.  Absent / invalid key → safe default of 1×.
+            // and win_output directly so we can size and position the VI layer
+            // correctly before Tesla initialises.  Absent / invalid key → safe defaults.
+
+            // Read win_output first — the 6× scale clamp depends on it.
+            {
+                const std::string out_val = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeyWinOutput);
+                g_win_1080 = (out_val == "1080");
+            }
             {
                 g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(
                     kConfigFile, kConfigSection, kKeyWinScale));
 
-                // Mirror Tesla's heap check (tsl::loop does the same at startup).
-                // Clamp scale to the maximum allowed for this heap tier — but do
-                // NOT save, so switching to a higher-memory session restores it.
-                // 4 MB: max 3×   6 MB / 8 MB: max 4×   10 MB: max 5×
+                // Clamp scale to the maximum the current heap tier can support.
+                // These clamps mirror what load_config() would apply in a normal
+                // overlay session, but must be done here (before tsl::loop) because
+                // the framebuffer is sized BEFORE Tesla / load_config initialises.
+                //
+                // Memory tiers:
+                //   4 MB (earlyLimited):       max 3×
+                //   6 MB (earlyRegularMemory): max 4×
+                //   8 MB (earlyExpanded):      max 5×; 6× only for docked+1080p+ROM<4MB
+                //  10 MB+ (none of the above): max 6× for docked+1080p (any ROM size)
+                //
+                // The stored config value is intentionally NOT written back; the user's
+                // intent is preserved for higher-memory sessions.
 
                 if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
                 if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
-                //if (earlyExpanded      && g_win_scale >= 5) g_win_scale = 5;
+                if (g_win_scale >= 6) {
+                    // earlyExpanded == true means EXACTLY 8 MB.
+                    // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
+                    const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
+                    if (isFurtherExpanded) {
+                        // 10 MB+: 6× allowed for any ROM size; need docked + 1080p.
+                        if (!(ult::consoleIsDocked() && g_win_1080))
+                            g_win_scale = 5;
+                    } else if (earlyExpanded) {
+                        // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
+                        // Read the windowed ROM path (written to config by the caller
+                        // before setNextOverlay).  Key is erased in initServices() —
+                        // reading it here does not consume it.
+                        const std::string wrom = ult::parseValueFromIniSection(
+                            kConfigFile, kConfigSection, kKeyWindowedRom);
+                        const size_t wrsz = wrom.empty() ? 0 : get_rom_size(wrom.c_str());
+                        if (!(ult::consoleIsDocked() && g_win_1080 && wrsz < kROM_4MB))
+                            g_win_scale = 5;
+                    } else {
+                        // 4 MB / 6 MB — unreachable (already clamped to 3 or 4 above).
+                        g_win_scale = 5;
+                    }
+                }
             }
+            // Lock g_win_scale so WindowedOverlay::initServices() → load_config()
+            // does not read the raw stored value back from config.ini and override
+            // the correctly-clamped framebuffer-matching scale set just above.
+            g_win_scale_locked = true;
             ult::DefaultFramebufferWidth  = GB_W * g_win_scale;
             ult::DefaultFramebufferHeight = GB_H * g_win_scale;
+            ult::windowedLayerPixelPerfect = g_win_1080 && ult::consoleIsDocked();
             return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
         }
     }

@@ -642,6 +642,13 @@ static struct GACtrl {
     // paused — thread submits silence; GBAPU state is fully preserved.
     std::atomic<bool> paused{false};
 
+    // resync — set by gb_audio_request_resync() when the operation mode changes
+    // (handheld ↔ docked).  The audio thread handles it inline on its next
+    // iteration: flush, stop, start, re-prequeue two silence frames, reset
+    // drift clock.  Zero blocking; zero overhead in the steady-state path
+    // (one relaxed atomic load per audio frame, ~1 ns).
+    std::atomic<bool> resync{false};
+
     // Full GBAPU snapshot written by the audio thread on exit (gb_audio_shutdown).
     // Restored on the next thread startup (gb_audio_init) so all runtime state
     // (channel enabled flags, timers, duty_pos, vol, seq_step, lfsr, ...) is
@@ -838,6 +845,38 @@ static void gb_audio_thread_fn(void*) {
         }
         s_ctrl.cur=(s_ctrl.cur+1u)&3u;
 
+        // ── Operation-mode resync (handheld ↔ docked) ────────────────────────
+        // When the audio output device changes the kernel silently invalidates
+        // all queued DMA buffers, desynchronising our ring.  Flush+stop+start
+        // resets the hardware queue; re-queuing two silence frames restores the
+        // 2-frame headroom.  GBAPU state in `local` (including hp_ch) is fully
+        // preserved — no pops, no stale channel state.
+        if (__builtin_expect(s_ctrl.resync.load(std::memory_order_acquire), 0)) {
+            {
+                std::lock_guard<std::mutex> lk(ult::Audio::m_audioMutex);
+                bool _dummy = false;
+                audoutFlushAudioOutBuffers(&_dummy);
+                audoutStopAudioOut();
+                audoutStartAudioOut();
+                for (int _i = 0; _i < 2; ++_i) {
+                    const uint8_t slot = (s_ctrl.cur + _i) & 3u;
+                    memset(s_ctrl.dma[slot], 0, GB_DMA_CAP);
+                    s_ctrl.ab[slot] = {};
+                    s_ctrl.ab[slot].buffer      = s_ctrl.dma[slot];
+                    s_ctrl.ab[slot].buffer_size = GB_DMA_CAP;
+                    s_ctrl.ab[slot].data_size   = GB_DMA_DATA;
+                    s_ctrl.ab[slot].data_offset = 0;
+                    s_ctrl.ab[slot].next        = nullptr;
+                    audoutAppendAudioOutBuffer(&s_ctrl.ab[slot]);
+                }
+                s_ctrl.cur = (s_ctrl.cur + 2u) & 3u;
+            }
+            // Re-anchor the drift clock so we don't spin catch-up frames.
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            next_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec + GB_FRAME_NS;
+            s_ctrl.resync.store(false, std::memory_order_release);
+        }
+
         // ── Sleep for remainder of frame period ───────────────────────────────
         // Skip sleep when thread_run is false so the thread exits immediately
         // rather than waiting up to 16 ms.  threadWaitForExit then returns in
@@ -979,6 +1018,18 @@ static void gb_audio_pause() {
 // ─────────────────────────────────────────────────────────────────────────────
 static void gb_audio_resume() {
     s_ctrl.paused.store(false, std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_request_resync — call when operation mode changes (handheld ↔ docked).
+//
+// Sets a flag; the audio thread handles it asynchronously on its next iteration
+// (≤16.7 ms).  Non-blocking; safe to call from draw() or handleInput().
+// No-op when the audio thread is not running.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_request_resync() {
+    if (s_ctrl.ready)
+        s_ctrl.resync.store(true, std::memory_order_release);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

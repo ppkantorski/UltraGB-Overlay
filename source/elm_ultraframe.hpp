@@ -31,7 +31,7 @@
  *   footer string and re-measuring the page-label width every frame; those
  *   values only change when setPageNames() is called.
  * 
- *  Licensed under both GPLv2
+ *  Licensed under GPLv2
  *  Copyright (c) 2026 ppkantorski
  ********************************************************************************/
 
