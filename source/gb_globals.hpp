@@ -87,6 +87,15 @@ static const std::string kKeySettingsScroll{"settings_scroll"};
 static const std::string kKeyPlayerRom     {"overlay_rom"};  // ROM path for -overlay relaunch
 
 // =============================================================================
+// ROM size thresholds
+// Shared by gb_load_rom, rom_is_playable, rom_playability_message, and
+// the -quicklaunch pre-loop size check in main().
+// =============================================================================
+static constexpr size_t kROM_2MB = 2u << 20;
+static constexpr size_t kROM_4MB = 4u << 20;
+static constexpr size_t kROM_6MB = 6u << 20;
+
+// =============================================================================
 // Stack-only integer-to-string for 0–100 volume values.
 // std::to_string heap-allocates; this writes into a caller-supplied char[4].
 // Returns a pointer to buf (always null-terminated).

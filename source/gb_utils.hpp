@@ -274,6 +274,695 @@ static bool poll_console_docked() {
 }
 
 // =============================================================================
+// Config persist helpers
+//
+// One-liner wrappers around setIniFileValue.  Moved from main.cpp so any GUI
+// that includes gb_utils.hpp can persist settings without needing to reach
+// back into main.cpp.
+// =============================================================================
+
+// Persist the basename of the just-launched ROM so the selector can jump to it on re-entry.
+static void save_last_rom(const char* fullPath) {
+    const char* sl = strrchr(fullPath, '/');
+    const char* base = sl ? sl + 1 : fullPath;
+    strncpy(g_last_rom_path, base, sizeof(g_last_rom_path) - 1);
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyLastRom, base, "");
+}
+
+// Persist the LCD grid toggle to config.ini.
+static void save_lcd_grid() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyLcdGrid,
+                         g_lcd_grid ? "1" : "0", "");
+}
+
+// Persist the windowed mode toggle to config.ini.
+static void save_windowed_mode() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowed,
+                         g_windowed_mode ? "1" : "0", "");
+}
+
+// Persist the dragged window position (VI coordinates) to config.ini.
+static void save_win_pos() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinPosX,
+                         ult::to_string(g_win_pos_x), "");
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinPosY,
+                         ult::to_string(g_win_pos_y), "");
+}
+
+// Persist the windowed output resolution mode to config.ini.
+static void save_win_output() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinOutput,
+                         g_win_1080 ? "1080" : "720", "");
+}
+
+// Persist the windowed scale (1–6) to config.ini.
+static void save_win_scale() {
+    const char s[2] = { static_cast<char>('0' + g_win_scale), '\0' };
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinScale, s, "");
+}
+
+// =============================================================================
+// ROM validation helpers
+// =============================================================================
+
+// Shared fopen/fseek/ftell/fclose sequence — avoids duplicating the 4-line
+// block in both rom_is_playable() and rom_playability_message().
+static size_t get_rom_size(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    const size_t sz = static_cast<size_t>(ftell(f));
+    fclose(f);
+    return sz;
+}
+
+// Returns true when the ROM at |path| can be loaded on the current memory tier.
+// Mirrors the rejection conditions in gb_load_rom() so the selector can dim
+// unplayable entries before the user tries to launch them.
+static bool rom_is_playable(const char* path) {
+    const size_t sz = get_rom_size(path);
+    if (!sz) return false;
+    if (ult::limitedMemory          && sz >= kROM_2MB) return false;
+    if (!ult::expandedMemory        && sz >= kROM_4MB) return false;
+    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return false;
+    return true;
+}
+
+// Returns the actionable error string if the ROM at path cannot be loaded on
+// the current heap tier, or nullptr if it is playable.
+static const char* rom_playability_message(const char* path) {
+    const size_t sz = get_rom_size(path);
+    if (!sz) return nullptr;
+    if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return REQUIRES_AT_LEAST_6MB;
+    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
+    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
+    return nullptr;
+}
+
+// =============================================================================
+// Quick Combo helpers
+// =============================================================================
+
+// Return the bare filename of this .ovl (e.g. "ultragb.ovl") from g_self_path.
+static const char* ovl_filename() {
+    if (!g_self_path[0]) return "";
+    const char* sl = strrchr(g_self_path, '/');
+    return sl ? sl + 1 : g_self_path;
+}
+
+// Default combos available in the Quick Combo picker.
+static constexpr const char* const g_defaultCombos[] = {
+    "ZL+ZR+DDOWN",  "ZL+ZR+DRIGHT", "ZL+ZR+DUP",    "ZL+ZR+DLEFT",
+    "L+R+DDOWN",    "L+R+DRIGHT",   "L+R+DUP",       "L+R+DLEFT",
+    "L+DDOWN",      "R+DDOWN",
+    "ZL+ZR+PLUS",   "L+R+PLUS",     "ZL+ZR+MINUS",   "L+R+MINUS",
+    "ZL+MINUS",     "ZR+MINUS",     "ZL+PLUS",        "ZR+PLUS",    "MINUS+PLUS",
+    "LS+RS",        "L+DDOWN+RS",   "L+R+LS",         "L+R+RS",
+    "ZL+ZR+LS",     "ZL+ZR+RS",     "ZL+ZR+L",        "ZL+ZR+R",    "ZL+ZR+LS+RS"
+};
+
+// Remove keyCombo from every overlay's key_combo AND mode_combos in
+// overlays.ini, and from every package's key_combo in packages.ini.
+[[gnu::noinline]]
+static void remove_quick_combo_from_others(const std::string& keyCombo,
+                                           bool skipOwnModeCombos = false) {
+    if (keyCombo.empty()) return;
+    if (!ult::isFile(ult::OVERLAYS_INI_FILEPATH)) return;
+
+    const char* own = ovl_filename();
+    const bool haveOwn = own && own[0];
+    auto data = ult::getParsedDataFromIniFile(ult::OVERLAYS_INI_FILEPATH);
+    bool dirty = false;
+
+    for (auto& [name, section] : data) {
+        const bool isSelf = haveOwn && (name == own);
+
+        auto kcIt = section.find("key_combo");
+        if (kcIt != section.end() && !kcIt->second.empty() &&
+            tsl::hlp::comboStringToKeys(kcIt->second) ==
+            tsl::hlp::comboStringToKeys(keyCombo)) {
+            kcIt->second = "";
+            dirty = true;
+        }
+
+        if (isSelf && skipOwnModeCombos) continue;
+
+        auto mcIt = section.find("mode_combos");
+        if (mcIt != section.end() && !mcIt->second.empty()) {
+            auto comboList = ult::splitIniList(mcIt->second);
+            bool changed = false;
+            for (auto& c : comboList) {
+                if (!c.empty() &&
+                    tsl::hlp::comboStringToKeys(c) ==
+                    tsl::hlp::comboStringToKeys(keyCombo)) {
+                    c = "";
+                    changed = true;
+                }
+            }
+            if (changed) {
+                mcIt->second = "(" + ult::joinIniList(comboList) + ")";
+                dirty = true;
+            }
+        }
+    }
+
+    if (dirty)
+        ult::saveIniFileData(ult::OVERLAYS_INI_FILEPATH, data);
+
+    if (!ult::isFile(ult::PACKAGES_INI_FILEPATH)) return;
+    auto pkgData = ult::getParsedDataFromIniFile(ult::PACKAGES_INI_FILEPATH);
+    bool pkgDirty = false;
+    for (auto& [name, section] : pkgData) {
+        auto kcIt = section.find("key_combo");
+        if (kcIt != section.end() && !kcIt->second.empty() &&
+            tsl::hlp::comboStringToKeys(kcIt->second) ==
+            tsl::hlp::comboStringToKeys(keyCombo)) {
+            kcIt->second = "";
+            pkgDirty = true;
+        }
+    }
+    if (pkgDirty)
+        ult::saveIniFileData(ult::PACKAGES_INI_FILEPATH, pkgData);
+}
+
+// Register "-quicklaunch" as our single mode in overlays.ini and read the
+// stored combo into g_quick_combo.  Called from Overlay::initServices().
+static void register_quick_launch_mode() {
+    const char* filename = ovl_filename();
+    if (!filename || !filename[0]) return;
+    if (!ult::isFile(ult::OVERLAYS_INI_FILEPATH)) return;
+
+    static constexpr const char* kExpectedArgs   = "(-quicklaunch)";
+    static constexpr const char* kExpectedLabels = "(Quick Launch)";
+
+    ult::setIniFileValue(ult::OVERLAYS_INI_FILEPATH, filename, "mode_args",   kExpectedArgs);
+    ult::setIniFileValue(ult::OVERLAYS_INI_FILEPATH, filename, "mode_labels", kExpectedLabels);
+
+    g_quick_combo[0] = '\0';
+
+    const std::string mc = ult::parseValueFromIniSection(
+        ult::OVERLAYS_INI_FILEPATH, filename, "mode_combos"
+    );
+
+    const auto comboList = ult::splitIniList(mc);
+    if (!comboList.empty() && !comboList[0].empty()) {
+        strncpy(g_quick_combo, comboList[0].c_str(), sizeof(g_quick_combo) - 1);
+        g_quick_combo[sizeof(g_quick_combo) - 1] = '\0';
+    }
+
+    if (g_quick_combo[0])
+        remove_quick_combo_from_others(g_quick_combo, /*skipOwnModeCombos=*/true);
+}
+
+// =============================================================================
+// Per-game config helpers
+// Each ROM gets its own ini at: CONFIGURE_DIR/<filename>.ini
+// =============================================================================
+
+// Peek at ROM header byte 0x143 to determine CGB support without loading the ROM.
+static uint8_t rom_cgb_flag(const char* romPath) {
+    FILE* f = fopen(romPath, "rb");
+    if (!f) return 0;
+    uint8_t flag = 0;
+    if (fseek(f, 0x143, SEEK_SET) == 0)
+        fread(&flag, 1, 1, f);
+    fclose(f);
+    return flag;
+}
+
+// Returns true for any ROM that declares CGB support (0x80 or 0xC0).
+static bool rom_has_cgb_flag(const char* romPath) {
+    return (rom_cgb_flag(romPath) & 0x80) != 0;
+}
+
+static void build_game_config_path(const char* romPath, char* out, size_t outSz) {
+    const char* sl = strrchr(romPath, '/');
+    const char* base = sl ? sl + 1 : romPath;
+    snprintf(out, outSz, "%s%s.ini", CONFIGURE_DIR, base);
+}
+
+static std::string load_game_cfg_str(const char* romPath, const char* key) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    return ult::parseValueFromIniSection(cfgPath, kConfigSection, key);
+}
+
+static void save_game_cfg_str(const char* romPath, const char* key, const char* value) {
+    char cfgPath[PATH_BUFFER_SIZE];
+    build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
+    ult::createDirectory(CONFIGURE_DIR);
+    ult::setIniFileValue(cfgPath, kConfigSection, key, value, "");
+}
+
+static const char* palette_mode_to_str(PaletteMode m) {
+    switch (m) {
+        case PaletteMode::SGB:    return "SGB";
+        case PaletteMode::DMG:    return "DMG";
+        case PaletteMode::NATIVE: return "Native";
+        default:                  return "GBC";
+    }
+}
+
+static PaletteMode str_to_palette_mode(const std::string& s) {
+    if (s == "DMG")    return PaletteMode::DMG;
+    if (s == "Native") return PaletteMode::NATIVE;
+    return PaletteMode::GBC;
+}
+
+static PaletteMode load_game_palette_mode(const char* romPath) {
+    return str_to_palette_mode(load_game_cfg_str(romPath, "palette_mode"));
+}
+
+static void save_game_palette_mode(const char* romPath, PaletteMode m) {
+    save_game_cfg_str(romPath, "palette_mode", palette_mode_to_str(m));
+}
+
+// Cycles through the three UI-exposed modes (SGB intentionally excluded).
+static PaletteMode next_palette_mode(PaletteMode current) {
+    switch (current) {
+        case PaletteMode::GBC:    return PaletteMode::DMG;
+        case PaletteMode::DMG:    return PaletteMode::NATIVE;
+        case PaletteMode::NATIVE: return PaletteMode::GBC;
+        default:                  return PaletteMode::GBC;
+    }
+}
+
+// Short user-facing label for the three exposed modes.
+static const char* palette_mode_label(PaletteMode m) {
+    switch (m) {
+        case PaletteMode::DMG:    return "DMG";
+        case PaletteMode::NATIVE: return "Native";
+        default:                  return "GBC";
+    }
+}
+
+static bool load_game_lcd_ghosting(const char* romPath) {
+    return load_game_cfg_str(romPath, "lcd_ghosting") == "1";
+}
+
+static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
+    save_game_cfg_str(romPath, "lcd_ghosting", enabled ? "1" : "0");
+}
+
+static bool load_game_no_sprite_limit(const char* romPath) {
+    return load_game_cfg_str(romPath, "no_sprite_limit") != "0";
+}
+
+static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
+    save_game_cfg_str(romPath, "no_sprite_limit", enabled ? "1" : "0");
+}
+
+// =============================================================================
+// Save helpers
+// =============================================================================
+
+// Derives a per-ROM path of the form <dir><basename_no_ext><ext>.
+static void build_rom_data_path(const char* romPath, char* out, size_t outSz,
+                                const char* dir, const char* ext) {
+    const char* slash = strrchr(romPath, '/');
+    const char* base  = slash ? slash + 1 : romPath;
+    char bn[PATH_BUFFER_SIZE] = {};
+    strncpy(bn, base, sizeof(bn) - 1);
+    char* dot = strrchr(bn, '.');
+    if (dot) *dot = '\0';
+    snprintf(out, outSz, "%s%s%s", dir, bn, ext);
+}
+
+static void load_save(GBState& s) {
+    if (!s.cartRam || !s.cartRamSz) return;
+    FILE* f = fopen(s.savePath, "rb");
+    if (!f) return;
+    fread(s.cartRam, 1, s.cartRamSz, f);
+    fclose(f);
+}
+
+static void write_save(GBState& s) {
+    if (!s.cartRam || !s.cartRamSz) return;
+    ult::createDirectory(g_save_dir);
+    FILE* f = fopen(s.savePath, "wb");
+    if (!f) return;
+    fwrite(s.cartRam, 1, s.cartRamSz, f);
+    fclose(f);
+}
+
+// =============================================================================
+// State save / load  (cross-session resume)
+//
+// Format (all fields little-endian):
+//   [0]  uint32  magic        = 0x47425354 ('GBST')
+//   [4]  uint32  version      = 4
+//   [8]  uint32  cart_ram_sz
+//   [12] uint32  fb_bytes     = GB_W*GB_H*2
+//   [16] uint32  fb_flags     0=RGB565/RGB555  1=RGBA4444 prepacked
+//   [20] gb_s    core         (function pointers re-patched on load)
+//   [+]  uint8[] cart_ram
+//   [+]  uint16[] framebuffer
+//   [+]  GBAPU   apu_snapshot
+// =============================================================================
+static constexpr uint32_t STATE_MAGIC   = 0x47425354u; // 'GBST'
+static constexpr uint32_t STATE_VERSION = 4u;
+
+static void save_state(GBState& s) {
+    if (!s.romPath[0]) return;
+
+    ult::createDirectory(STATE_DIR);
+
+    char statePath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(s.romPath, statePath, sizeof(statePath), STATE_DIR, ".state");
+
+    FILE* f = fopen(statePath, "wb");
+    if (!f) return;
+
+    const uint32_t magic   = STATE_MAGIC;
+    const uint32_t version = STATE_VERSION;
+    const uint32_t ramSz   = static_cast<uint32_t>(s.cartRamSz);
+    const uint32_t fbBytes = static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t));
+    const uint32_t fbFlags = g_fb_is_prepacked ? 1u : 0u;
+
+    fwrite(&magic,   sizeof(magic),   1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&ramSz,   sizeof(ramSz),   1, f);
+    fwrite(&fbBytes, sizeof(fbBytes), 1, f);
+    fwrite(&fbFlags, sizeof(fbFlags), 1, f);
+    fwrite(s.gb,     sizeof(*s.gb),   1, f);
+    if (s.cartRam && s.cartRamSz)
+        fwrite(s.cartRam, 1, s.cartRamSz, f);
+    fwrite(g_gb_fb, 1, fbBytes, f);
+
+    GBAPU apu_snap{};
+    gb_audio_save_state(&apu_snap);
+    fwrite(&apu_snap, sizeof(apu_snap), 1, f);
+
+    fclose(f);
+}
+
+// Returns true if a valid state was loaded and the emulator is ready to run.
+// *apu_restored is set true when the GBAPU snapshot was successfully restored.
+static bool load_state(GBState& s, bool* apu_restored = nullptr) {
+    if (apu_restored) *apu_restored = false;
+    if (!s.romPath[0]) return false;
+
+    char statePath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(s.romPath, statePath, sizeof(statePath), STATE_DIR, ".state");
+
+    FILE* f = fopen(statePath, "rb");
+    if (!f) return false;
+
+    uint32_t magic = 0, version = 0, ramSz = 0, fbBytes = 0;
+    if (fread(&magic,   sizeof(magic),   1, f) != 1 || magic != STATE_MAGIC) { fclose(f); return false; }
+    if (fread(&version, sizeof(version), 1, f) != 1 || version != STATE_VERSION) { fclose(f); return false; }
+    if (fread(&ramSz,   sizeof(ramSz),   1, f) != 1) { fclose(f); return false; }
+    if (fread(&fbBytes, sizeof(fbBytes), 1, f) != 1) { fclose(f); return false; }
+
+    uint32_t fbFlags = 0u;
+    if (fread(&fbFlags, sizeof(fbFlags), 1, f) != 1) { fclose(f); return false; }
+
+    if (ramSz   != static_cast<uint32_t>(s.cartRamSz))  { fclose(f); return false; }
+    if (fbBytes != static_cast<uint32_t>(GB_W * GB_H * sizeof(uint16_t))) { fclose(f); return false; }
+
+    if (fread(s.gb, sizeof(*s.gb), 1, f) != 1) { fclose(f); return false; }
+
+    s.gb->gb_rom_read       = gb_rom_read;
+    s.gb->gb_rom_read_16bit = gb_rom_read16;
+    s.gb->gb_rom_read_32bit = gb_rom_read32;
+    s.gb->gb_cart_ram_read  = gb_cart_ram_read;
+    s.gb->gb_cart_ram_write = gb_cart_ram_write;
+    s.gb->gb_error          = gb_error;
+    s.gb->gb_serial_tx      = nullptr;
+    s.gb->gb_serial_rx      = nullptr;
+    s.gb->gb_bootrom_read   = nullptr;
+    s.gb->direct.priv       = nullptr;
+    gb_init_lcd(s.gb, gb_lcd_draw_line);
+
+    if (s.cartRam && s.cartRamSz) {
+        if (fread(s.cartRam, 1, s.cartRamSz, f) != s.cartRamSz) { fclose(f); return false; }
+    }
+
+    if (fread(g_gb_fb, 1, fbBytes, f) != fbBytes) { fclose(f); return false; }
+
+    if (g_fb_is_prepacked && fbFlags == 0u) {
+        for (int i = 0; i < GB_W * GB_H; ++i)
+            g_gb_fb[i] = gb_pack_rgb555(g_gb_fb[i]);
+    } else if (!g_fb_is_prepacked && fbFlags == 1u) {
+        memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
+    }
+
+    GBAPU apu_snap{};
+    if (fread(&apu_snap, sizeof(apu_snap), 1, f) == 1) {
+        gb_audio_restore_state(&apu_snap);
+        if (apu_restored) *apu_restored = true;
+    }
+
+    fclose(f);
+    return true;
+}
+
+// =============================================================================
+// User save-state and save-data slot helpers  (10 named slots per game)
+// =============================================================================
+
+// Per-game slot directory: <baseDir><gamename_no_ext>/.
+static void build_game_slot_dir(const char* romPath, char* out, size_t outSz,
+                                const char* baseDir) {
+    build_rom_data_path(romPath, out, outSz, baseDir, "/");
+}
+
+// Shared slot-file path builder.
+static void build_slot_file_path(const char* romPath, int slot, char* out, size_t outSz,
+                                  const char* baseDir, const char* ext) {
+    char dir[PATH_BUFFER_SIZE] = {};
+    build_game_slot_dir(romPath, dir, sizeof(dir), baseDir);
+    snprintf(out, outSz, "%sslot_%d%s", dir, slot, ext);
+}
+
+static void build_user_slot_path(const char* romPath, int slot, char* out, size_t outSz) {
+    build_slot_file_path(romPath, slot, out, outSz, STATE_BASE_DIR, ".state");
+}
+
+static void build_user_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz) {
+    build_slot_file_path(romPath, slot, out, outSz, STATE_BASE_DIR, ".ts");
+}
+
+// Write current wall-clock time to an arbitrary .ts file path.
+static void write_timestamp_to(const char* tsPath) {
+    FILE* f = fopen(tsPath, "w");
+    if (!f) return;
+    time_t t = time(nullptr);
+    struct tm ti{};
+    localtime_r(&t, &ti);
+    char buf[64] = {};
+    size_t len = strftime(buf, sizeof(buf), "%Y-%m-%d", &ti);
+    if (len < sizeof(buf))
+        len += snprintf(buf + len, sizeof(buf) - len, "%s", ult::DIVIDER_SYMBOL.c_str());
+    if (len < sizeof(buf))
+        strftime(buf + len, sizeof(buf) - len, "%H:%M:%S", &ti);
+    fwrite(buf, 1, strlen(buf), f);
+    fclose(f);
+}
+
+// Read a .ts file into out; fills ult::OPTION_SYMBOL if absent or empty.
+static void read_timestamp_from(const char* tsPath, char* out, size_t outSz) {
+    FILE* f = fopen(tsPath, "r");
+    if (!f) { strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1); out[outSz - 1] = '\0'; return; }
+    size_t n = fread(out, 1, outSz - 1, f);
+    out[n] = '\0';
+    fclose(f);
+    if (!out[0]) strncpy(out, ult::OPTION_SYMBOL.c_str(), outSz - 1);
+}
+
+static void write_slot_timestamp(const char* romPath, int slot) {
+    char tsPath[PATH_BUFFER_SIZE] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    write_timestamp_to(tsPath);
+}
+
+static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
+    char tsPath[PATH_BUFFER_SIZE] = {};
+    build_user_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    read_timestamp_from(tsPath, out, outSz);
+}
+
+static std::string make_slot_label(int slot) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Slot %d", slot);
+    return buf;
+}
+
+static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz);
+
+static std::string newest_slot_label(const char* romPath,
+    void(*buildTs)(const char*, int, char*, size_t)) {
+    time_t best = -1;
+    int    best_slot = -1;
+    for (int i = 0; i < 10; ++i) {
+        char tsPath[PATH_BUFFER_SIZE] = {};
+        buildTs(romPath, i, tsPath, sizeof(tsPath));
+        struct stat st{};
+        if (::stat(tsPath, &st) == 0 && st.st_mtime > best) {
+            best = st.st_mtime;
+            best_slot = i;
+        }
+    }
+    return best_slot >= 0 ? make_slot_label(best_slot) : std::string{};
+}
+
+static std::string newest_state_slot_label(const char* romPath) {
+    return newest_slot_label(romPath, build_user_slot_ts_path);
+}
+
+static std::string newest_save_backup_slot_label(const char* romPath) {
+    return newest_slot_label(romPath, build_save_backup_slot_ts_path);
+}
+
+static void build_save_backup_slot_path(const char* romPath, int slot, char* out, size_t outSz) {
+    build_slot_file_path(romPath, slot, out, outSz, SAVE_BASE_DIR, ".sav");
+}
+
+static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz) {
+    build_slot_file_path(romPath, slot, out, outSz, SAVE_BASE_DIR, ".ts");
+}
+
+static void write_save_backup_timestamp(const char* romPath, int slot) {
+    char tsPath[PATH_BUFFER_SIZE] = {};
+    build_save_backup_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    write_timestamp_to(tsPath);
+}
+
+static void read_save_backup_timestamp(const char* romPath, int slot, char* out, size_t outSz) {
+    char tsPath[PATH_BUFFER_SIZE] = {};
+    build_save_backup_slot_ts_path(romPath, slot, tsPath, sizeof(tsPath));
+    read_timestamp_from(tsPath, out, outSz);
+}
+
+static inline bool file_exists(const char* p) { return ult::isFile(p); }
+static inline void copy_file(const char* s, const char* d) { ult::copyFileOrDirectory(s, d); }
+static inline void delete_file(const char* p) { ult::deleteFileOrDirectory(p); }
+
+// Back up the live .sav to slot N.  Returns false if the internal .sav is absent.
+static bool backup_save_data_slot(const char* romPath, int slot) {
+    char internalPath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), g_save_dir, ".sav");
+    if (!file_exists(internalPath)) return false;
+
+    char dir[PATH_BUFFER_SIZE] = {};
+    build_game_slot_dir(romPath, dir, sizeof(dir), SAVE_BASE_DIR);
+    ult::createDirectory(dir);
+
+    char slotPath[PATH_BUFFER_SIZE] = {};
+    build_save_backup_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+
+    copy_file(internalPath, slotPath);
+    if (!file_exists(slotPath)) return false;
+    write_save_backup_timestamp(romPath, slot);
+    return true;
+}
+
+// Restore slot N into the live .sav file.  Returns false if the slot file doesn't exist.
+static bool restore_save_data_slot(const char* romPath, int slot) {
+    char slotPath[PATH_BUFFER_SIZE] = {};
+    build_save_backup_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+    if (!file_exists(slotPath)) return false;
+
+    char internalPath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), g_save_dir, ".sav");
+
+    copy_file(slotPath, internalPath);
+    if (!file_exists(internalPath)) return false;
+
+    if (g_gb.rom &&
+        strncmp(g_gb.romPath, romPath, sizeof(g_gb.romPath)) == 0 &&
+        g_gb.cartRam && g_gb.cartRamSz) {
+        FILE* f = fopen(slotPath, "rb");
+        if (f) {
+            fread(g_gb.cartRam, 1, g_gb.cartRamSz, f);
+            fclose(f);
+        }
+    }
+    return true;
+}
+
+// Save the current internal quick-resume state to user slot N.
+static bool save_user_slot(const char* romPath, int slot) {
+    char internalPath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), STATE_DIR, ".state");
+    if (!file_exists(internalPath)) return false;
+
+    char dir[PATH_BUFFER_SIZE] = {};
+    build_game_slot_dir(romPath, dir, sizeof(dir), STATE_BASE_DIR);
+    ult::createDirectory(dir);
+
+    char slotPath[PATH_BUFFER_SIZE] = {};
+    build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+
+    copy_file(internalPath, slotPath);
+    if (!file_exists(slotPath)) return false;
+    write_slot_timestamp(romPath, slot);
+    return true;
+}
+
+// Load user slot N into the internal quick-resume state file.
+static bool load_user_slot(const char* romPath, int slot) {
+    char slotPath[PATH_BUFFER_SIZE] = {};
+    build_user_slot_path(romPath, slot, slotPath, sizeof(slotPath));
+    if (!file_exists(slotPath)) return false;
+
+    char internalPath[PATH_BUFFER_SIZE] = {};
+    build_rom_data_path(romPath, internalPath, sizeof(internalPath), STATE_DIR, ".state");
+
+    copy_file(slotPath, internalPath);
+    return file_exists(internalPath);
+}
+
+// =============================================================================
+// Launch helpers
+// =============================================================================
+
+// Attempt a windowed relaunch for romPath.  Returns false when windowed mode is off.
+static bool launch_windowed_mode(const char* romPath) {
+    if (!g_windowed_mode || !g_self_path[0]) return false;
+
+    skipRumbleDoubleClick = true;
+
+    ult::launchingOverlay.store(true, std::memory_order_release);
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, romPath, "");
+    if (g_settings_scroll[0])
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                             g_settings_scroll, "");
+    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch" : "-windowed");
+    if (g_directMode)
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+    tsl::Overlay::get()->close();
+    return true;
+}
+
+// Relaunch this overlay with -overlay <romPath>.
+static void launch_overlay_mode(const char* romPath) {
+    if (!g_self_path[0]) return;
+
+    ult::launchingOverlay.store(true, std::memory_order_release);
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, romPath, "");
+    if (g_settings_scroll[0])
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                             g_settings_scroll, "");
+    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-overlay");
+    if (g_directMode)
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+
+    skipRumbleDoubleClick = true;
+    tsl::Overlay::get()->close();
+}
+
+// Exit UI audio, mark last-played, then launch in windowed or overlay mode.
+[[gnu::noinline]]
+static bool launch_game(const char* romPath) {
+    audio_exit_if_enabled();
+    save_last_rom(romPath);
+    if (launch_windowed_mode(romPath)) return true;
+    launch_overlay_mode(romPath);
+    return true;
+}
+
+// =============================================================================
 // draw_wallpaper_direct
 //
 // Drop-in replacement for renderer->drawWallpaper() with the same guards and
