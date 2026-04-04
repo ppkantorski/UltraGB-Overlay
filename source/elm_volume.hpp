@@ -1,3 +1,25 @@
+/********************************************************************************
+ * File: elm_volume.hpp
+ * VolumeTrackBar
+ *
+ * Extends TrackBar with two behaviours:
+ *
+ *  1. Mute visualisation — when volume == 0, draws the speaker glyph
+ *     left-half only (via scissor) plus a cross glyph in the right half,
+ *     giving a clear muted state without any overdraw artefacts.
+ *
+ *  2. Icon tap → mute/unmute — tapping the speaker icon fires a callback
+ *     (set via setIconTapCallback) so the caller can toggle mute and
+ *     preserve the pre-mute volume level.
+ *
+ *  3. setLabel() — lets update() relabel the slider live when the running
+ *     title ID changes without rebuilding the whole list.
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
+ ********************************************************************************/
+
+
 #pragma once
 
 #include <tesla.hpp>
@@ -5,20 +27,7 @@
 #include <algorithm>
 
 // =============================================================================
-// VolumeTrackBar
-//
-// Extends TrackBar with two behaviours:
-//
-//  1. Mute visualisation — when volume == 0, draws the speaker glyph
-//     left-half only (via scissor) plus a cross glyph in the right half,
-//     giving a clear muted state without any overdraw artefacts.
-//
-//  2. Icon tap → mute/unmute — tapping the speaker icon fires a callback
-//     (set via setIconTapCallback) so the caller can toggle mute and
-//     preserve the pre-mute volume level.
-//
-//  3. setLabel() — lets update() relabel the slider live when the running
-//     title ID changes without rebuilding the whole list.
+
 // =============================================================================
 
 class VolumeTrackBar final : public tsl::elm::TrackBar {

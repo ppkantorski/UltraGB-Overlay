@@ -39,7 +39,6 @@
 
 #include <tesla.hpp>
 #include <string>
-#include <cmath>
 
 // draw_ultragb_title is defined in main.cpp (static, visible here because
 // this header is included after the definition).
