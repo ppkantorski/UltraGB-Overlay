@@ -217,6 +217,14 @@ sdmc:/
 
 ---
 
+## Contributing
+
+Contributions are welcome! If you have any ideas, suggestions, or bug reports, please raise an [issue](https://github.com/ppkantorski/UltraGB-Overlay/issues/new/choose), submit a [pull request](https://github.com/ppkantorski/UltraGB-Overlay/compare) or reach out to me directly on [GBATemp](https://gbatemp.net/threads/ultragb-overlay/).
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/X8X3VR194)
+
+---
+
 ## License
 
 UltraGB Overlay is released under the [GPLv2](LICENSE).
