@@ -1799,8 +1799,7 @@ public:
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
 
-        list->addItem(new tsl::elm::CategoryHeader(
-            "Save Data " + ult::DIVIDER_SYMBOL + " " + m_display_name));
+        list->addItem(new tsl::elm::CategoryHeader("Save Data " + ult::DIVIDER_SYMBOL + " " + m_display_name));
 
         const std::string romPath     = m_rom_path;
         const std::string displayName = m_display_name;
@@ -2792,157 +2791,244 @@ public:
 
 
 // =============================================================================
-// Windowed mode — GBWindowedElement / GBWindowedGui / WindowedOverlay.
+// Windowed mode — GBWindowedElement / GBWindowedGui.
 // Included here so it has access to all globals, helpers, and gb_load_rom/
 // gb_unload_rom defined above.  Must come before class Overlay below.
+// The commented-out WindowedOverlay class at the bottom of gb_windowed.hpp
+// is kept for reference only — it is never dispatched.
 // =============================================================================
 #include "gb_windowed.hpp"
 
 // =============================================================================
-// Overlay
+// Overlay — single unified overlay class for every launch path:
+//
+//   Game sessions  (m_game_session = true, resolved in initServices()):
+//     • Windowed mode       (-windowed, -quicklaunch with windowed=1)
+//     • Player overlay mode (-overlay relaunch)
+//     • Quick-launch mode   (-quicklaunch with windowed=0)
+//
+//   UI sessions (m_game_session = false):
+//     • Cold starts, -returning from windowed, windowed-quicklaunch tooLarge fallback
+//
+// One class → one vtable → one tsl::loop<Overlay> instantiation in main().
+// The large block of common initServices() code (directory creation, load_config,
+// write_default_config_if_missing, scroll restore) is compiled exactly once,
+// eliminating the ~320–400 byte duplication that existed when GameOverlay and
+// Overlay were separate classes with identical setup bodies.
 // =============================================================================
 class Overlay : public tsl::Overlay {
+    // Guard for onShow: resume audio only after a genuine onHide() call.
+    // Prevents gb_audio_resume() firing on first show when the audio thread was
+    // started (not paused) by gb_load_rom inside GBWindowedGui / GBOverlayGui.
+    bool m_audio_paused = false;
+
+    // True when this session will load and run a ROM.  Set in initServices()
+    // after load_config() populates g_windowed_mode and g_last_rom_path.
+    // Guards all game-specific teardown and audio handling in the other virtuals.
+    bool m_game_session = false;
+
 public:
-    virtual void initServices() override {
-        ult::COPY_BUFFER_SIZE = 1024; // minimize copy buffer
+    void initServices() override {
         tsl::overrideBackButton = true;
+        ult::COPY_BUFFER_SIZE   = 1024;
+
+        // ── Common init (every session type) ─────────────────────────────────
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_BASE_DIR);
         //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
         ult::createDirectory(STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
-        load_config();
+
+        load_config();                   // populates g_windowed_mode, g_last_rom_path, …
         write_default_config_if_missing();
         ult::createDirectory(g_rom_dir);
         ult::createDirectory(g_save_dir);
 
-        // Register "-quicklaunch" mode in overlays.ini so Ultrahand can
-        // display and assign a combo to it.  Also refreshes g_quick_combo.
-        register_quick_launch_mode();
+        // ── Determine session type ────────────────────────────────────────────
+        // g_win_scale_locked is set by setup_windowed_framebuffer() in main()
+        // BEFORE tsl::loop() starts — it is the reliable indicator that this
+        // launch is actually a windowed session.  g_windowed_mode is only a
+        // config preference (windowed=1/0 in config.ini) and must NOT be used
+        // here: a user with windowed=1 stored would cause every cold start and
+        // -returning launch to be misidentified as a windowed game session,
+        // setting tsl::disableHiding and routing to GBWindowedGui incorrectly.
+        m_game_session = g_win_scale_locked                      ||
+                         g_overlay_mode                          ||
+                        (g_quick_launch && g_last_rom_path[0]   &&
+                         !g_quicklaunch_windowed_toobig);
 
-        // In overlay overlay mode (quick-launch or -overlay relaunch) the Ultrahand
-        // launch combo must close the overlay (not hide it).  Hiding is disabled
-        // here so the combo falls through to our handleInput close() path —
-        // exactly as WindowedOverlay does in its initServices().
-        if (g_quick_launch || g_overlay_mode)
-            tsl::disableHiding = true;
+        if (m_game_session)
+            tsl::disableHiding = true;   // launch combo must close, not hide
 
-        // -overlay relaunch: read the ROM path that launch_overlay_mode() wrote
-        // to config.ini so loadInitialGui() can boot directly into GBOverlayGui.
-        // The key is erased immediately after reading so a cold launch or crash
-        // never accidentally re-plays a stale overlay_rom on the next startup.
-        if (g_overlay_mode) {
-            const std::string pr = ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeyPlayerRom);
-            if (!pr.empty() && pr.size() < sizeof(g_overlay_rom_path) - 1) {
-                strncpy(g_overlay_rom_path, pr.c_str(), sizeof(g_overlay_rom_path) - 1);
-                g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
+        // ── Mode-specific init ────────────────────────────────────────────────
+        if (g_win_scale_locked) {
+            // Windowed session — setup_windowed_framebuffer() set this flag in
+            // main() before tsl::loop().  Read quick-exit flag and ROM path.
+            {
+                const std::string qe = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeyWinQuickExit);
+                g_win_quick_exit = (qe == "1");
+                if (g_win_quick_exit)
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
             }
-            if (!pr.empty())
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
+            {
+                const std::string wrom = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeyWindowedRom);
+                if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
+                    strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
+                    g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
+                }
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
+            }
+        } else {
+            // All non-windowed sessions (game or UI):
+
+            if (g_overlay_mode) {
+                // Player overlay: read the ROM path written by launch_overlay_mode().
+                // Erase immediately so it never persists across unrelated launches.
+                const std::string pr = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeyPlayerRom);
+                if (!pr.empty() && pr.size() < sizeof(g_overlay_rom_path) - 1) {
+                    strncpy(g_overlay_rom_path, pr.c_str(), sizeof(g_overlay_rom_path) - 1);
+                    g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
+                }
+                if (!pr.empty())
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
+            }
+
+            if (!m_game_session) {
+                // UI-only session: register quick-launch mode in overlays.ini so
+                // Ultrahand can display and assign a combo to it.  Also refreshes g_quick_combo.
+                register_quick_launch_mode();
+            }
+
+            // Restore settings-page scroll position.
+            //
+            // Shared by overlay game sessions (-overlay, -quicklaunch) and UI
+            // sessions (-returning, tooLarge fallback).  The multi-hop chain:
+            //
+            //   SettingsGui → RomSelectorGui
+            //     → launch writes INI key
+            //       → game session reads + erases key → g_settings_scroll
+            //         → game plays → combo return writes key again → -returning
+            //           → UI session restores → SettingsGui reopens at correct item
+            //
+            // Always erased immediately so an abnormal exit can't leak stale data.
+            {
+                const std::string ss = ult::parseValueFromIniSection(
+                    kConfigFile, kConfigSection, kKeySettingsScroll);
+                if (!ss.empty() && ss.size() < sizeof(g_settings_scroll) - 1)
+                    set_settings_scroll(ss.c_str());
+                g_returning_from_windowed = false;   // consumed; clear for safety
+                if (!ss.empty())
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+            }
         }
+    }
 
-        // Restore the settings-page scroll position from the transient INI key
-        // written by launch_overlay_mode(), launch_windowed_mode(), and the
-        // combo-return paths in GBOverlayGui / GBWindowedGui before each
-        // setNextOverlay / close() call.
-        //
-        // The key must be restored on EVERY launch type (-overlay, -quicklaunch,
-        // -returning, cold open), not just -returning.  The multi-hop chain:
-        //
-        //   SettingsGui (scroll to "LCD Grid") → navigate left → RomSelectorGui
-        //     → click game → launch_overlay_mode() writes INI key
-        //       → -overlay process: initServices() loads key → g_settings_scroll
-        //         → game plays → combo return writes key again → -returning
-        //           → initServices() restores → SettingsGui lands at "LCD Grid"
-        //
-        // Without the unconditional load, the -overlay process reads and erases
-        // the key but leaves g_settings_scroll empty, so the value is gone by the
-        // time the user presses the combo to return.
-        //
-        // The key is always erased immediately after reading so an abnormal exit
-        // can never leave a stale value that leaks into a subsequent cold launch.
-        {
-            const std::string ss = ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeySettingsScroll);
-            if (!ss.empty() && ss.size() < sizeof(g_settings_scroll) - 1)
-                set_settings_scroll(ss.c_str());
-            g_returning_from_windowed = false;  // consumed; clear for safety
-            if (!ss.empty())
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+    void exitServices() override {
+        tsl::disableHiding = false;
+
+        if (m_game_session) {
+            if (g_win_scale_locked) {
+                // ── Windowed teardown ─────────────────────────────────────────
+                tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
+                ult::layerEdge  = 0;                 // restore for normal overlay hit-tests
+                tsl::layerEdgeY = 0;
+                // Shut down the blit thread pool before freeing the framebuffer.
+                // Workers must not be running when gb_unload_rom frees g_gb_fb.
+                // shutdown() joins all workers so the blit is complete before we continue.
+                if (s_win_pool_active) {
+                    s_win_pool.shutdown();
+                    s_win_pool_active = false;
+                }
+            } else {
+                // ── Overlay teardown ──────────────────────────────────────────
+                // Persist scroll — catches Tesla mode-combo relaunch mid-game.
+                if (g_settings_scroll[0])
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                                         g_settings_scroll, "");
+                gb_audio_pause();
+            }
+            // Common game teardown — runs for both windowed and overlay sessions.
+            gb_unload_rom();      // saves state, writes SRAM, frees ROM buffer
+            gb_audio_free_dma();  // releases DMA buffers held across sessions
+            free_lcd_ghosting();  // releases ghosting heap held across sessions
+        } else {
+            // ── UI session teardown ───────────────────────────────────────────
+            // Persist scroll — catches Tesla mode-combo close while browsing settings.
+            if (g_settings_scroll[0])
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                                     g_settings_scroll, "");
         }
-
-        // Migrate legacy .sav files from saves/ root → saves/internal/
-        // Runs once after the first update; files that already exist in the
-        // destination are skipped automatically by moveFilesOrDirectoriesByPattern.
-        //ult::moveFilesOrDirectoriesByPattern(std::string(SAVE_BASE_DIR) + "*.sav",
-        //                                     INTERNAL_SAVE_BASE_DIR);
     }
 
-    virtual void exitServices() override {
-        // Persist the settings-page scroll position before the process exits.
-        //
-        // This catches every exit path that doesn't go through our explicit
-        // combo-return handlers — most importantly the Tesla mode-combo relaunch:
-        // when the user presses the quick-launch combo while browsing SettingsGui
-        // or RomSelectorGui, Tesla closes the overlay and relaunches it with
-        // -quicklaunch without ever touching our handleInput close paths.
-        // SettingsGui::update() keeps g_settings_scroll current with the focused
-        // item, so by the time exitServices() runs the value is always correct.
-        //
-        // The B-exit paths in SettingsGui and RomSelectorGui already clear
-        // g_settings_scroll[0] = '\0' before calling close(), so this write is a
-        // guaranteed no-op on a genuine user exit — the position resets to the
-        // top on next open exactly as intended.
-        if (g_settings_scroll[0])
-            ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
-                                 g_settings_scroll, "");
-
-        tsl::disableHiding = false;  // restore default; was set true in overlay overlay mode
+    // Pause the emulator when the overlay is hidden.
+    void onHide() override {
+        if (!m_game_session) return;
+        if (g_win_scale_locked)
+            tsl::hlp::requestForeground(true);  // reclaim HID during pass-through
+        g_gb.running   = false;
+        g_emu_active   = false;
         gb_audio_pause();
-        gb_unload_rom();   // save state, write SRAM, shut down audio, free ROM buffer
-        gb_audio_free_dma();  // release DMA buffers held across sessions (see gb_audio.h)
-        free_lcd_ghosting();  // release ghosting heap held across sessions
+        m_audio_paused = true;
     }
 
-    // Pause when overlay is hidden with the system combo.
-    // gb_audio_pause() signals the audio thread to submit silence and clear
-    // its GBAPU state — prevents the last sound from looping while hidden.
-    virtual void onHide() override {
-        g_gb.running = false;
-        g_emu_active = false;
-        gb_audio_pause();
-    }
-
-    // Resume when overlay is shown again.
-    // gb_audio_resume() re-enables sample generation.  The GBAPU repopulates
-    // from gb_run_frame() register events within one frame (~16.7 ms).
-    virtual void onShow() override {
-        if (g_gb.rom) {
-            g_gb_frame_next_ns = 0;
-            g_gb.running = true;
-            g_emu_active = true;
+    // Resume the emulator when the overlay is shown again.
+    void onShow() override {
+        if (!m_game_session || !g_gb.rom) return;
+        g_gb_frame_next_ns = 0;
+        g_gb.running  = true;
+        g_emu_active  = true;
+        if (m_audio_paused) {
             gb_audio_resume();
+            m_audio_paused = false;
         }
     }
 
-    virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
-        // ── -overlay relaunch: boot directly into GBOverlayGui ───────────────
-        // launch_overlay_mode() wrote the ROM path to config.ini; initServices()
-        // already read it into g_overlay_rom_path and cleared the config key.
-        // Mirrors the normal quick-launch path but always goes through -overlay
-        // (never -quicklaunch) for non-direct entries, so X can return to the
-        // ROM selector via -returning.
+    std::unique_ptr<tsl::Gui> loadInitialGui() override {
+        // ── Windowed quick-launch tooLarge fallback (UI session) ─────────────────
+        // main() set this flag when the pre-tsl::loop() ROM size check rejected
+        // the windowed quick-launch.  Re-check post-loop for a tier-aware message;
+        // if the pre-loop check was overly conservative, attempt recovery relaunch.
+        if (g_quicklaunch_windowed_toobig) {
+            g_quicklaunch_windowed_toobig = false;
+            char romPathBuf[PATH_BUFFER_SIZE];
+            snprintf(romPathBuf, sizeof(romPathBuf), "%s%s", g_rom_dir, g_last_rom_path);
+            if (const char* msg = rom_playability_message(romPathBuf)) {
+                show_notify(msg);
+            } else if (g_self_path[0]) {
+                // Pre-loop check was overly conservative — attempt recovery.
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, romPathBuf, "");
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+                tsl::setNextOverlay(g_self_path, "-windowed");
+                tsl::Overlay::get()->close();
+            }
+            return initially<RomSelectorGui>();
+        }
+
+        // ── Windowed session ─────────────────────────────────────────────────────
+        if (g_win_scale_locked) {
+            if (g_win_rom_path[0]) {
+                strncpy(g_pending_rom_path, g_win_rom_path, sizeof(g_pending_rom_path) - 1);
+                g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+            }
+            return initially<GBWindowedGui>();
+        }
+
+        // ── Player overlay relaunch ──────────────────────────────────────────────
         if (g_overlay_mode && g_overlay_rom_path[0]) {
-            // Guard: bail out cleanly if the ROM cannot be loaded on this tier.
             if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
                 show_notify(msg);
                 g_overlay_mode = false;
+                if (g_self_path[0]) {
+                    tsl::setNextOverlay(g_self_path);
+                    tsl::Overlay::get()->close();
+                }
                 return initially<RomSelectorGui>();
             }
-            // loadWallpaperFileWhenSafe() is normally called by UltraGBOverlayFrame's
-            // constructor; since we bypass that frame here, trigger it explicitly.
+            // UltraGBOverlayFrame bypassed — trigger wallpaper load manually.
             if (ult::expandedMemory)
                 ult::loadWallpaperFileWhenSafe();
             strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
@@ -2951,51 +3037,32 @@ public:
             return initially<GBOverlayGui>();
         }
 
+        // ── Quick-launch (non-windowed) ──────────────────────────────────────────
         if (g_quick_launch && g_last_rom_path[0]) {
-            // Build full path from dir + basename persisted by save_last_rom().
-            // snprintf directly into a stack buffer — no heap std::string needed.
             char romPathBuf[PATH_BUFFER_SIZE];
             snprintf(romPathBuf, sizeof(romPathBuf), "%s%s", g_rom_dir, g_last_rom_path);
-            const char* romPath = romPathBuf;
-
-            if (g_windowed_mode) {
-                // ── Windowed quick-launch fallback ────────────────────────────
-                // The fast path in main() normally launches WindowedOverlay
-                // directly.  This branch fires only if that path was skipped
-                // (e.g. g_self_path not yet valid, edge-case startup order).
-                // Guard: if the ROM is too large for the current heap tier,
-                // open the selector with an error instead of triggering the
-                // janky windowed-launch-fail -> restart cycle.
-                if (const char* msg = rom_playability_message(romPath)) {
-                    show_notify(msg);
-                    return initially<RomSelectorGui>();
-                }
-                // Write config keys and setNextOverlay; placeholder Gui is never
-                // rendered because close() fires immediately after.
+            if (const char* msg = rom_playability_message(romPathBuf)) {
+                show_notify(msg);
                 if (g_self_path[0]) {
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, romPath, "");
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
-                    tsl::setNextOverlay(g_self_path, "-windowed");
+                    tsl::setNextOverlay(g_self_path);
                     tsl::Overlay::get()->close();
                 }
                 return initially<RomSelectorGui>();
             }
-
-            // ── Normal quick-launch ───────────────────────────────────────────
-            // Skip the ROM selector and boot directly into the emulator.
-            // UltraGBOverlayFrame normally calls loadWallpaperFileWhenSafe() in
-            // its constructor; since we bypass that frame, trigger it here so the
-            // wallpaper is available when GBOverlayElement draws its first frame.
+            // UltraGBOverlayFrame bypassed — trigger wallpaper load manually.
             ult::loadWallpaperFileWhenSafe();
-
-            strncpy(g_pending_rom_path, romPath, sizeof(g_pending_rom_path) - 1);
+            strncpy(g_pending_rom_path, romPathBuf, sizeof(g_pending_rom_path) - 1);
             g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
             return initially<GBOverlayGui>();
         }
 
+        // ── Default — cold start, -returning, unexpected edge cases ──────────────
         return initially<RomSelectorGui>();
     }
 };
+
+
+
 
 // Clamp g_win_scale to the maximum the current heap tier can support.
 // romPath is used only for the earlyExpanded (8 MB) 6× check; pass nullptr
@@ -3041,10 +3108,26 @@ static void setup_windowed_framebuffer() {
     ult::windowedLayerPixelPerfect = g_win_1080 && poll_console_docked();
 }
 
+// =============================================================================
+// Session type — resolved once in main() from argv + config.  Each enumerator
+// corresponds to a distinct Overlay::initServices() / loadInitialGui() path.
+//
+// To add a new game mode:
+//   1. Add an enumerator below.
+//   2. Add its argv token to the Phase 1 parse loop.
+//   3. Handle it in the Phase 2 resolution block.
+//   4. Add matching branches in Overlay::initServices() / loadInitialGui().
+// =============================================================================
+enum class SessionType {
+    Menu,           // cold start, -returning, quicklaunch-windowed tooLarge fallback
+    Windowed,       // -windowed, or -quicklaunch with windowed=1 and ROM fits
+    OverlayPlayer,  // -overlay  (ROM path written to config by launch_overlay_mode)
+    QuickLaunch,    // -quicklaunch with windowed=0
+};
+
 int main(int argc, char* argv[]) {
     if (argc > 0)
-        snprintf(g_self_path, sizeof(g_self_path),
-                 "sdmc:/switch/.overlays/%s", argv[0]);
+        snprintf(g_self_path, sizeof(g_self_path), "sdmc:/switch/.overlays/%s", argv[0]);
 
     //ult::logFilePath    = "sdmc:/config/ultragb/log.txt";
     //ult::disableLogging = false;
@@ -3055,13 +3138,11 @@ int main(int argc, char* argv[]) {
     const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
     const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
 
-    // ── Phase 1: parse argv into mode flags ───────────────────────────────────
-    // Launch-type args are mutually exclusive; else-if makes that explicit and
-    // ensures exactly one branch fires per token.  The loop only sets flags —
-    // all dispatch logic lives in Phase 2 below.
+    // ── Phase 1: parse argv into raw intent flags ─────────────────────────────
+    // Flags only — no branching.  Session resolution happens in Phase 2.
+    bool wantWindowed      = false;
     bool wantOverlayPlayer = false;
     bool wantQuickLaunch   = false;
-    bool wantWindowed      = false;
 
     for (int i = 1; i < argc; ++i) {
         if      (strcmp(argv[i], "-returning")   == 0) { g_returning_from_windowed = true; skipRumbleDoubleClick = false; }
@@ -3071,31 +3152,27 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-windowed")    == 0) { wantWindowed   = true; }
     }
 
-    // ── Phase 2: dispatch to the appropriate overlay loop ─────────────────────
+    // ── Phase 2: resolve session type ────────────────────────────────────────
+    //
+    // Reads config only when needed.  Sets globals (g_win_scale_locked,
+    // g_quicklaunch_windowed_toobig) that Overlay::initServices() consumes.
+    //
+    // NOTE: rom_playability_message() is unavailable here — Tesla's memory-tier
+    // atomics only initialise inside tsl::loop().  Use getCurrentHeapSize() /
+    // get_rom_size() directly for pre-loop ROM size checks.
+    SessionType session = SessionType::Menu;
 
-    // ── Quick-launch: windowed or player overlay fast path (-quicklaunch) ─────
-    // When a last-played ROM exists, dispatch directly into the appropriate mode.
-    //
-    //  • Windowed on  → WindowedOverlay  (avoids the RomSelector flash + restart delay)
-    //  • Windowed off → Overlay          (loadInitialGui boots GBOverlayGui directly
-    //                                     via g_quick_launch + g_last_rom_path)
-    //
-    // NOTE: rom_playability_message() cannot be used for the tooLarge check here —
-    // Tesla's memory-tier atomics are only initialised inside tsl::loop().
-    // getCurrentHeapSize() is used directly instead.
     if (wantQuickLaunch) {
         const std::string lastRom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyLastRom);
         const bool        windowed = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowed) == "1";
 
         if (!lastRom.empty()) {
-            std::string romDir = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyRomDir);
-            if (romDir.empty()) romDir = "sdmc:/roms/gb/";
-            if (romDir.back() != '/') romDir += '/';
-            const std::string fullPath = romDir + lastRom;
-
             if (windowed) {
-                // Windowed fast path — bail to normal overlay launch if the ROM
-                // is too large so the selector opens cleanly with an error notify.
+                std::string romDir = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyRomDir);
+                if (romDir.empty()) romDir = "sdmc:/roms/gb/";
+                if (romDir.back() != '/') romDir += '/';
+                const std::string fullPath = romDir + lastRom;
+
                 const size_t rsz      = get_rom_size(fullPath.c_str());
                 const bool   tooLarge = rsz > 0 &&
                     ((earlyLimited       && rsz >= kROM_2MB) ||
@@ -3103,58 +3180,49 @@ int main(int argc, char* argv[]) {
                      (earlyExpanded      && rsz >= kROM_6MB));
 
                 if (!tooLarge) {
-                    {
-                        const std::string out_val = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput);
-                        g_win_1080 = (out_val == "1080");
-                    }
-                    g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
-                    clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded, fullPath.c_str());
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, fullPath);
+                    // Write transient keys consumed by initServices().
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom,  fullPath);
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1");
-                    setup_windowed_framebuffer();
-                    return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+                    session = SessionType::Windowed;
+                } else {
+                    // ROM too large — open menu with a post-loop error notify.
+                    g_quicklaunch_windowed_toobig = true;
+                    session = SessionType::Menu;
                 }
             } else {
-                // Player overlay fast path — Overlay::loadInitialGui() picks up
-                // g_quick_launch + g_last_rom_path and boots GBOverlayGui directly.
-                return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
+                session = SessionType::QuickLaunch;
             }
         }
+        // lastRom empty → stays SessionType::Menu.
+
+    } else if (wantWindowed) {
+        // Explicit relaunch — ROM path already in config under "windowed_rom".
+        session = SessionType::Windowed;
+
+    } else if (wantOverlayPlayer) {
+        // ROM path already in config under "overlay_rom" (set by launch_overlay_mode).
+        session = SessionType::OverlayPlayer;
     }
 
-    // ── Explicit windowed relaunch (-windowed) ────────────────────────────────
-    // The ROM path is already in config.ini under "windowed_rom" (written by the
-    // caller before setNextOverlay).  win_output and win_scale must be read and
-    // clamped before tsl::loop() — load_config() only runs later in initServices().
-    if (wantWindowed) {
-        {
-            const std::string out_val = ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeyWinOutput);
-            g_win_1080 = (out_val == "1080");
-        }
-        {
-            g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeyWinScale));
-            const std::string wrom = ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeyWindowedRom);
-            clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
-                            wrom.empty() ? nullptr : wrom.c_str());
-        }
-        setup_windowed_framebuffer();
-        return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+    // ── Phase 3: session-specific pre-loop setup, then single dispatch ────────
+    //
+    // Windowed sessions must size the VI layer before tsl::loop() because
+    // load_config() only runs later inside initServices().
+    // All other sessions need no pre-loop work beyond what Phase 2 already did.
+    if (session == SessionType::Windowed) {
+        g_win_1080  = (ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput) == "1080");
+        g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
+        const std::string wrom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowedRom);
+        clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
+                        wrom.empty() ? nullptr : wrom.c_str());
+        setup_windowed_framebuffer();   // sets g_win_scale_locked = true
+
+    } else if (session == SessionType::Menu) {
+        returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";
     }
 
-    // ── Player overlay launch (-overlay) ──────────────────────────────────────
-    // launch_overlay_mode() wrote the ROM path to config.ini under "player_rom"
-    // before calling setNextOverlay with "-overlay".  initServices() reads it
-    // into g_overlay_rom_path; loadInitialGui() boots GBOverlayGui directly.
-    if (wantOverlayPlayer) {
-        return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
-    }
-
-    // ── Normal overlay launch ─────────────────────────────────────────────────
-    // Cold starts, -returning (from windowed), and -quicklaunch (windowed) with
-    // a too-large ROM all land here.
-    returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";
+    // One tsl::loop<Overlay> instantiation handles every session type.
+    // Overlay::initServices() reads g_win_scale_locked / g_overlay_mode /
+    // g_quick_launch to set m_game_session and route accordingly.
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }

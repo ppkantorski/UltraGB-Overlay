@@ -144,6 +144,11 @@ static char g_overlay_rom_path[PATH_BUFFER_SIZE] = {};
 // Set true when a windowed quick-launch is triggered from loadInitialGui().
 static bool g_win_quick_exit = false;
 
+// Set true by main() when a -quicklaunch windowed ROM was too large for the
+// pre-tsl::loop() heap-size check.  Overlay::loadInitialGui() clears it and
+// shows an error notify (or attempts recovery) before opening the ROM selector.
+static bool g_quicklaunch_windowed_toobig = false;
+
 // Window position in VI-space (1920×1080).
 // WIN_VI_W = 1920*160/1280 = 240, WIN_VI_H = 1080*144/720 = 216.
 // Default: centred on the display.

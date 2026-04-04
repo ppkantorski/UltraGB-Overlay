@@ -887,14 +887,20 @@ public:
 
             launchComboHasTriggered.store(true, std::memory_order_release);
 
-            // Genuine exit from player mode via the main combo.
-            // ALWAYS reset the settings scroll — unconditional, before the
-            // g_win_quick_exit / g_self_path branch.
-            // Clears g_settings_scroll[0] so exitServices() also writes nothing.
-            // Erases the INI key so any stale value from a prior session can't
-            // survive into the next -returning or cold launch.
-            g_settings_scroll[0] = '\0';
-            ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+            // Reset the settings scroll only for genuine exits — quick-exit mode
+            // (g_win_quick_exit, triggered by the Quick Combo fast path) and
+            // direct mode — where pressing the combo means "leave entirely".
+            //
+            // In normal windowed mode (g_win_quick_exit=false, g_directMode=false)
+            // this combo returns to the ROM selector via -returning, exactly as
+            // X/back does in overlay mode.  The scroll position must survive so
+            // SettingsGui lands at the right item on the next RIGHT-press.
+            // exitServices() will write the intact g_settings_scroll to INI, and
+            // the -returning process's initServices() will restore it.
+            if (g_win_quick_exit || g_directMode) {
+                g_settings_scroll[0] = '\0';
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+            }
 
             if (!g_win_quick_exit && g_self_path[0]) {
                 const std::string returnArg = g_directMode ? "-returning --direct" : "-returning";
@@ -1235,100 +1241,100 @@ public:
 // =============================================================================
 // WindowedOverlay
 // =============================================================================
-class WindowedOverlay : public tsl::Overlay {
-    // Guard for onShow/onHide: only resume audio when we actually paused it.
-    // On the very first show, gb_audio_init() inside gb_load_rom has already
-    // started the audio thread — calling gb_audio_resume() on a never-paused
-    // system causes glitches.  We only resume after a genuine onHide() call.
-    bool m_audio_paused = false;
-
-public:
-    void initServices() override {
-        tsl::overrideBackButton = true;
-        ult::COPY_BUFFER_SIZE   = 1024;
-
-        // Prevent Tesla from hiding the overlay when the user touches outside
-        // the framebuffer region.  disableHiding suppresses it.
-        // All hiding is done explicitly via the launch combo.
-        tsl::disableHiding = true;
-
-        ult::createDirectory(CONFIG_DIR);
-        ult::createDirectory(SAVE_BASE_DIR);
-        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
-        ult::createDirectory(STATE_BASE_DIR);
-        ult::createDirectory(STATE_DIR);
-        ult::createDirectory(CONFIGURE_DIR);
-
-        load_config();
-        write_default_config_if_missing();
-        ult::createDirectory(g_rom_dir);
-        ult::createDirectory(g_save_dir);
-
-        // Read windowed quick-exit flag.  Set when the user triggered Quick Launch
-        // in windowed mode — the exit combo should close entirely, not return to
-        // the UltraGB menu.  Clear it immediately so it never persists across
-        // unrelated windowed launches.
-        {
-            const std::string qe = ult::parseValueFromIniSection(
-                kConfigFile, kConfigSection, kKeyWinQuickExit);
-            g_win_quick_exit = (qe == "1");
-            if (g_win_quick_exit)
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
-        }
-
-        // Read the ROM path from config.ini.
-        const std::string wrom = ult::parseValueFromIniSection(
-            kConfigFile, kConfigSection, kKeyWindowedRom);
-        if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
-            strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
-            g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
-        }
-        // Erase immediately so the key never persists across unrelated launches.
-        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
-    }
-
-    void exitServices() override {
-        tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
-        tsl::disableHiding = false;  // restore default for any subsequent overlay
-        ult::layerEdge  = 0;       // restore for normal overlay hit-tests
-        tsl::layerEdgeY = 0;
-        // Shut down the blit thread pool first — workers must not be running
-        // when gb_unload_rom frees g_gb_fb and nulls g_gb.rom.  shutdown()
-        // joins all workers so the blit is guaranteed complete before we continue.
-        if (s_win_pool_active) {
-            s_win_pool.shutdown();
-            s_win_pool_active = false;
-        }
-        gb_unload_rom();             // saves quick-resume state + SRAM
-        gb_audio_free_dma();
-        free_lcd_ghosting();
-    }
-
-    void onHide() override {
-        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
-        g_gb.running   = false;
-        g_emu_active   = false;
-        gb_audio_pause();
-        m_audio_paused = true;
-    }
-
-    void onShow() override {
-        if (g_gb.rom) {
-            g_gb_frame_next_ns = 0;
-            g_gb.running  = true;
-            g_emu_active  = true;
-            if (m_audio_paused) {
-                gb_audio_resume();
-                m_audio_paused = false;
-            }
-        }
-    }
-
-    std::unique_ptr<tsl::Gui> loadInitialGui() override {
-        if (g_win_rom_path[0]) {
-            strncpy(g_pending_rom_path, g_win_rom_path, sizeof(g_pending_rom_path) - 1);
-            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-        }
-        return initially<GBWindowedGui>();
-    }
-};
+//class WindowedOverlay : public tsl::Overlay {
+//    // Guard for onShow/onHide: only resume audio when we actually paused it.
+//    // On the very first show, gb_audio_init() inside gb_load_rom has already
+//    // started the audio thread — calling gb_audio_resume() on a never-paused
+//    // system causes glitches.  We only resume after a genuine onHide() call.
+//    bool m_audio_paused = false;
+//
+//public:
+//    void initServices() override {
+//        tsl::overrideBackButton = true;
+//        ult::COPY_BUFFER_SIZE   = 1024;
+//
+//        // Prevent Tesla from hiding the overlay when the user touches outside
+//        // the framebuffer region.  disableHiding suppresses it.
+//        // All hiding is done explicitly via the launch combo.
+//        tsl::disableHiding = true;
+//
+//        ult::createDirectory(CONFIG_DIR);
+//        ult::createDirectory(SAVE_BASE_DIR);
+//        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
+//        ult::createDirectory(STATE_BASE_DIR);
+//        ult::createDirectory(STATE_DIR);
+//        ult::createDirectory(CONFIGURE_DIR);
+//
+//        load_config();
+//        write_default_config_if_missing();
+//        ult::createDirectory(g_rom_dir);
+//        ult::createDirectory(g_save_dir);
+//
+//        // Read windowed quick-exit flag.  Set when the user triggered Quick Launch
+//        // in windowed mode — the exit combo should close entirely, not return to
+//        // the UltraGB menu.  Clear it immediately so it never persists across
+//        // unrelated windowed launches.
+//        {
+//            const std::string qe = ult::parseValueFromIniSection(
+//                kConfigFile, kConfigSection, kKeyWinQuickExit);
+//            g_win_quick_exit = (qe == "1");
+//            if (g_win_quick_exit)
+//                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
+//        }
+//
+//        // Read the ROM path from config.ini.
+//        const std::string wrom = ult::parseValueFromIniSection(
+//            kConfigFile, kConfigSection, kKeyWindowedRom);
+//        if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
+//            strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
+//            g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
+//        }
+//        // Erase immediately so the key never persists across unrelated launches.
+//        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
+//    }
+//
+//    void exitServices() override {
+//        tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
+//        tsl::disableHiding = false;  // restore default for any subsequent overlay
+//        ult::layerEdge  = 0;       // restore for normal overlay hit-tests
+//        tsl::layerEdgeY = 0;
+//        // Shut down the blit thread pool first — workers must not be running
+//        // when gb_unload_rom frees g_gb_fb and nulls g_gb.rom.  shutdown()
+//        // joins all workers so the blit is guaranteed complete before we continue.
+//        if (s_win_pool_active) {
+//            s_win_pool.shutdown();
+//            s_win_pool_active = false;
+//        }
+//        gb_unload_rom();             // saves quick-resume state + SRAM
+//        gb_audio_free_dma();
+//        free_lcd_ghosting();
+//    }
+//
+//    void onHide() override {
+//        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
+//        g_gb.running   = false;
+//        g_emu_active   = false;
+//        gb_audio_pause();
+//        m_audio_paused = true;
+//    }
+//
+//    void onShow() override {
+//        if (g_gb.rom) {
+//            g_gb_frame_next_ns = 0;
+//            g_gb.running  = true;
+//            g_emu_active  = true;
+//            if (m_audio_paused) {
+//                gb_audio_resume();
+//                m_audio_paused = false;
+//            }
+//        }
+//    }
+//
+//    std::unique_ptr<tsl::Gui> loadInitialGui() override {
+//        if (g_win_rom_path[0]) {
+//            strncpy(g_pending_rom_path, g_win_rom_path, sizeof(g_pending_rom_path) - 1);
+//            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+//        }
+//        return initially<GBWindowedGui>();
+//    }
+//};
