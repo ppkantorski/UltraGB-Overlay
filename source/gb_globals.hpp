@@ -76,7 +76,7 @@ static const std::string kKeyVolBackup     {"vol_backup"};
 static const std::string kKeyLcdGrid       {"lcd_grid"};
 static const std::string kKeyWindowed      {"windowed"};
 static const std::string kKeyIngameHaptics {"ingame_haptics"};
-static const std::string kKeyIngameWallpaper{"ingame_wallpaper"};
+static const std::string kKeyOverlayWallpaper{"overlay_wallpaper"};
 static const std::string kKeyWinPosX       {"win_pos_x"};
 static const std::string kKeyWinPosY       {"win_pos_y"};
 static const std::string kKeyWinScale      {"win_scale"};
@@ -85,6 +85,9 @@ static const std::string kKeyWindowedRom   {"windowed_rom"};
 static const std::string kKeyWinQuickExit  {"win_quick_exit"};
 static const std::string kKeySettingsScroll{"settings_scroll"};
 static const std::string kKeyPlayerRom     {"overlay_rom"};  // ROM path for -overlay relaunch
+static const std::string kKeyOvlFreeMode  {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
+static const std::string kKeyOvlFreePosX  {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
+static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // VI-space Y of the free overlay layer
 
 // =============================================================================
 // ROM size thresholds
@@ -121,13 +124,14 @@ static u8 g_vol_backup = 50;
 // rendering the Game Boy screen as a small draggable window with no UI chrome.
 static bool g_windowed_mode    = false;
 static bool g_ingame_haptics   = true;
-static bool g_ingame_wallpaper = false;  // off by default; only relevant when expandedMemory is true
+static bool g_overlay_wallpaper = false;  // off by default; only relevant when expandedMemory is true
 
 // Set true by main() when the overlay is relaunched with the -returning argument.
 // Read and cleared in Overlay::initServices() to restore the settings scroll position.
 static bool g_returning_from_windowed = false;
 
 static bool g_directMode = false;
+static bool g_comboReturn = false;
 
 // Full path to this .ovl — captured from argv[0] so WindowedOverlay can
 // pass it to setNextOverlay when the launch combo is pressed to return here.
@@ -149,6 +153,31 @@ static bool g_overlay_mode = false;
 
 // ROM path received via the -overlay argument.
 static char g_overlay_rom_path[PATH_BUFFER_SIZE] = {};
+
+// ── Free overlay mode ──────────────────────────────────────────────────────────
+// When true the overlay is relaunched with -freeoverlay <path>: the layer is
+// trimmed by OVL_FREE_TOP_TRIM rows (removing the title/widget region) and can
+// be repositioned freely by holding KEY_PLUS + left stick, exactly like windowed
+// mode.  The stored position is separate from the windowed mode position.
+//
+// OVL_FREE_TOP_TRIM = VP_Y - VP_X: strips enough rows so the gap above the GB
+// border inside the free layer equals the side gap (VP_X-1 = 23 px on each
+// side), giving equal wallpaper padding on all three exposed edges.
+//   VP_Y - VP_X = 108 - 24 = 84 rows stripped from the top.
+//   GB border top appears at framebuffer y = (VP_Y-1) - OVL_FREE_TOP_TRIM
+//                                          = 107 - 84 = 23 = VP_X - 1  ✓
+//
+// Layer VI size at 720p (1.5× scaling):  448*1.5 × 636*1.5 = 672 × 954
+//   VI max X = 1920 - 672 = 1248
+//   VI max Y = 1080 - 954 = 126
+// Default pos_y = 126 keeps the GB border at roughly the same screen position
+// as in the normal (full-screen) overlay.
+static constexpr int OVL_FREE_TOP_TRIM = VP_Y - VP_X;            // 84 rows
+static constexpr int OVL_FREE_FB_H     = FB_H - OVL_FREE_TOP_TRIM; // 636
+
+static bool g_overlay_free_mode = false;  // true when launched with -freeoverlay
+static int  g_ovl_free_pos_x    = 0;      // VI-space X; 0 = left edge
+static int  g_ovl_free_pos_y    = 126;    // VI-space Y; 126 = VI max_y → GB border aligned with normal overlay
 
 // Set true when a windowed quick-launch is triggered from loadInitialGui().
 static bool g_win_quick_exit = false;

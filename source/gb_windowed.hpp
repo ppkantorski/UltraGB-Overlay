@@ -771,10 +771,11 @@ public:
     tsl::elm::Element* createUI() override {
         audio_exit_if_enabled();
 
-        // Ensure screenshots work.
-        screenshotsAreDisabled.store(false, std::memory_order_release);
-        screenshotsAreForceDisabled.store(false, std::memory_order_release);
-        tsl::gfx::Renderer::get().addScreenshotStacks();
+        // Ensure screenshot do nots work.
+        //screenshotsAreDisabled.store(true, std::memory_order_release);
+        //screenshotsAreForceDisabled.store(true, std::memory_order_release);
+        //tsl::gfx::Renderer::get().removeScreenshotStacks();
+
 
         // Load the ROM.  g_pending_rom_path was set from windowed_rom in
         // WindowedOverlay::loadInitialGui().

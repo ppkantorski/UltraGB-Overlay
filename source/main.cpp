@@ -103,9 +103,9 @@ static void load_config() {
     if (!hap_val.empty())
         g_ingame_haptics = (hap_val != "0");
 
-    const std::string wall_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyIngameWallpaper);
+    const std::string wall_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOverlayWallpaper);
     if (!wall_val.empty())
-        g_ingame_wallpaper = (wall_val == "1");
+        g_overlay_wallpaper = (wall_val == "1");
 
     // win_pos_x / win_pos_y — persisted VI-space window position
     { int v = 0;
@@ -134,6 +134,37 @@ static void load_config() {
         if (!out_val.empty())
             g_win_1080 = (out_val == "1080");
     }
+
+    // ovl_free_mode — only update when the session type has not already been
+    // determined by main() before tsl::loop() started.
+    //
+    // main() sets g_overlay_free_mode (and g_overlay_mode) from argv BEFORE
+    // calling tsl::loop(), which then calls initServices() → load_config().
+    // If we unconditionally overwrite g_overlay_free_mode here we corrupt those
+    // already-resolved flags, causing wrong routing in loadInitialGui():
+    //
+    //   • Windowed session  (g_win_scale_locked=true,  g_overlay_free_mode=false):
+    //     If ovl_free_mode=1 is stored in config, load_config would flip
+    //     g_overlay_free_mode to true, bypassing the windowed init block in
+    //     initServices() and sending loadInitialGui() down the free-overlay path
+    //     instead of GBWindowedGui — wrong framebuffer, wrong rendering.
+    //
+    //   • Fixed overlay session (g_overlay_mode=true, g_overlay_free_mode=false):
+    //     Same corruption — loadInitialGui() would route to the free-overlay
+    //     branch even though the layer was sized for a full-screen overlay.
+    //
+    // The guard mirrors the existing g_win_scale_locked guard on win_scale above.
+    // Sessions that need this value freshly loaded (UI / menu) always have both
+    // flags false at load_config() time.
+    if (!g_win_scale_locked && !g_overlay_mode) {
+        const std::string v = ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreeMode);
+        if (!v.empty()) g_overlay_free_mode = (v == "1");
+    }
+
+    // ovl_free_pos_x / ovl_free_pos_y — free-overlay layer position in VI space
+    { int v = 0;
+      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreePosX), v)) g_ovl_free_pos_x = v;
+      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreePosY), v)) g_ovl_free_pos_y = v; }
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -158,6 +189,9 @@ static void write_default_config_if_missing() {
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
     set_if_missing("win_output",    "720");
+    set_if_missing("ovl_free_mode", "0");
+    set_if_missing("ovl_free_pos_x","0");
+    set_if_missing("ovl_free_pos_y","126");
 }
 
 // The following functions were moved to gb_utils.hpp:
@@ -649,7 +683,7 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
         cx += renderer->drawString(ult::SPLIT_PROJECT_NAME_1, false, cx, y, fontSize, tsl::logoColor1).first;
     }
     cx += renderer->drawString("GB",  false, cx, y, fontSize, tsl::logoColor2).first;
-    if (quickModeSymbol && g_directMode) {
+    if (quickModeSymbol && g_directMode && g_comboReturn) {
         static const auto directModeColor = tsl::RGB888("6ea0f0");
         cx += renderer->drawString("\uE08E",  false, cx+5, y-2, fontSize-8, directModeColor).first;
     }
@@ -1115,8 +1149,8 @@ public:
         });
         list->addItem(resetItem);
 
-        // ── Display ───────────────────────────────────────────────────────────
-        list->addItem(new tsl::elm::CategoryHeader("Display"));
+        // ── Core Presets ───────────────────────────────────────────────────
+        list->addItem(new tsl::elm::CategoryHeader("Core Presets"));
 
 
         // isCgbOnly is no longer needed — all CGB games (0x80 and 0xC0) support
@@ -1459,6 +1493,38 @@ public:
             list->addItem(out_item);
         }
 
+        // ── Overlay Position ──────────────────────────────────────────────────
+        // "Fixed" (default) — full overlay with title/widget chrome at the top,
+        //   identical to the current behaviour.
+        // "Free"  — the top OVL_FREE_TOP_TRIM rows (title/widget region) are
+        //   stripped from the layer.  The layer can be repositioned by holding
+        //   KEY_PLUS for 1 s then moving the left stick, exactly like windowed
+        //   mode.  Position is stored independently from the windowed position.
+        {
+            auto* pos_item = new tsl::elm::ListItem(
+                "Overlay Position",
+                g_overlay_free_mode ? "Free" : "Fixed");
+            pos_item->setClickListener([pos_item](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                g_overlay_free_mode = !g_overlay_free_mode;
+                pos_item->setValue(g_overlay_free_mode ? "Free" : "Fixed");
+                save_ovl_free_mode();
+                return true;
+            });
+            list->addItem(pos_item);
+        }
+
+        if (ult::expandedMemory) {
+            auto* wallpaper_item = new tsl::elm::ToggleListItem(
+                "Overlay Wallpaper", g_overlay_wallpaper, ult::ON, ult::OFF);
+            wallpaper_item->setStateChangedListener([](bool state) {
+                g_overlay_wallpaper = state;
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOverlayWallpaper,
+                                     state ? "1" : "0", "");
+            });
+            list->addItem(wallpaper_item);
+        }
+
         // ── LCD Grid ──────────────────────────────────────────────────────────
         // Simulates the dark inter-pixel gap of a real Game Boy Color LCD by
         // dimming the last row and column of each scaled source-pixel block to
@@ -1478,7 +1544,6 @@ public:
             });
             list->addItem(grid_item);
         }
-
         
         // ── Misc ────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
@@ -1518,17 +1583,6 @@ public:
                                  state ? "1" : "0", "");
         });
         list->addItem(haptics_item);
-
-        if (ult::expandedMemory) {
-            auto* wallpaper_item = new tsl::elm::ToggleListItem(
-                "In-Game Wallpaper", g_ingame_wallpaper, ult::ON, ult::OFF);
-            wallpaper_item->setStateChangedListener([](bool state) {
-                g_ingame_wallpaper = state;
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyIngameWallpaper,
-                                     state ? "1" : "0", "");
-            });
-            list->addItem(wallpaper_item);
-        }
 
         // Restore the previously focused item (empty on first visit or after a game launch).
         if (!m_settings_scroll.empty())
@@ -1588,6 +1642,38 @@ public:
         // cold open of Settings starts at the top rather than mid-list.
         if (keysDown & KEY_B) {
             g_settings_scroll[0] = '\0';
+            if (g_directMode && g_comboReturn) {
+                //directMode = false;
+                ult::launchingOverlay.store(true, std::memory_order_release);
+                ult::setIniFileValue(
+                    ult::ULTRAHAND_CONFIG_INI_PATH,
+                    ult::ULTRAHAND_PROJECT_NAME,
+                    ult::IN_OVERLAY_STR,
+                    ult::TRUE_STR
+                );
+                disableSound.store(true, std::memory_order_release);
+                skipRumbleDoubleClick = true;
+            
+                // setNextOverlay always puts getNameFromPath(returnOverlayPath) = "ovlmenu.ovl"
+                // as argv[0], so Ultrahand always sees lastOverlayFilename = "ovlmenu.ovl",
+                // which never matches any overlay in the list — scroll restore silently fails.
+                //
+                // The ovlloader, by contrast, passes argv[0] = "ultragb.ovl" when an overlay
+                // exits naturally, which is why the no-setNextOverlay path scrolls correctly.
+                //
+                // Solution: call envSetNextLoad directly, putting the self filename as argv[0],
+                // exactly replicating what the ovlloader does on a natural exit.
+                const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
+            
+                // Replicate the extra args setNextOverlay appends automatically.
+                const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||
+                                        ult::lastTitleID != ult::getTitleIdAsString();
+                std::string argvStr = selfFilename + " --skipCombo"
+                                    + " --foregroundFix " + (needsFgFix ? '1' : '0')
+                                    + " --lastTitleID " + ult::lastTitleID;
+            
+                envSetNextLoad(returnOverlayPath.c_str(), argvStr.c_str());
+            }
             tsl::Overlay::get()->close();
             return true;
         }
@@ -1937,6 +2023,38 @@ public:
         // B — close the overlay (full exit: clear saved settings scroll position)
         if (keysDown & KEY_B) {
             g_settings_scroll[0] = '\0';
+            if (g_directMode && g_comboReturn) {
+                //directMode = false;
+                ult::launchingOverlay.store(true, std::memory_order_release);
+                ult::setIniFileValue(
+                    ult::ULTRAHAND_CONFIG_INI_PATH,
+                    ult::ULTRAHAND_PROJECT_NAME,
+                    ult::IN_OVERLAY_STR,
+                    ult::TRUE_STR
+                );
+                disableSound.store(true, std::memory_order_release);
+                skipRumbleDoubleClick = true;
+            
+                // setNextOverlay always puts getNameFromPath(returnOverlayPath) = "ovlmenu.ovl"
+                // as argv[0], so Ultrahand always sees lastOverlayFilename = "ovlmenu.ovl",
+                // which never matches any overlay in the list — scroll restore silently fails.
+                //
+                // The ovlloader, by contrast, passes argv[0] = "ultragb.ovl" when an overlay
+                // exits naturally, which is why the no-setNextOverlay path scrolls correctly.
+                //
+                // Solution: call envSetNextLoad directly, putting the self filename as argv[0],
+                // exactly replicating what the ovlloader does on a natural exit.
+                const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
+            
+                // Replicate the extra args setNextOverlay appends automatically.
+                const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||
+                                        ult::lastTitleID != ult::getTitleIdAsString();
+                std::string argvStr = selfFilename + " --skipCombo"
+                                    + " --foregroundFix " + (needsFgFix ? '1' : '0')
+                                    + " --lastTitleID " + ult::lastTitleID;
+            
+                envSetNextLoad(returnOverlayPath.c_str(), argvStr.c_str());
+            }
             tsl::Overlay::get()->close();
             return true;
         }
@@ -2018,9 +2136,7 @@ public:
             tsl::disableHiding = true;   // launch combo must close, not hide
 
         // ── Mode-specific init ────────────────────────────────────────────────
-        if (g_win_scale_locked) {
-            // Windowed session — setup_windowed_framebuffer() set this flag in
-            // main() before tsl::loop().  Read quick-exit flag and ROM path.
+        if (g_win_scale_locked && !g_overlay_free_mode) {
             {
                 const std::string qe = ult::parseValueFromIniSection(
                     kConfigFile, kConfigSection, kKeyWinQuickExit);
@@ -2051,6 +2167,16 @@ public:
                 }
                 if (!pr.empty())
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
+            }
+
+            // Free-overlay quicklaunch: g_overlay_rom_path wasn't written to
+            // config (no launch_free_overlay_mode call), so construct it from
+            // g_last_rom_path + g_rom_dir — both now populated by load_config().
+            if (g_overlay_free_mode && !g_overlay_rom_path[0] && g_quick_launch && g_last_rom_path[0]) {
+                char full[PATH_BUFFER_SIZE];
+                snprintf(full, sizeof(full), "%s%s", g_rom_dir, g_last_rom_path);
+                strncpy(g_overlay_rom_path, full, sizeof(g_overlay_rom_path) - 1);
+                g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
             }
 
             if (!m_game_session) {
@@ -2087,8 +2213,7 @@ public:
         tsl::disableHiding = false;
 
         if (m_game_session) {
-            if (g_win_scale_locked) {
-                // ── Windowed teardown ─────────────────────────────────────────
+            if (g_win_scale_locked && !g_overlay_free_mode) {
                 tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
                 ult::layerEdge  = 0;                 // restore for normal overlay hit-tests
                 tsl::layerEdgeY = 0;
@@ -2123,7 +2248,7 @@ public:
     // Pause the emulator when the overlay is hidden.
     void onHide() override {
         if (!m_game_session) return;
-        if (g_win_scale_locked)
+        if (g_win_scale_locked && !g_overlay_free_mode)
             tsl::hlp::requestForeground(true);  // reclaim HID during pass-through
         g_gb.running   = false;
         g_emu_active   = false;
@@ -2162,6 +2287,29 @@ public:
                 tsl::Overlay::get()->close();
             }
             return initially<RomSelectorGui>();
+        }
+
+        // ── Free overlay player ──────────────────────────────────────────────────
+        // Must be checked before g_win_scale_locked because free overlay sets
+        // g_win_scale_locked=true for windowed layer sizing while still needing
+        // GBOverlayGui (not GBWindowedGui).
+        if (g_overlay_free_mode && g_overlay_rom_path[0]) {
+            if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
+                show_notify(msg);
+                g_overlay_mode      = false;
+                g_overlay_free_mode = false;
+                if (g_self_path[0]) {
+                    tsl::setNextOverlay(g_self_path);
+                    tsl::Overlay::get()->close();
+                }
+                return initially<RomSelectorGui>();
+            }
+            if (ult::expandedMemory)
+                ult::loadWallpaperFileWhenSafe();
+            strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
+            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
+            g_overlay_rom_path[0] = '\0';
+            return initially<GBOverlayGui>();
         }
 
         // ── Windowed session ─────────────────────────────────────────────────────
@@ -2275,10 +2423,11 @@ static void setup_windowed_framebuffer() {
 //   4. Add matching branches in Overlay::initServices() / loadInitialGui().
 // =============================================================================
 enum class SessionType {
-    Menu,           // cold start, -returning, quicklaunch-windowed tooLarge fallback
-    Windowed,       // -windowed, or -quicklaunch with windowed=1 and ROM fits
-    OverlayPlayer,  // -overlay  (ROM path written to config by launch_overlay_mode)
-    QuickLaunch,    // -quicklaunch with windowed=0
+    Menu,              // cold start, -returning, quicklaunch-windowed tooLarge fallback
+    Windowed,          // -windowed, or -quicklaunch with windowed=1 and ROM fits
+    OverlayPlayer,     // -overlay  (ROM path written to config by launch_overlay_mode)
+    FreeOverlayPlayer, // -freeoverlay (trimmed 448×613 layer, repositionable)
+    QuickLaunch,       // -quicklaunch with windowed=0
 };
 
 int main(int argc, char* argv[]) {
@@ -2303,9 +2452,12 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if      (strcmp(argv[i], "-returning")   == 0) { g_returning_from_windowed = true; skipRumbleDoubleClick = false; }
         else if (strcmp(argv[i], "--direct")     == 0) { g_directMode = true;              skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "--comboReturn") == 0) { g_comboReturn = true;}
         else if (strcmp(argv[i], "-overlay")     == 0) { g_overlay_mode = true; wantOverlayPlayer = true; skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "-freeoverlay") == 0) { g_overlay_mode = true; g_overlay_free_mode = true; wantOverlayPlayer = true; skipRumbleDoubleClick = false; }
         else if (strcmp(argv[i], "-quicklaunch") == 0) { g_quick_launch = true; wantQuickLaunch   = true; }
         else if (strcmp(argv[i], "-windowed")    == 0) { wantWindowed   = true; }
+
     }
 
     // ── Phase 2: resolve session type ────────────────────────────────────────
@@ -2320,7 +2472,14 @@ int main(int argc, char* argv[]) {
 
     if (wantQuickLaunch) {
         const std::string lastRom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyLastRom);
-        const bool        windowed = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowed) == "1";
+        const bool        windowed    = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowed)     == "1";
+        const bool        overlayFree = !windowed &&
+                                        ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyOvlFreeMode) == "1";
+        // Set globals early so Phase 3 and initServices() can see them.
+        if (overlayFree) {
+            g_overlay_free_mode = true;
+            g_overlay_mode      = true;
+        }
 
         if (!lastRom.empty()) {
             if (windowed) {
@@ -2345,6 +2504,11 @@ int main(int argc, char* argv[]) {
                     g_quicklaunch_windowed_toobig = true;
                     session = SessionType::Menu;
                 }
+            } else if (overlayFree) {
+                // Free-overlay quicklaunch: route through FreeOverlayPlayer so
+                // Phase 3 sets DefaultFramebufferHeight = OVL_FREE_FB_H before
+                // tsl::loop() and Renderer::init() allocate the framebuffer.
+                session = SessionType::FreeOverlayPlayer;
             } else {
                 session = SessionType::QuickLaunch;
             }
@@ -2356,8 +2520,10 @@ int main(int argc, char* argv[]) {
         session = SessionType::Windowed;
 
     } else if (wantOverlayPlayer) {
-        // ROM path already in config under "overlay_rom" (set by launch_overlay_mode).
-        session = SessionType::OverlayPlayer;
+        // ROM path already in config under "overlay_rom" (set by launch_overlay_mode /
+        // launch_free_overlay_mode).  Route to the correct session sub-type.
+        session = g_overlay_free_mode ? SessionType::FreeOverlayPlayer
+                                      : SessionType::OverlayPlayer;
     }
 
     // ── Phase 3: session-specific pre-loop setup, then single dispatch ────────
@@ -2372,6 +2538,19 @@ int main(int argc, char* argv[]) {
         clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
                         wrom.empty() ? nullptr : wrom.c_str());
         setup_windowed_framebuffer();   // sets g_win_scale_locked = true
+
+    } else if (session == SessionType::FreeOverlayPlayer) {
+        // Free overlay: 448×OVL_FREE_FB_H framebuffer, windowed-style floating
+        // layer sized at 1.5× (= 672×954 VI pixels at 720p).  Setting
+        // g_win_scale_locked=true makes Tesla use windowed layer sizing instead
+        // of the full-screen 1280×720 stretch, so the layer can be freely
+        // repositioned in both X and Y.  loadInitialGui() checks g_overlay_free_mode
+        // before g_win_scale_locked so it still routes to GBOverlayGui, not
+        // GBWindowedGui.
+        g_win_scale_locked            = true;
+        ult::DefaultFramebufferWidth  = static_cast<u32>(FB_W);
+        ult::DefaultFramebufferHeight = static_cast<u32>(OVL_FREE_FB_H);
+        ult::windowedLayerPixelPerfect = false;  // 720p 1.5× scaling
 
     } else if (session == SessionType::Menu) {
         returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";

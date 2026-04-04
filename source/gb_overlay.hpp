@@ -60,12 +60,23 @@ inline void gb_tick_frame() {
 }
 #endif
 
+// Set true by GBOverlayGui::handleInput while a free-overlay touch-drag or
+// joystick reposition is active.  Read by GBOverlayElement::draw to overlay
+// the "Paused" dim/border/text — identical to s_win_dragging in windowed mode.
+static bool s_ovl_free_dragging = false;
+
 // =============================================================================
 // GBOverlayElement — drawing only; no input handling (input lives on Gui)
 // =============================================================================
 class GBOverlayElement : public tsl::elm::Element {
 public:
     virtual void draw(tsl::gfx::Renderer* renderer) override {
+        // In free overlay mode set the Y render offset BEFORE any draw call so
+        // init_outer_lut() (called lazily inside render_gb_screen / letterbox)
+        // builds the row LUT with the trimmed viewport base.  Reset to 0 in
+        // normal overlay mode so the two modes never bleed into each other.
+        g_render_y_offset = g_overlay_free_mode ? -(int)OVL_FREE_TOP_TRIM : 0;
+
         // Zero the footer-button width atomics every frame.
         // The Overlay's touch handler computes backTouched / nextPageTouched as:
         //   touchPos.x >= backLeftEdge && touchPos.x < (backLeftEdge + backWidth)
@@ -93,21 +104,37 @@ public:
         // a single pass.  Current approach: draw_wallpaper_direct with a skip
         // region splits into three branch-free bands and uses NEON 8-pixel
         // stores throughout.
-        if (ult::expandedMemory && g_ingame_wallpaper)
-            draw_wallpaper_direct(renderer,
-                static_cast<u32>(VP_Y),           // skip_row_start = 108
-                static_cast<u32>(VP_Y + VP_H),    // skip_row_end   = 468
-                static_cast<u32>(VP_X) / 8u,      // skip_grp_start = 3
-                static_cast<u32>(VP_X + VP_W) / 8u); // skip_grp_end = 53
-    
-        //renderer->drawRect(15, tsl::cfg::FramebufferHeight - 73, tsl::cfg::FramebufferWidth - 30, 1, renderer->a(tsl::bottomSeparatorColor));
-        
-        draw_ultragb_title(renderer, 20, 67, 50);
+        if (ult::expandedMemory && g_overlay_wallpaper) {
+            if (g_overlay_free_mode) {
+                // Free mode: framebuffer is OVL_FREE_FB_H (636) rows tall, sourced from
+                // row OVL_FREE_TOP_TRIM (84) of the full wallpaper.  The GB viewport
+                // lands at rows VP_Y+g_render_y_offset .. VP_Y+VP_H+g_render_y_offset
+                // = 24 .. 384, so the skip region shifts accordingly.
+                draw_wallpaper_direct(renderer,
+                    static_cast<u32>(VP_Y   + g_render_y_offset),  // skip_row_start = 24
+                    static_cast<u32>(VP_Y + VP_H + g_render_y_offset), // skip_row_end = 384
+                    static_cast<u32>(VP_X)       / 8u,             // skip_grp_start = 3
+                    static_cast<u32>(VP_X + VP_W) / 8u,            // skip_grp_end   = 53
+                    static_cast<u32>(OVL_FREE_TOP_TRIM),            // src_row_offset = 84
+                    static_cast<u32>(OVL_FREE_FB_H));               // fb_height      = 636
+            } else {
+                draw_wallpaper_direct(renderer,
+                    static_cast<u32>(VP_Y),           // skip_row_start = 108
+                    static_cast<u32>(VP_Y + VP_H),    // skip_row_end   = 468
+                    static_cast<u32>(VP_X) / 8u,      // skip_grp_start = 3
+                    static_cast<u32>(VP_X + VP_W) / 8u); // skip_grp_end = 53
+            }
+        }
 
-        #if USING_WIDGET_DIRECTIVE
-        //if (m_showWidget)
-        renderer->drawWidget();
-        #endif
+        // Title and widget — only drawn in fixed overlay mode.
+        // In free mode the top OVL_FREE_TOP_TRIM rows are absent from the
+        // framebuffer entirely; drawing there would write out of bounds.
+        if (!g_overlay_free_mode) {
+            draw_ultragb_title(renderer, 20, 67, 50);
+#if USING_WIDGET_DIRECTIVE
+            renderer->drawWidget();
+#endif
+        }
 
         //render_gb_background(renderer);
 
@@ -147,7 +174,13 @@ public:
         // bypassing the clock gate entirely.  Audio is paused for the duration so
         // the SPSC ring doesn't overflow — the audio thread drains it silently and
         // preserves all GBAPU channel state, so playback resumes cleanly on release.
-        gb_tick_frame();
+        //
+        // Free-overlay reposition: skip the emulation tick entirely while the user
+        // is dragging so the game is truly paused (not just audio-silenced).  The
+        // last rendered framebuffer continues to be drawn by render_gb_screen below,
+        // giving a clean frozen frame under the dim/border/"Paused" overlay.
+        if (!s_ovl_free_dragging)
+            gb_tick_frame();
 
         render_gb_letterbox(renderer);
         render_gb_screen(renderer);
@@ -176,27 +209,31 @@ public:
             // and their __cxa_guard_acquire/release sequences from .text.
             // dw/dh are also saved to g_dpad_glyph_w/h so the scissor block below
             // can read them as plain floats rather than carrying its own static guard.
+            //
+            // In free overlay mode g_render_y_offset is already set (= -OVL_FREE_TOP_TRIM)
+            // at the top of draw(), so hit-center Y values are automatically placed in
+            // the correct framebuffer-relative coordinate space for the trimmed layer.
             const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
             g_dpad_hx  = DPAD_DRAW_X  + dw / 2;
-            g_dpad_hy  = (DPAD_DRAW_Y - 10) - dh / 2 + 10;
+            g_dpad_hy  = (DPAD_DRAW_Y + g_render_y_offset - 10) - dh / 2 + 10;
             g_dpad_glyph_w = dw;
             g_dpad_glyph_h = dh;
 
             const auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
             g_abtn_hx  = ABTN_DRAW_X  + aw / 2;
-            g_abtn_hy  = ABTN_DRAW_Y  - ah / 2;
+            g_abtn_hy  = ABTN_DRAW_Y  + g_render_y_offset - ah / 2;
 
             const auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
             g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
-            g_bbtn_hy  = BBTN_DRAW_Y  - bh / 2;
+            g_bbtn_hy  = BBTN_DRAW_Y  + g_render_y_offset - bh / 2;
 
             const auto [sw, sh] = renderer->getTextDimensions("\uE0EF", false, START_SIZE);
             g_start_hx = START_DRAW_X + sw / 2;
-            g_start_hy = START_DRAW_Y - sh / 2;
+            g_start_hy = START_DRAW_Y + g_render_y_offset - sh / 2;
 
             const auto [selw, selh] = renderer->getTextDimensions("\uE0F0", false, SELECT_SIZE);
             g_select_hx = SELECT_DRAW_X + selw / 2;
-            g_select_hy = SELECT_DRAW_Y - selh / 2;
+            g_select_hy = SELECT_DRAW_Y + g_render_y_offset - selh / 2;
 
             const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
             g_div_half_w = static_cast<int>(divw) / 2;
@@ -210,9 +247,12 @@ public:
         // D-pad backing: two rects forming a plus/cross shape.
         // All constants are directly tuneable — no getTextDimensions needed.
         // Adjust DPAD_CX/CY to centre, ARM_W/H for shaft width, FULL for span.
+        // In free overlay mode g_render_y_offset is -OVL_FREE_TOP_TRIM; we apply it
+        // at runtime (not compile-time) so the backing tracks the shifted viewport.
         {
-            static constexpr s32 DPAD_CX = DPAD_DRAW_X + 67;   // horizontal centre
-            static constexpr s32 DPAD_CY = DPAD_DRAW_Y - 10 - 56; // vertical centre
+            static constexpr s32 DPAD_CX      = DPAD_DRAW_X + 67;
+            static constexpr s32 DPAD_CY_BASE = DPAD_DRAW_Y - 10 - 56;
+            const            s32 DPAD_CY      = DPAD_CY_BASE + g_render_y_offset;
             static constexpr s32 ARM_W   = 46;
             static constexpr s32 ARM_H   = 48;   // +2 vertically taller
             static constexpr s32 FULL    = 131;  // +3 for vertical length
@@ -241,7 +281,7 @@ public:
             // Right edge: rightmost of (start glyph right, divider right half)
             const int right_edge = std::max(START_DRAW_X + START_SIZE, FB_W / 2 + g_div_half_w);
             const int rx = left_edge  - PAD_X;
-            const int ry = (START_DRAW_Y - START_SIZE) - PAD_Y + Y_SHIFT + 4;
+            const int ry = (START_DRAW_Y + g_render_y_offset - START_SIZE) - PAD_Y + Y_SHIFT + 4;
             const int rw = (right_edge - left_edge) + PAD_X * 2;
             const int rh = START_SIZE + PAD_Y * 2;
             renderer->drawUniformRoundedRect(rx, ry, rw, rh, BK);
@@ -253,7 +293,7 @@ public:
         // one third (33%) so the arrow arms are fully visible, but narrow enough
         // to hide the diagonal corners of the overlapping glyph.
         {
-            const s32 baseline  = DPAD_DRAW_Y - 10;
+            const s32 baseline  = DPAD_DRAW_Y + g_render_y_offset - 10;
             // g_dpad_glyph_w/h are populated by the g_btns_measured block above on the
             // first draw — guaranteed before this point because g_btns_measured runs
             // first in every draw() call.  Reading them here eliminates the static
@@ -266,12 +306,14 @@ public:
             // 46% wide for the vertical (↑↓) strip, 46% tall for the horizontal (←→) strip
             const s32 stripW    = static_cast<s32>(dw) * 34 / 100;
             const s32 stripH    = static_cast<s32>(dh) * 34 / 100;
+            const s32 fbH       = static_cast<s32>(tsl::cfg::FramebufferHeight);
+            const s32 fbW       = static_cast<s32>(tsl::cfg::FramebufferWidth);
 
             // E115 (↑↓): narrow strip horizontally (stripW), but fully unbounded
             // vertically — scissor spans the entire screen height so arrow tips
             // are never clipped regardless of font ascender/descender metrics.
             renderer->enableScissoring(left + (static_cast<s32>(dw) - stripW) / 2, 0,
-                                       stripW, FB_H);
+                                       stripW, fbH);
             renderer->drawString("\uE115", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
             renderer->disableScissoring();
 
@@ -280,21 +322,21 @@ public:
             // are never clipped at either side.
             const s32 rowNudge = thirdH / 4;
             renderer->enableScissoring(0, top + (static_cast<s32>(dh) - stripH) / 2 + rowNudge +4,
-                                       FB_W, stripH);
+                                       fbW, stripH);
             renderer->drawString("\uE116", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
             renderer->disableScissoring();
 
             // Centre circle — drawn last so it sits on top of both arrow glyphs
             // at the exact crossing point of the two black backing bars.
             // Values match DPAD_CX, DPAD_CY+4, and (ARM_W+LIP*2)/2 from the backing block.
-            renderer->drawCircle(DPAD_DRAW_X + 67, DPAD_DRAW_Y - 10 - 56 + 4+1, 14, true, BK);
+            renderer->drawCircle(DPAD_DRAW_X + 67, DPAD_DRAW_Y + g_render_y_offset - 10 - 56 + 4+1, 14, true, BK);
         }
-        renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y,  ABTN_SIZE,  VBTN_COLOR);
-        renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y,  BBTN_SIZE,  VBTN_COLOR);
-        renderer->drawString("\uE0F0", false, SELECT_DRAW_X, SELECT_DRAW_Y + 1, SELECT_SIZE, VBTN_COLOR);
+        renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y  + g_render_y_offset, ABTN_SIZE,   VBTN_COLOR);
+        renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y  + g_render_y_offset, BBTN_SIZE,   VBTN_COLOR);
+        renderer->drawString("\uE0F0", false, SELECT_DRAW_X, SELECT_DRAW_Y + g_render_y_offset + 1, SELECT_SIZE, VBTN_COLOR);
         renderer->drawString(ult::DIVIDER_SYMBOL, false,
-            FB_W / 2 - g_div_half_w, START_DRAW_Y + 1, START_SIZE, 0xF444);
-        renderer->drawString("\uE0EF", false, START_DRAW_X,  START_DRAW_Y  + 1, START_SIZE,  VBTN_COLOR);
+            FB_W / 2 - g_div_half_w, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, 0xF444);
+        renderer->drawString("\uE0EF", false, START_DRAW_X, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, VBTN_COLOR);
 
         // ── Focus pass-through flash border ──────────────────────────────────
         // Draws a 4-pixel coloured border for g_focus_flash frames after the
@@ -311,17 +353,63 @@ public:
                 ? tsl::Color{0xF, 0x0, 0x0, al}
                 : tsl::Color{0x0, 0xF, 0x0, al};
             static constexpr int B = 4;
-            renderer->drawRect(0,        0,         FB_W, B,             fc);
-            renderer->drawRect(0,        FB_H - B,  FB_W, B,             fc);
-            renderer->drawRect(0,        B,         B,    FB_H - B * 2,  fc);
-            renderer->drawRect(FB_W - B, B,         B,    FB_H - B * 2,  fc);
+            const int fbH = static_cast<int>(tsl::cfg::FramebufferHeight);
+            renderer->drawRect(0,        0,         FB_W, B,               fc);
+            renderer->drawRect(0,        fbH - B,   FB_W, B,               fc);
+            renderer->drawRect(0,        B,         B,    fbH - B * 2,     fc);
+            renderer->drawRect(FB_W - B, B,         B,    fbH - B * 2,     fc);
             --g_focus_flash;
         }
 
-        if (!ult::useRightAlignment)
-            renderer->drawRect(447, 0, 448, 720, a(tsl::edgeSeparatorColor));
-        else
-            renderer->drawRect(0, 0, 1, 720, a(tsl::edgeSeparatorColor));
+        if (!g_overlay_free_mode) {
+            if (!ult::useRightAlignment)
+                renderer->drawRect(447, 0, 448, static_cast<int>(tsl::cfg::FramebufferHeight), a(tsl::edgeSeparatorColor));
+            else
+                renderer->drawRect(0, 0, 1, static_cast<int>(tsl::cfg::FramebufferHeight), a(tsl::edgeSeparatorColor));
+        } else {
+            const int fbw = static_cast<int>(tsl::cfg::FramebufferWidth);
+            const int fbh = static_cast<int>(tsl::cfg::FramebufferHeight);
+            const auto col = a(tsl::edgeSeparatorColor);
+            
+            renderer->drawRect(0,    0,   1,   fbh, col); // left
+            renderer->drawRect(fbw-1,0,   fbw, fbh, col); // right
+            renderer->drawRect(0,    0,   fbw, 1,   col); // top
+            renderer->drawRect(0,    fbh-1, fbw, fbh, col); // bottom
+        }
+
+        // ── Free overlay reposition overlay ──────────────────────────────────
+        // Mirrors GBWindowedElement exactly: while dragging, dim the frozen
+        // frame and show a red border + centred "Paused" text.
+        if (g_overlay_free_mode && s_ovl_free_dragging) {
+            const s32 fw = static_cast<s32>(tsl::cfg::FramebufferWidth);
+            const s32 fh = static_cast<s32>(tsl::cfg::FramebufferHeight);
+
+            static constexpr tsl::Color DIM  = {0x0, 0x0, 0x0, 0x8};
+            renderer->drawRect(0, 0, fw, fh, DIM);
+
+            static constexpr int        BORD = 4;
+            static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
+            renderer->drawRect(0,         0,          fw,   BORD,          RED);
+            renderer->drawRect(0,         fh - BORD,  fw,   BORD,          RED);
+            renderer->drawRect(0,         BORD,       BORD, fh - BORD * 2, RED);
+            renderer->drawRect(fw - BORD, BORD,       BORD, fh - BORD * 2, RED);
+
+            static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
+            static constexpr u32 FONT = 20;
+
+            // Centre "Paused" within the 2× pixel-perfect GB screen region.
+            // In free overlay mode g_render_y_offset == -OVL_FREE_TOP_TRIM, so
+            // the screen in framebuffer coords is:
+            //   x: VP2_X .. VP2_X + VP2_W  (64 .. 384)
+            //   y: VP2_Y - OVL_FREE_TOP_TRIM .. +VP2_H  (60 .. 348)
+            const s32 scr_x = VP2_X;
+            const s32 scr_y = static_cast<s32>(VP2_Y) + g_render_y_offset;
+            const auto [tw, th] = renderer->getTextDimensions("Paused", false, FONT);
+            renderer->drawString("Paused", false,
+                scr_x + (static_cast<s32>(VP2_W) - static_cast<s32>(tw)) / 2,
+                scr_y + (static_cast<s32>(VP2_H) + static_cast<s32>(th)) / 2,
+                FONT, WHITE);
+        }
     }
 
     virtual void layout(u16, u16, u16, u16) override {
@@ -343,50 +431,117 @@ class GBOverlayGui : public tsl::Gui {
     uint32_t m_zr_first_frame = 0;     // g_frame_count when first press fired
     ZLPassThroughState m_zl_state;     // ZL double-click-hold pass-through toggle
 
+    // ── Free overlay touch hold-to-drag state (mirrors GBWindowedGui) ────────
+    bool m_hold_armed    = false;  // touch landed inside the window
+    bool m_dragging      = false;  // hold threshold passed; actively repositioning
+    int  m_hold_frames   = 0;
+    int  m_touch_start_x = 0;     // HID x where the hold began (touch space)
+    int  m_touch_start_y = 0;     // HID y where the hold began (touch space)
+    int  m_pos_start_x   = 0;     // g_ovl_free_pos_x when hold began (VI space)
+    int  m_pos_start_y   = 0;     // g_ovl_free_pos_y when hold began (VI space)
+    bool m_prev_touching = false;
+
+    // ── Free overlay KEY_PLUS drag state (mirrors GBWindowedGui) ─────────────
+    bool     m_plus_dragging      = false;
+    bool     m_plus_armed         = false;
+    uint64_t m_plus_hold_start_ns = 0;
+    float    m_joy_acc_x          = 0.f;
+    float    m_joy_acc_y          = 0.f;
+    uint64_t m_joy_last_ns        = 0;
+
+    // 60 frames ≈ 1 s at ~60 fps.
+    static constexpr int      HOLD_FRAMES  = 60;
+    static constexpr uint64_t PLUS_HOLD_NS = 1'000'000'000ULL;  // 1 s
+    static constexpr int      JOY_DEADZONE = 20;
+
+    // Poll raw HID touch — bypasses Tesla's per-frame coordinate clamping.
+    // Identical to GBWindowedGui::poll_touch.
+    static bool poll_touch(int& out_x, int& out_y) {
+        HidTouchScreenState ts = {};
+        hidGetTouchScreenStates(&ts, 1);
+        if (ts.count > 0) {
+            out_x = static_cast<int>(ts.touches[0].x);
+            out_y = static_cast<int>(ts.touches[0].y);
+            return true;
+        }
+        out_x = out_y = 0;
+        return false;
+    }
+
+    // VI bounds helpers — derived from the layer size Tesla set.
+    // Mirrors GBWindowedGui::vi_max_x/y exactly.
+    static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
+    static int vi_max_y() { return 1080 - static_cast<int>(tsl::cfg::LayerHeight); }
+
+    // Layer footprint in HID touch space (0-1279 × 0-719).
+    // touch = VI × 2/3.  Identical to GBWindowedGui::touch_win_w/h.
+    static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
+    static int touch_win_h() { return static_cast<int>(tsl::cfg::LayerHeight) * 2 / 3; }
+
+    // Sync notification / virtual-button touch offsets to the current VI position.
+    void sync_ovl_touch_offsets() {
+        ult::layerEdge  = (g_ovl_free_pos_x * 2) / 3;
+        tsl::layerEdgeY = (g_ovl_free_pos_y * 2) / 3;
+    }
+
 public:
     ~GBOverlayGui() {
         restore_haptic_if_needed(m_restoreHapticState);
-        //tsl::gfx::FontManager::clearCache(); // ALWAYS CLEAR BEFORE
         tsl::disableHiding = false;
+        if (g_overlay_free_mode) {
+            ult::layerEdge  = 0;
+            tsl::layerEdgeY = 0;
+        }
     }
 
     virtual tsl::elm::Element* createUI() override {
         tsl::disableHiding = true;
         audio_exit_if_enabled();
+
+        // Ensure screenshots do not work.
+        //screenshotsAreDisabled.store(true, std::memory_order_release);
+        //screenshotsAreForceDisabled.store(true, std::memory_order_release);
+        //tsl::gfx::Renderer::get().removeScreenshotStacks();
         
-        // ── Deferred ROM load ─────────────────────────────────────────────────
         consume_pending_rom(m_load_failed);
 
         if (m_load_failed) {
-            // Don't activate the emulator; update() will swap back immediately.
             g_emu_active = false;
             ult::noClickableItems.store(false, std::memory_order_release);
         } else {
             g_emu_active = true;
             m_waitForRelease = true;
-            // No bottom bar is drawn in-game. Tell the framework there are no
-            // clickable items so footer-zone touches don't highlight the select
-            // button or fire its rumble / simulation callbacks.
             ult::noClickableItems.store(true, std::memory_order_release);
         }
+
+        // ── Free overlay: position the VI layer at the saved location ─────────
+        // Clamp to valid VI bounds derived from the layer size Tesla configured.
+        if (g_overlay_free_mode) {
+            // Disable screenshots
+            //screenshotsAreDisabled.store(true, std::memory_order_release);
+            //screenshotsAreForceDisabled.store(true, std::memory_order_release);
+            //tsl::gfx::Renderer::get().removeScreenshotStacks();
+
+            const int mx = vi_max_x();
+            const int my = vi_max_y();
+            g_ovl_free_pos_x = std::max(0, std::min(mx, g_ovl_free_pos_x));
+            g_ovl_free_pos_y = std::max(0, std::min(my, g_ovl_free_pos_y));
+            tsl::gfx::Renderer::get().setLayerPos(
+                static_cast<u32>(g_ovl_free_pos_x),
+                static_cast<u32>(g_ovl_free_pos_y));
+            sync_ovl_touch_offsets();
+        }
+
         return new GBOverlayElement();
     }
 
     virtual void update() override {
-        // Deferred load failed (OOM, bad ROM header, etc.):
-        // Close this process and relaunch as a plain overlay so the ROM
-        // selector opens cleanly.  Mirrors GBWindowedGui::update() exactly —
-        // no swapTo; exitServices() handles teardown (audio pause, ROM unload,
-        // DMA free) in the correct order before the new process starts.
-        // The settings scroll is preserved automatically: exitServices() writes
-        // g_settings_scroll to INI, and the fresh initServices() restores it.
         if (m_load_failed) {
             m_load_failed = false;
             if (g_self_path[0])
                 tsl::setNextOverlay(std::string(g_self_path));
             tsl::Overlay::get()->close();
         }
-
         run_once_setup(runOnce, m_restoreHapticState);
     }
 
@@ -394,11 +549,7 @@ public:
                              const HidTouchState& touchPos,
                              HidAnalogStickState leftJoy,
                              HidAnalogStickState rightJoy) override {
-        //(void)leftJoy; (void)rightJoy;
 
-        // Block all input until the buttons that launched us are fully released.
-        // keysHeld stays non-zero as long as any button remains physically held,
-        // so we wait for a clean frame before passing anything to the GB core.
         if (m_waitForRelease) {
             if (keysHeld) return true;
             g_touch_keys = 0;
@@ -406,68 +557,39 @@ public:
             m_waitForRelease = false;
         }
 
-        // ── Overlay overlay mode: Ultrahand launch combo → close ───────────────
-        // In quick-launch (overlay) mode the Ultrahand show/hide combo closes
-        // the overlay entirely.  Hiding is disabled in initServices() so the
-        // combo never hides — it reaches us here instead, exactly mirroring the
-        // combo_pressed() path in GBWindowedGui.
-        // gb_audio_pause() before close() matches windowed behaviour.
-        // launchComboHasTriggered suppresses Tesla's own directMode double-click
-        // so we don't get duplicate exit feedback.
+        // ── Overlay close combo ───────────────────────────────────────────────
         if (g_quick_launch || g_directMode || g_overlay_mode) {
             if ((keysDown & tsl::cfg::launchCombo) && (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo)) {
                 g_touch_keys = 0;
                 ult::noClickableItems.store(false, std::memory_order_release);
                 gb_audio_pause();
-    
                 launchComboHasTriggered.store(true, std::memory_order_release);
-
-                // Reset the settings scroll only for genuine exits — quick-launch
-                // and direct mode — where pressing the Ultrahand combo means
-                // "leave the app entirely / close to Ultrahand".
-                //
-                // In g_overlay_mode the same combo is the normal "back to ROM
-                // selector" action (equivalent to pressing X in non-overlay mode),
-                // so the scroll position must be preserved exactly as it is for any
-                // other return-to-selector path.  exitServices() will write the
-                // non-empty g_settings_scroll to INI, and the -returning process's
-                // initServices() will restore it so SettingsGui lands at the right
-                // item on the next RIGHT-press.
-                //
-                // Two reasons to clear (when warranted) rather than just omitting
-                // the INI write:
-                //   1. g_settings_scroll[0] = '\0' silences exitServices()'s own
-                //      write (guarded by the same flag), covering every exit path.
-                //   2. Erasing the INI key removes any stale value written by a
-                //      prior session so initServices() on the next -returning launch
-                //      finds nothing to restore.
                 if (g_quick_launch || g_directMode) {
                     g_settings_scroll[0] = '\0';
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
                 }
-
-                if (!g_directMode && g_self_path[0]) {
-                    const std::string returnArg = "-returning";
-                    tsl::setNextOverlay(std::string(g_self_path), returnArg);
-                }
-    
+                if (!g_directMode && g_self_path[0])
+                    tsl::setNextOverlay(std::string(g_self_path), "-returning");
                 tsl::Overlay::get()->close();
                 return true;
             }
         }
 
-        // ── Shared touch state — computed once, used by vp-tap and touch-keys ──
-        // tx/ty/touching were previously computed independently inside both the
-        // vp-tap block and the touch-keys block via identical cast expressions.
-        // Hoisting them here means one set of casts and one predicate per frame.
+        // ── Touch state — layer-relative coordinates ──────────────────────────
+        // In free overlay mode the layer may not be at (0,0), so subtract the
+        // layer's touch-space offset (= VI pos × 2/3) to get layer-relative coords.
         const int  tx       = static_cast<int>(touchPos.x) - static_cast<int>(ult::layerEdge);
-        const int  ty       = static_cast<int>(touchPos.y);
+        const int  ty_raw   = static_cast<int>(touchPos.y);
+        const int  ty       = g_overlay_free_mode
+                                ? ty_raw - static_cast<int>(tsl::layerEdgeY)
+                                : ty_raw;
+        const int  footer_y = g_overlay_free_mode
+                                ? static_cast<int>(OVL_FREE_FB_H)
+                                : FOOTER_Y;
         const bool touching = (touchPos.x != 0 || touchPos.y != 0) &&
-                              ty < FOOTER_Y;
+                              ty < footer_y;
 
         // ── ZR double-click-hold → fast-forward ──────────────────────────────
-        // Guarded by !pass_through so ZR reaches the background app undisturbed
-        // when foreground focus has been released.
         {
             const bool zr_down = !m_zl_state.pass_through && (keysDown & KEY_ZR);
             const bool zr_held = !m_zl_state.pass_through && (keysHeld  & KEY_ZR);
@@ -475,9 +597,6 @@ public:
         }
 
         // ── ZL double-click-hold: toggle background pass-through ─────────────
-        // Same gesture as windowed mode: double-tap ZL then hold ~300 ms.
-        // The d-pad key exclusion is omitted here because in overlay mode the
-        // physical d-pad is already dedicated to GB input and cannot conflict.
         {
             const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
             const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
@@ -485,115 +604,245 @@ public:
         }
 
         // ── Touch → virtual button state ──────────────────────────────────────
-        // Sample the first active touch point each frame and map it to GB keys.
-        // D-pad touch area is split into 4 directional arms by comparing the
-        // absolute x and y deltas from the pad centre — whichever axis dominates
-        // determines the pressed direction.  A, B, and Start are circular zones.
-        // HidTouchState in this libtesla fork is a single resolved touch point
-        // with flat .x / .y fields — no .count or .touches[] array.
-        // (0, 0) is the sentinel meaning "no active touch".
-        //
-        // Any touch with an initial y >= FOOTER_Y is intercepted by the
-        // framework as a footer button press even when the bar isn't drawn.
-        // We simply ignore those touches so they never reach the GB core.
-        // tx / ty / touching are already resolved above.
+        // Suppressed while dragging so the game never receives button presses
+        // during reposition, and suppressed during pass-through.
         g_touch_keys = 0;
-        if (touching && !m_zl_state.pass_through) {
-            // D-pad — stop-sign layout aligned to the drawn black rectangles.
-            //
-            // The cross is divided into 9 zones matching the physical shape:
-            //   • Centre overlap (|dx|<=HALF_ARM && |dy|<=HALF_ARM) → dead zone
-            //   • Top / bottom protrusion (|dx|<=HALF_ARM, outside centre) → UP / DOWN
-            //   • Left / right protrusion (|dy|<=HALF_ARM, outside centre) → LEFT / RIGHT
-            //   • Four corner triangles (outside both arms' widths) → two simultaneous
-            //     directions, e.g. top-right corner → UP + RIGHT.
-            //
-            // HALF_ARM matches the backing rectangle arm half-widths (ARM_W=46, LIP=4 → 27 px).
-            // HALF_SPAN matches half the full arm length (FULL=131, LIP*2=8, +pad → 70 px).
-            // D_CY is the backing rect visual centre (DPAD_CY + 5 ≈ 577).
+        if (touching && !m_zl_state.pass_through && !s_ovl_free_dragging) {
             {
-                static constexpr int D_CX        = DPAD_DRAW_X + 67;  // backing rect centre X
-                static constexpr int D_CY        = DPAD_DRAW_Y - 61;  // backing rect centre Y
-                static constexpr int D_HALF_ARM  = 27;  // half the narrow arm width / height
-                static constexpr int D_HALF_SPAN = 70;  // half the full arm length
+                static constexpr int D_CX        = DPAD_DRAW_X + 67;
+                static constexpr int D_CY        = DPAD_DRAW_Y - 61;
+                static constexpr int D_HALF_ARM  = 27;
+                static constexpr int D_HALF_SPAN = 70;
 
                 const int dx = tx - D_CX;
                 const int dy = ty - D_CY;
 
                 if (std::abs(dx) <= D_HALF_SPAN && std::abs(dy) <= D_HALF_SPAN) {
-                    const bool in_v = std::abs(dx) <= D_HALF_ARM;  // within vertical bar's width
-                    const bool in_h = std::abs(dy) <= D_HALF_ARM;  // within horizontal bar's height
+                    const bool in_v = std::abs(dx) <= D_HALF_ARM;
+                    const bool in_h = std::abs(dy) <= D_HALF_ARM;
 
                     if (in_v && in_h) {
-                        // Centre overlap — dead zone, no input
+                        // Centre overlap — dead zone
                     } else if (in_v) {
-                        // Top or bottom protrusion
                         g_touch_keys |= (dy > 0) ? KEY_DOWN : KEY_UP;
                     } else if (in_h) {
-                        // Left or right protrusion
                         g_touch_keys |= (dx > 0) ? KEY_RIGHT : KEY_LEFT;
                     } else {
-                        // Corner right-triangle — two simultaneous directions
                         g_touch_keys |= (dx > 0) ? KEY_RIGHT : KEY_LEFT;
                         g_touch_keys |= (dy > 0) ? KEY_DOWN : KEY_UP;
                     }
                 }
             }
-
-            // A button
-            {
-                const int dx = tx - g_abtn_hx, dy = ty - g_abtn_hy;
-                if (dx*dx + dy*dy <= ABTN_R * ABTN_R) {
-                    g_touch_keys |= KEY_A;
-                }
-            }
-
-            // B button
-            {
-                const int dx = tx - g_bbtn_hx, dy = ty - g_bbtn_hy;
-                if (dx*dx + dy*dy <= BBTN_R * BBTN_R) {
-                    g_touch_keys |= KEY_B;
-                }
-            }
-
-            // Start (+)
-            {
-                const int dx = tx - g_start_hx, dy = ty - g_start_hy;
-                if (dx*dx + dy*dy <= START_R * START_R) {
-                    g_touch_keys |= KEY_PLUS;
-                }
-            }
-
-            // Select (−)
-            {
-                const int dx = tx - g_select_hx, dy = ty - g_select_hy;
-                if (dx*dx + dy*dy <= SELECT_R * SELECT_R) {
-                    g_touch_keys |= KEY_MINUS;
-                }
-            }
+            { const int dx = tx - g_abtn_hx,  dy = ty - g_abtn_hy;  if (dx*dx + dy*dy <= ABTN_R   * ABTN_R)   g_touch_keys |= KEY_A; }
+            { const int dx = tx - g_bbtn_hx,  dy = ty - g_bbtn_hy;  if (dx*dx + dy*dy <= BBTN_R   * BBTN_R)   g_touch_keys |= KEY_B; }
+            { const int dx = tx - g_start_hx, dy = ty - g_start_hy; if (dx*dx + dy*dy <= START_R   * START_R)  g_touch_keys |= KEY_PLUS; }
+            { const int dx = tx - g_select_hx,dy = ty - g_select_hy;if (dx*dx + dy*dy <= SELECT_R  * SELECT_R) g_touch_keys |= KEY_MINUS; }
         }
 
-        // Trigger rumble ONLY on new touch presses (not holds)
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
-        if (newTouchPresses && g_ingame_haptics && !m_zl_state.pass_through) {
+        if (newTouchPresses && g_ingame_haptics && !m_zl_state.pass_through)
             triggerRumbleClick.store(true, std::memory_order_release);
-        }
         m_prevTouchKeys = g_touch_keys;
 
-        // Pass physical button state and virtual touch keys to the GB core.
-        // Suppressed when pass-through is active — the background app owns HID
-        // natively via requestForeground(false); we must not double-route input.
-        // keysDown is always a subset of keysHeld in libnx, so OR-ing it in
-        // separately is redundant — keysHeld alone covers every pressed button.
-        if (!m_zl_state.pass_through) {
+        // Physical buttons → GB joypad.  Suppressed during drag and pass-through.
+        if (!m_zl_state.pass_through && !s_ovl_free_dragging) {
             gb_set_input(keysHeld | g_touch_keys);
-
-            // Trigger rumble on ANY new physical button press
             if (g_ingame_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
-                             KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT))) {
+                             KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClick.store(true, std::memory_order_release);
+        }
+
+        // ── Free overlay reposition (touch + joystick) ────────────────────────
+        // Only active in free overlay mode; identical control scheme to windowed.
+        if (g_overlay_free_mode) {
+
+            // ── Touch hold-to-drag ────────────────────────────────────────────
+            // Coordinate spaces:
+            //   Touch: 0..1279 × 0..719   (HID native, always fixed)
+            //   VI:    0..1919 × 0..1079  (always fixed, touch→VI is ×3/2)
+            //
+            // Window top-left in touch space = (pos_x*2/3, pos_y*2/3).
+            // Window size in touch space     = LayerWidth*2/3 × LayerHeight*2/3.
+            {
+                int htx = 0, hty = 0;
+                const bool htouching = poll_touch(htx, hty);
+
+                const int win_tx = (g_ovl_free_pos_x * 2) / 3;
+                const int win_ty = (g_ovl_free_pos_y * 2) / 3;
+                const int win_w  = touch_win_w();
+                const int win_h  = touch_win_h();
+
+                // Restrict drag-arming to the 2× GB screen region only (not the
+                // full layer which also includes the virtual button area).
+                // Framebuffer pixels map 1:1 to touch-space pixels within the layer
+                // (1.5× FB→VI, then VI×2/3→touch cancels out), so we can add the
+                // screen's framebuffer offsets directly to the layer's touch-space origin.
+                const int scr_tx = win_tx + VP2_X;
+                const int scr_ty = win_ty + static_cast<int>(VP2_Y) - OVL_FREE_TOP_TRIM; // VP2_Y - 84
+                const bool in_screen = htouching
+                    && htx >= scr_tx && htx < scr_tx + VP2_W
+                    && hty >= scr_ty && hty < scr_ty + VP2_H;
+
+                // Still track whether the finger is anywhere in the window so we
+                // can cancel the hold when it drifts fully outside.
+                const bool in_window = htouching
+                    && htx >= win_tx && htx < win_tx + win_w
+                    && hty >= win_ty && hty < win_ty + win_h;
+
+                // Finger-down inside the 2× screen: arm the hold timer.
+                if (!m_prev_touching && htouching && in_screen && !m_plus_dragging) {
+                    m_hold_armed    = true;
+                    m_dragging      = false;
+                    m_hold_frames   = 0;
+                    m_touch_start_x = htx;
+                    m_touch_start_y = hty;
+                    m_pos_start_x   = g_ovl_free_pos_x;
+                    m_pos_start_y   = g_ovl_free_pos_y;
+                }
+
+                // Finger held: tick timer; enter/continue drag.
+                if (m_hold_armed && htouching) {
+                    ++m_hold_frames;
+
+                    if (!m_dragging && m_hold_frames >= HOLD_FRAMES) {
+                        m_dragging         = true;
+                        s_ovl_free_dragging = true;
+                        gb_audio_pause();
+                        // Re-anchor to avoid jump from drift during hold period.
+                        m_touch_start_x = htx;
+                        m_touch_start_y = hty;
+                        m_pos_start_x   = g_ovl_free_pos_x;
+                        m_pos_start_y   = g_ovl_free_pos_y;
+                        triggerNavigationFeedback();
+                    }
+
+                    if (m_dragging) {
+                        const int dx = (htx - m_touch_start_x) * 3 / 2;
+                        const int dy = (hty - m_touch_start_y) * 3 / 2;
+                        const int nx = std::max(0, std::min(vi_max_x(), m_pos_start_x + dx));
+                        const int ny = std::max(0, std::min(vi_max_y(), m_pos_start_y + dy));
+                        if (nx != g_ovl_free_pos_x || ny != g_ovl_free_pos_y) {
+                            g_ovl_free_pos_x = nx;
+                            g_ovl_free_pos_y = ny;
+                            tsl::gfx::Renderer::get().setLayerPos(
+                                static_cast<u32>(g_ovl_free_pos_x),
+                                static_cast<u32>(g_ovl_free_pos_y));
+                            sync_ovl_touch_offsets();
+                        }
+                    }
+
+                    // Finger drifted out of the entire window before hold threshold — cancel.
+                    if (!m_dragging && !in_window) {
+                        m_hold_armed  = false;
+                        m_hold_frames = 0;
+                    }
+                }
+
+                // Finger-up: save if we were dragging.
+                if (m_prev_touching && !htouching) {
+                    if (m_dragging) {
+                        save_ovl_free_pos();
+                        triggerExitFeedback();
+                        gb_audio_resume();
+                        g_gb_frame_next_ns = 0;
+                    }
+                    s_ovl_free_dragging = false;
+                    m_hold_armed        = false;
+                    m_dragging          = false;
+                    m_hold_frames       = 0;
+                }
+
+                m_prev_touching = htouching;
             }
+
+            // ── KEY_PLUS 1 s hold → left-stick reposition ────────────────────
+            // Identical to GBWindowedGui: x^8 sensitivity curve, dt-scaled,
+            // both X and Y axes, clamped to VI bounds.
+            {
+                const bool plus_only = (keysHeld & KEY_PLUS)
+                    && !(keysHeld & ~KEY_PLUS & ALL_KEYS_MASK);
+
+                if (plus_only) {
+                    if (!m_plus_armed) {
+                        m_plus_armed         = true;
+                        m_plus_hold_start_ns = ult::nowNs();
+                    }
+
+                    if (!m_plus_dragging) {
+                        if (ult::nowNs() - m_plus_hold_start_ns >= PLUS_HOLD_NS) {
+                            m_plus_dragging     = true;
+                            s_ovl_free_dragging = true;
+                            gb_audio_pause();
+                            m_joy_acc_x   = 0.f;
+                            m_joy_acc_y   = 0.f;
+                            m_joy_last_ns = 0;
+                            triggerNavigationFeedback();
+                        }
+                    }
+
+                    if (m_plus_dragging) {
+                        if (std::abs(leftJoy.x) > JOY_DEADZONE || std::abs(leftJoy.y) > JOY_DEADZONE) {
+                            const float fx = static_cast<float>(leftJoy.x);
+                            const float fy = static_cast<float>(leftJoy.y);
+
+                            // x^8 sensitivity curve — same as windowed mode.
+                            const float mag2   = fx*fx + fy*fy;
+                            const float norm   = mag2 / (32767.f * 32767.f);
+                            const float curve2 = norm  * norm;
+                            const float curve4 = curve2 * curve2;
+                            const float curve8 = curve4 * curve4;
+                            static constexpr float BASE_SENS = 0.00008f;
+                            static constexpr float MAX_SENS  = 0.0005f;
+                            const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve8;
+
+                            const uint64_t now_ns = ult::nowNs();
+                            if (m_joy_last_ns == 0) m_joy_last_ns = now_ns;
+                            const float dt_ns    = static_cast<float>(now_ns - m_joy_last_ns);
+                            const float dt_factor = std::max(0.25f, std::min(4.0f, dt_ns * (60.f / 1e9f)));
+                            m_joy_last_ns = now_ns;
+
+                            // Stick up (−y) → window moves up → smaller pos_y.
+                            m_joy_acc_x += fx  * sens * dt_factor;
+                            m_joy_acc_y += -fy * sens * dt_factor;
+
+                            const int dx = static_cast<int>(m_joy_acc_x);
+                            const int dy = static_cast<int>(m_joy_acc_y);
+                            m_joy_acc_x -= static_cast<float>(dx);
+                            m_joy_acc_y -= static_cast<float>(dy);
+
+                            const int nx = std::max(0, std::min(vi_max_x(), g_ovl_free_pos_x + dx));
+                            const int ny = std::max(0, std::min(vi_max_y(), g_ovl_free_pos_y + dy));
+                            if (nx != g_ovl_free_pos_x || ny != g_ovl_free_pos_y) {
+                                g_ovl_free_pos_x = nx;
+                                g_ovl_free_pos_y = ny;
+                                tsl::gfx::Renderer::get().setLayerPos(
+                                    static_cast<u32>(g_ovl_free_pos_x),
+                                    static_cast<u32>(g_ovl_free_pos_y));
+                                sync_ovl_touch_offsets();
+                            }
+                        } else {
+                            m_joy_last_ns = 0;
+                        }
+                    }
+                } else {
+                    if (m_plus_armed) {
+                        if (m_plus_dragging) {
+                            save_ovl_free_pos();
+                            triggerExitFeedback();
+                            gb_audio_resume();
+                            g_gb_frame_next_ns = 0;
+                            s_ovl_free_dragging = false;
+                            m_plus_dragging     = false;
+                        }
+                        m_plus_armed         = false;
+                        m_plus_hold_start_ns = 0;
+                    }
+                }
+            }
+
+            // Swallow all input while repositioning.
+            if (s_ovl_free_dragging) return true;
         }
 
         return true;  // consume all input while in-game

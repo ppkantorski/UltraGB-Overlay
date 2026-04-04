@@ -103,6 +103,12 @@ inline tsl::Color rgb565_to_tsl(const uint16_t c) {
 
 static constexpr uint32_t OWV = 112u;
 
+// Row-rendering Y offset for free overlay mode.
+// Set to -(int)OVL_FREE_TOP_TRIM (= -107) at the top of GBOverlayElement::draw()
+// when g_overlay_free_mode is true; reset to 0 otherwise.
+// Must be applied to every VP_Y-based coordinate passed to render functions.
+static int g_render_y_offset = 0;
+
 // -- Shared swizzle LUT construction helpers ----------------------------------
 // The block-linear col_part(x) / row_part(y) formula is identical for every
 // LUT in the project.  Centralising it here means the formula lives exactly
@@ -159,7 +165,10 @@ static bool     s_outer_lut_ready = false;
 
 static void init_outer_lut() {
     build_col_lut(s_outer_col_lut, VP_X, VP_W);
-    build_row_lut(s_outer_row_lut, VP_Y, VP_H, OWV);
+    // In free overlay mode g_render_y_offset == -(int)OVL_FREE_TOP_TRIM,
+    // shifting the LUT base from VP_Y=108 to 1.  The inner-viewport pointer
+    // offset (VP2_Y - VP_Y = 36) is unchanged regardless of the shift.
+    build_row_lut(s_outer_row_lut, VP_Y + g_render_y_offset, VP_H, OWV);
     // Derive inner-viewport pointers from the outer arrays — no separate allocation.
     s_col_lut = s_outer_col_lut + (VP2_X - VP_X);   // +40
     s_row_lut = s_outer_row_lut + (VP2_Y - VP_Y);   // +36
@@ -735,8 +744,9 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
 //   gap height = 36px → 4px padding each side → font size 18.
 inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
     static constexpr int LOGO_SIZE = 18;
-    // gap top=432, gap bottom=468, centred baseline:
-    static constexpr int LOGO_Y    = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1;
+    // gap top=432, gap bottom=468, centred baseline — shifted by g_render_y_offset
+    // in free overlay mode (e.g. 458 - 107 = 351 in free mode).
+    const int LOGO_Y = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1 + g_render_y_offset;
 
     static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
 
@@ -845,8 +855,8 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
 // fills, and logo as one cohesive unit.
 inline void render_gb_border(tsl::gfx::Renderer* renderer) {
     static constexpr tsl::Color BORDER{0x3, 0x3, 0x3, 0xF};
-    renderer->drawRect(VP_X - 1, VP_Y - 1,    VP_W + 2, 1,    BORDER);  // top
-    renderer->drawRect(VP_X - 1, VP_Y + VP_H, VP_W + 2, 1,    BORDER);  // bottom
-    renderer->drawRect(VP_X - 1, VP_Y,        1,        VP_H, BORDER);  // left
-    renderer->drawRect(VP_X + VP_W, VP_Y,     1,        VP_H, BORDER);  // right
+    renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);  // top
+    renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);  // bottom
+    renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);  // left
+    renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);  // right
 }

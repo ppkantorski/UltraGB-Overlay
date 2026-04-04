@@ -197,6 +197,7 @@ static void run_once_setup(bool& runOnce, bool& restoreHapticState) {
     }
     if (g_self_path[0])
         returnOverlayPath = std::string(g_self_path);
+    
     runOnce = false;
 }
 
@@ -319,6 +320,20 @@ static void save_win_output() {
 static void save_win_scale() {
     const char s[2] = { static_cast<char>('0' + g_win_scale), '\0' };
     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinScale, s, "");
+}
+
+// Persist the free-overlay position toggle to config.ini.
+static void save_ovl_free_mode() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlFreeMode,
+                         g_overlay_free_mode ? "1" : "0", "");
+}
+
+// Persist the free-overlay layer position (VI coordinates) to config.ini.
+static void save_ovl_free_pos() {
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlFreePosX,
+                         ult::to_string(g_ovl_free_pos_x), "");
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlFreePosY,
+                         ult::to_string(g_ovl_free_pos_y), "");
 }
 
 // =============================================================================
@@ -952,12 +967,35 @@ static void launch_overlay_mode(const char* romPath) {
     tsl::Overlay::get()->close();
 }
 
-// Exit UI audio, mark last-played, then launch in windowed or overlay mode.
+// Relaunch with -freeoverlay <romPath> — trimmed, repositionable overlay.
+// The new process detects -freeoverlay and sets DefaultFramebufferHeight=613
+// before Tesla initialises, giving a 448×613 layer that floats freely.
+static void launch_free_overlay_mode(const char* romPath) {
+    if (!g_self_path[0]) return;
+
+    ult::launchingOverlay.store(true, std::memory_order_release);
+    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, romPath, "");
+    if (g_settings_scroll[0])
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                             g_settings_scroll, "");
+    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-freeoverlay");
+    if (g_directMode)
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+
+    skipRumbleDoubleClick = true;
+    tsl::Overlay::get()->close();
+}
+
+// Exit UI audio, mark last-played, then launch in windowed, free-overlay, or overlay mode.
 [[gnu::noinline]]
 static bool launch_game(const char* romPath) {
     audio_exit_if_enabled();
     save_last_rom(romPath);
     if (launch_windowed_mode(romPath)) return true;
+    if (g_overlay_free_mode) {
+        launch_free_overlay_mode(romPath);
+        return true;
+    }
     launch_overlay_mode(romPath);
     return true;
 }
@@ -1024,7 +1062,9 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                                    u32 skip_row_start,
                                    u32 skip_row_end,
                                    u32 skip_grp_start,
-                                   u32 skip_grp_end) {
+                                   u32 skip_grp_end,
+                                   u32 src_row_offset,
+                                   u32 fb_height) {
     // ── Same entry guards as Renderer::drawWallpaper() ──────────────────────
     if (!ult::expandedMemory || ult::refreshWallpaper.load(std::memory_order_acquire)) return;
 
@@ -1032,7 +1072,9 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 
     if (!ult::wallpaperData.empty() &&
         !ult::refreshWallpaper.load(std::memory_order_acquire) &&
-        ult::correctFrameSize)
+        // correctFrameSize is false for the 448×613 free-overlay framebuffer;
+        // bypass the check when src_row_offset > 0 (free-overlay call site).
+        (ult::correctFrameSize || src_row_offset > 0u))
     {
         // ── Static precomputed offset tables ─────────────────────────────────
         // yParts[y]       : y-contribution to the block-linear framebuffer offset.
@@ -1103,7 +1145,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
         const u32 mid_row_work = skip_grp_start + (kGW - skip_grp_end);
         const u32 total_work   = skip_row_start * kGW
                                + (skip_row_end - skip_row_start) * mid_row_work
-                               + (kH - skip_row_end) * kGW;
+                               + (fb_height - skip_row_end) * kGW;
         const u32 target       = (total_work + numThreads - 1u) / numThreads;
 
         // thread_starts[t] / thread_starts[t+1] are the row range for thread t.
@@ -1112,11 +1154,11 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
         thread_starts[0] = 0u;
         {
             u32 cum = 0u, ti = 1u;
-            for (u32 y = 0u; y < kH && ti < numThreads; ++y) {
+            for (u32 y = 0u; y < fb_height && ti < numThreads; ++y) {
                 cum += (y >= skip_row_start && y < skip_row_end) ? mid_row_work : kGW;
                 if (cum >= ti * target) thread_starts[ti++] = y + 1u;
             }
-            thread_starts[numThreads] = kH;
+            thread_starts[numThreads] = fb_height;
         }
 
         for (u32 t = 0u; t < numThreads; ++t) {
@@ -1212,7 +1254,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 top_end   = std::min(rowEnd, skip_row_start);
                     for (u32 y = rowStart; y < top_end; ++y) {
                         const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + y * (kW * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
                         for (u32 g = 0u; g < kGW; ++g) do_group(yPart, rs, g);
                     }
 
@@ -1220,7 +1262,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 mid_end   = std::min(rowEnd,   skip_row_end);
                     for (u32 y = mid_start; y < mid_end; ++y) {
                         const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + y * (kW * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
                         for (u32 g = 0u;           g < skip_grp_start; ++g) do_group(yPart, rs, g);
                         for (u32 g = skip_grp_end; g < kGW;            ++g) do_group(yPart, rs, g);
                     }
@@ -1228,7 +1270,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 bot_start = std::max(rowStart, skip_row_end);
                     for (u32 y = bot_start; y < rowEnd; ++y) {
                         const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + y * (kW * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
                         for (u32 g = 0u; g < kGW; ++g) do_group(yPart, rs, g);
                     }
 

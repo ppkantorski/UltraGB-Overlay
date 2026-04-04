@@ -47,10 +47,12 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
 
 // draw_wallpaper_direct is defined in gb_utils.hpp, which is included after
 // this header in main.cpp.  Forward-declare for the same reason.
-// Default parameters produce a full-screen blit with no skip region.
+// Default arguments are specified here (on the declaration) per C++ rules —
+// the definition in gb_utils.hpp must NOT repeat them.
 static void draw_wallpaper_direct(tsl::gfx::Renderer*,
                                    u32 = 720u, u32 = 720u,
-                                   u32 = 0u,   u32 = 0u);
+                                   u32 = 0u,   u32 = 0u,
+                                   u32 = 0u,   u32 = 720u);
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
