@@ -886,6 +886,16 @@ public:
             gb_audio_pause();
 
             launchComboHasTriggered.store(true, std::memory_order_release);
+
+            // Genuine exit from player mode via the main combo.
+            // ALWAYS reset the settings scroll — unconditional, before the
+            // g_win_quick_exit / g_self_path branch.
+            // Clears g_settings_scroll[0] so exitServices() also writes nothing.
+            // Erases the INI key so any stale value from a prior session can't
+            // survive into the next -returning or cold launch.
+            g_settings_scroll[0] = '\0';
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+
             if (!g_win_quick_exit && g_self_path[0]) {
                 const std::string returnArg = g_directMode ? "-returning --direct" : "-returning";
                 tsl::setNextOverlay(std::string(g_self_path), returnArg);

@@ -2135,7 +2135,9 @@ public:
 class SettingsGui : public tsl::Gui {
     // Raw pointer into the list owned by the frame; valid for the lifetime of
     // this Gui (the slider is destroyed together with the list).
-    VolumeTrackBar*    m_vol_slider      = nullptr;
+    VolumeTrackBar*     m_vol_slider      = nullptr;
+    tsl::elm::ListItem* m_scale_item      = nullptr;  ///< "Windowed Scale" — refreshed when Windowed Docked changes.
+    tsl::elm::Element*  m_lastFocused     = nullptr;  ///< Tracks last-seen focus for update() change detection.
     u8                 m_vol             = 100;
     u8                 m_vol_backup      = 100;
     std::string        m_rom_scroll;       // ROM name to scroll to when returning to RomSelectorGui
@@ -2170,6 +2172,30 @@ public:
     // No destructor needed: Tesla deletes m_topElement (frame) →
     // ~UltraGBOverlayFrame deletes m_contentElement (list) →
     // ~List deletes all items.
+
+    // -----------------------------------------------------------------------
+    // update() — called every frame by Tesla.
+    //
+    // Keeps g_settings_scroll continuously in sync with whatever item is
+    // currently focused.  This ensures that if the overlay process is
+    // terminated by an external event (e.g. the mode combo fires Tesla's
+    // own relaunch while the user is mid-browse), exitServices() can write
+    // the correct focused-item label to the INI transient key — even if the
+    // user never pressed LEFT to navigate back to the ROM selector.
+    //
+    // Only updated when focus actually changes (pointer comparison) so the
+    // common case (no movement) costs a single branch and two pointer loads.
+    // -----------------------------------------------------------------------
+    virtual void update() override {
+        auto* focused = getFocusedElement();
+        if (focused && focused != m_lastFocused) {
+            m_lastFocused = focused;
+            const std::string label = (focused == m_vol_slider)
+                ? "Game Boy"
+                : static_cast<tsl::elm::ListItem*>(focused)->getText();
+            set_settings_scroll(label.c_str());
+        }
+    }
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
@@ -2238,24 +2264,29 @@ public:
                 const std::string full = std::string(g_rom_dir) + g_last_rom_path;
                 return get_rom_size(full.c_str()) < kROM_4MB;
             }();
-            const bool can6x   = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
-            const int maxScale = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (can6x ? 6 : 5));
-
-            auto make_label = [maxScale]() -> std::string {
-                const int s = std::min(g_win_scale, maxScale);
+            // make_label captures only romSmall (stable for the session) and
+            // recomputes can6x / maxScale on every call so the displayed value
+            // stays correct if g_win_1080 changes via the Windowed Docked toggle.
+            auto make_label = [romSmall]() -> std::string {
+                const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
+                const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                const int s = std::min(g_win_scale, ms_);
                 static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x"};
                 return lbs[s - 1];
             };
 
             auto* scale_item = new tsl::elm::ListItem("Windowed Scale", make_label());
-            scale_item->setClickListener([scale_item, maxScale, make_label](u64 keys) -> bool {
+            scale_item->setClickListener([scale_item, romSmall, make_label](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                const int cur = std::min(g_win_scale, maxScale);
-                g_win_scale   = (cur % maxScale) + 1;
+                const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
+                const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                const int cur = std::min(g_win_scale, ms_);
+                g_win_scale   = (cur % ms_) + 1;
                 save_win_scale();
                 scale_item->setValue(make_label());
                 return true;
             });
+            m_scale_item = scale_item;
             list->addItem(scale_item);
         }
 
@@ -2269,11 +2300,25 @@ public:
         {
             auto* out_item = new tsl::elm::ListItem("Windowed Docked",
                                                      g_win_1080 ? "1080p" : "720p");
-            out_item->setClickListener([out_item](u64 keys) -> bool {
+            out_item->setClickListener([this, out_item](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
                 g_win_1080 = !g_win_1080;
                 save_win_output();
                 out_item->setValue(g_win_1080 ? "1080p" : "720p");
+                // Sync the Windowed Scale display — the effective maxScale may have
+                // changed (e.g. 1080p+docked unlocks 6×, 720p caps at 5×).
+                // g_win_scale (the stored INI intent) is never touched here; only the
+                // visible label is corrected so the user sees the value that would
+                // actually take effect on the next windowed launch.
+                if (m_scale_item) {
+                    const bool rs = ult::furtherExpandedMemory ? true
+                                  : (g_last_rom_path[0] && get_rom_size(
+                                         (std::string(g_rom_dir) + g_last_rom_path).c_str()) < kROM_4MB);
+                    const bool c6  = ult::expandedMemory && poll_console_docked() && g_win_1080 && rs;
+                    const int  ms  = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6 ? 6 : 5));
+                    static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
+                    m_scale_item->setValue(lbs[std::min(g_win_scale, ms) - 1]);
+                }
                 return true;
             });
             list->addItem(out_item);
@@ -2798,21 +2843,31 @@ public:
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
         }
 
-        // Restore the settings-page scroll position when returning from windowed
-        // mode.  g_returning_from_windowed is set by main() when -returning is
-        // present in argv; the transient "settings_scroll" ini key was written by
-        // launch_windowed_mode() immediately before the windowed setNextOverlay call.
+        // Restore the settings-page scroll position from the transient INI key
+        // written by launch_overlay_mode(), launch_windowed_mode(), and the
+        // combo-return paths in GBOverlayGui / GBWindowedGui before each
+        // setNextOverlay / close() call.
         //
-        // The key is always erased here regardless of the return-path flag so
-        // that an abnormal windowed exit (process killed by the OS) cannot leave
-        // a stale value that sneaks in on the next normal cold launch.
+        // The key must be restored on EVERY launch type (-overlay, -quicklaunch,
+        // -returning, cold open), not just -returning.  The multi-hop chain:
+        //
+        //   SettingsGui (scroll to "LCD Grid") → navigate left → RomSelectorGui
+        //     → click game → launch_overlay_mode() writes INI key
+        //       → -overlay process: initServices() loads key → g_settings_scroll
+        //         → game plays → combo return writes key again → -returning
+        //           → initServices() restores → SettingsGui lands at "LCD Grid"
+        //
+        // Without the unconditional load, the -overlay process reads and erases
+        // the key but leaves g_settings_scroll empty, so the value is gone by the
+        // time the user presses the combo to return.
+        //
+        // The key is always erased immediately after reading so an abnormal exit
+        // can never leave a stale value that leaks into a subsequent cold launch.
         {
             const std::string ss = ult::parseValueFromIniSection(
                 kConfigFile, kConfigSection, kKeySettingsScroll);
-            if (g_returning_from_windowed && !ss.empty()
-                    && ss.size() < sizeof(g_settings_scroll) - 1) {
+            if (!ss.empty() && ss.size() < sizeof(g_settings_scroll) - 1)
                 set_settings_scroll(ss.c_str());
-            }
             g_returning_from_windowed = false;  // consumed; clear for safety
             if (!ss.empty())
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
@@ -2826,6 +2881,24 @@ public:
     }
 
     virtual void exitServices() override {
+        // Persist the settings-page scroll position before the process exits.
+        //
+        // This catches every exit path that doesn't go through our explicit
+        // combo-return handlers — most importantly the Tesla mode-combo relaunch:
+        // when the user presses the quick-launch combo while browsing SettingsGui
+        // or RomSelectorGui, Tesla closes the overlay and relaunches it with
+        // -quicklaunch without ever touching our handleInput close paths.
+        // SettingsGui::update() keeps g_settings_scroll current with the focused
+        // item, so by the time exitServices() runs the value is always correct.
+        //
+        // The B-exit paths in SettingsGui and RomSelectorGui already clear
+        // g_settings_scroll[0] = '\0' before calling close(), so this write is a
+        // guaranteed no-op on a genuine user exit — the position resets to the
+        // top on next open exactly as intended.
+        if (g_settings_scroll[0])
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                                 g_settings_scroll, "");
+
         tsl::disableHiding = false;  // restore default; was set true in overlay overlay mode
         gb_audio_pause();
         gb_unload_rom();   // save state, write SRAM, shut down audio, free ROM buffer
@@ -2969,169 +3042,119 @@ static void setup_windowed_framebuffer() {
 }
 
 int main(int argc, char* argv[]) {
-    // Build the full path to this overlay so setNextOverlay can relaunch us.
-    // argv[0] on NX is just the bare filename (e.g. "gbemu.ovl"), NOT a full
-    // path.  All overlays live in sdmc:/switch/.overlays/ — prepend that prefix
-    // exactly as Status Monitor does with (folderpath + filename).
-    if (argc > 0) {
+    if (argc > 0)
         snprintf(g_self_path, sizeof(g_self_path),
                  "sdmc:/switch/.overlays/%s", argv[0]);
-    }
 
-    // logging directionry (for debugging)
     //ult::logFilePath    = "sdmc:/config/ultragb/log.txt";
     //ult::disableLogging = false;
     skipRumbleDoubleClick = false;
 
-    // ── Windowed launch ───────────────────────────────────────────────────────
-    // The ROM path is in config.ini under "windowed_rom" (written by the ROM
-    // click listener before calling setNextOverlay).  We only detect the flag
-    // here and set the framebuffer size; the path is read in initServices().
-    //
-    // -returning is passed by GBWindowedGui when the user exits windowed mode
-    // via the launch combo (setNextOverlay g_self_path "-returning").  It is NOT
-    // a windowed launch — tsl::loop<Overlay> runs normally — but Overlay::
-    // initServices() needs to know it should restore the persisted settings
-    // scroll position from config.ini rather than starting fresh.
-    
     const auto currentHeapSize    = ult::getCurrentHeapSize();
     const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
     const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
     const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
 
+    // ── Phase 1: parse argv into mode flags ───────────────────────────────────
+    // Launch-type args are mutually exclusive; else-if makes that explicit and
+    // ensures exactly one branch fires per token.  The loop only sets flags —
+    // all dispatch logic lives in Phase 2 below.
+    bool wantOverlayPlayer = false;
+    bool wantQuickLaunch   = false;
+    bool wantWindowed      = false;
+
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-returning") == 0) {
-            g_returning_from_windowed = true;
-            skipRumbleDoubleClick = false;
-        }
+        if      (strcmp(argv[i], "-returning")   == 0) { g_returning_from_windowed = true; skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "--direct")     == 0) { g_directMode = true;              skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "-overlay")     == 0) { g_overlay_mode = true; wantOverlayPlayer = true; skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "-quicklaunch") == 0) { g_quick_launch = true; wantQuickLaunch   = true; }
+        else if (strcmp(argv[i], "-windowed")    == 0) { wantWindowed   = true; }
+    }
 
-        if (strcmp(argv[i], "--direct") == 0) {
-            g_directMode = true;
-            skipRumbleDoubleClick = false;
-        }
+    // ── Phase 2: dispatch to the appropriate overlay loop ─────────────────────
 
-        // -overlay: relaunch into overlay overlay mode with the ROM path stored in
-        // config.ini under "overlay_rom".  Behaves like -quicklaunch but always
-        // returns to the ROM selector (via -returning relaunch) when X is pressed,
-        // and the overlay combo closes entirely.
-        if (strcmp(argv[i], "-overlay") == 0) {
-            g_overlay_mode = true;
-            skipRumbleDoubleClick = false;
-        }
+    // ── Quick-launch: windowed or player overlay fast path (-quicklaunch) ─────
+    // When a last-played ROM exists, dispatch directly into the appropriate mode.
+    //
+    //  • Windowed on  → WindowedOverlay  (avoids the RomSelector flash + restart delay)
+    //  • Windowed off → Overlay          (loadInitialGui boots GBOverlayGui directly
+    //                                     via g_quick_launch + g_last_rom_path)
+    //
+    // NOTE: rom_playability_message() cannot be used for the tooLarge check here —
+    // Tesla's memory-tier atomics are only initialised inside tsl::loop().
+    // getCurrentHeapSize() is used directly instead.
+    if (wantQuickLaunch) {
+        const std::string lastRom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyLastRom);
+        const bool        windowed = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowed) == "1";
 
-        if (strcmp(argv[i], "-quicklaunch") == 0) {
-            g_quick_launch = true;
+        if (!lastRom.empty()) {
+            std::string romDir = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyRomDir);
+            if (romDir.empty()) romDir = "sdmc:/roms/gb/";
+            if (romDir.back() != '/') romDir += '/';
+            const std::string fullPath = romDir + lastRom;
 
-            // ── Windowed quick-launch fast path ───────────────────────────────
-            // When windowed mode is configured and a last-played ROM is saved,
-            // launch WindowedOverlay directly instead of going through the
-            // Overlay → setNextOverlay → close → WindowedOverlay cycle.
-            // That cycle flashes the RomSelector placeholder and adds a full
-            // process-restart delay before the game appears.
-            {
-                const std::string wval    = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowed);
-                const std::string lastRom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyLastRom);
-                if (wval == "1" && !lastRom.empty()) {
-                    // Build full ROM path: dir (with trailing slash) + basename.
-                    std::string romDir = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyRomDir);
-                    if (romDir.empty()) romDir = "sdmc:/roms/gb/";
-                    if (romDir.back() != '/') romDir += '/';
-                    const std::string fullPath = romDir + lastRom;
+            if (windowed) {
+                // Windowed fast path — bail to normal overlay launch if the ROM
+                // is too large so the selector opens cleanly with an error notify.
+                const size_t rsz      = get_rom_size(fullPath.c_str());
+                const bool   tooLarge = rsz > 0 &&
+                    ((earlyLimited       && rsz >= kROM_2MB) ||
+                     (earlyRegularMemory && rsz >= kROM_4MB) ||
+                     (earlyExpanded      && rsz >= kROM_6MB));
 
-                    // Bail out early if the ROM is too large for the current
-                    // heap tier.  Launching WindowedOverlay only to have it
-                    // fail inside createUI causes a janky full-process-restart
-                    // cycle.  Fall through to tsl::loop<Overlay> instead so the
-                    // ROM selector opens cleanly; loadInitialGui() will show the
-                    // appropriate notify message.
-                    //
-                    // IMPORTANT: rom_playability_message() reads ult::limitedMemory,
-                    // ult::expandedMemory, and ult::furtherExpandedMemory — all of
-                    // which are set by Tesla inside tsl::loop(), which has NOT run
-                    // yet at this point in main().  They are all false by default,
-                    // so the check would incorrectly block a 4 MB ROM on an 8 MB
-                    // heap (!expandedMemory=true) and fall through to normal_overlay_
-                    // launch, causing the brief menu flash before windowed starts.
-                    // Use getCurrentHeapSize() directly instead — it queries the
-                    // real heap tier before Tesla initialises.
-                    {
-                        const size_t rsz = get_rom_size(fullPath.c_str());
-                        const bool tooLarge = rsz > 0 &&
-                                ((earlyLimited       && rsz >= kROM_2MB) ||
-                                 (earlyRegularMemory && rsz >= kROM_4MB) ||
-                                 (earlyExpanded      && rsz >= kROM_6MB));
-                        if (tooLarge)
-                            goto normal_overlay_launch;
-                    }
-
-                    // Read win_output early — load_config() has not run yet.
-                    // Must precede the win_scale clamp (6× needs g_win_1080).
+                if (!tooLarge) {
                     {
                         const std::string out_val = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput);
                         g_win_1080 = (out_val == "1080");
                     }
-
-                    // Read win_scale and clamp to the effective heap-tier maximum.
-                    // Memory tiers and limits are documented in clamp_win_scale().
-                    // The stored config value is intentionally NOT written back;
-                    // the user's intent is preserved for higher-memory sessions.
                     g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
                     clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded, fullPath.c_str());
-
-                    // Write to config so WindowedOverlay::initServices() picks
-                    // them up (it always reads from config.ini, not from globals).
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, fullPath);
                     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1");
-
-                    // Lock so WindowedOverlay::initServices() → load_config()
-                    // does not restore the raw stored win_scale over the clamped value.
                     setup_windowed_framebuffer();
                     return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
                 }
+            } else {
+                // Player overlay fast path — Overlay::loadInitialGui() picks up
+                // g_quick_launch + g_last_rom_path and boots GBOverlayGui directly.
+                return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
             }
-            // No windowed mode or no saved ROM — fall through to normal Overlay.
-        }
-
-        if (strcmp(argv[i], "-windowed") == 0) {
-            // load_config() has not run yet at this point (it runs inside
-            // WindowedOverlay::initServices(), which tsl::loop calls after
-            // the framebuffer is already created).  We must read win_scale
-            // and win_output directly so we can size and position the VI layer
-            // correctly before Tesla initialises.  Absent / invalid key → safe defaults.
-
-            // Read win_output first — the 6× scale clamp depends on it.
-            {
-                const std::string out_val = ult::parseValueFromIniSection(
-                    kConfigFile, kConfigSection, kKeyWinOutput);
-                g_win_1080 = (out_val == "1080");
-            }
-            {
-                g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(
-                    kConfigFile, kConfigSection, kKeyWinScale));
-
-                // Clamp scale to the maximum the current heap tier can support.
-                // Memory tiers and limits are documented in clamp_win_scale().
-                // The stored config value is intentionally NOT written back; the user's
-                // intent is preserved for higher-memory sessions.
-                //
-                // For the 8 MB 6× check, read the windowed ROM path that the caller
-                // wrote to config before setNextOverlay.  The key is erased in
-                // initServices() — reading it here does not consume it.
-                const std::string wrom = ult::parseValueFromIniSection(
-                    kConfigFile, kConfigSection, kKeyWindowedRom);
-                clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
-                                wrom.empty() ? nullptr : wrom.c_str());
-            }
-            // Lock g_win_scale so WindowedOverlay::initServices() → load_config()
-            // does not read the raw stored value back from config.ini and override
-            // the correctly-clamped framebuffer-matching scale set just above.
-            setup_windowed_framebuffer();
-            return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
         }
     }
 
-    // ── Normal launch ─────────────────────────────────────────────────────────
-    normal_overlay_launch:
+    // ── Explicit windowed relaunch (-windowed) ────────────────────────────────
+    // The ROM path is already in config.ini under "windowed_rom" (written by the
+    // caller before setNextOverlay).  win_output and win_scale must be read and
+    // clamped before tsl::loop() — load_config() only runs later in initServices().
+    if (wantWindowed) {
+        {
+            const std::string out_val = ult::parseValueFromIniSection(
+                kConfigFile, kConfigSection, kKeyWinOutput);
+            g_win_1080 = (out_val == "1080");
+        }
+        {
+            g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(
+                kConfigFile, kConfigSection, kKeyWinScale));
+            const std::string wrom = ult::parseValueFromIniSection(
+                kConfigFile, kConfigSection, kKeyWindowedRom);
+            clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
+                            wrom.empty() ? nullptr : wrom.c_str());
+        }
+        setup_windowed_framebuffer();
+        return tsl::loop<WindowedOverlay, tsl::impl::LaunchFlags::None>(argc, argv);
+    }
+
+    // ── Player overlay launch (-overlay) ──────────────────────────────────────
+    // launch_overlay_mode() wrote the ROM path to config.ini under "player_rom"
+    // before calling setNextOverlay with "-overlay".  initServices() reads it
+    // into g_overlay_rom_path; loadInitialGui() boots GBOverlayGui directly.
+    if (wantOverlayPlayer) {
+        return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
+    }
+
+    // ── Normal overlay launch ─────────────────────────────────────────────────
+    // Cold starts, -returning (from windowed), and -quicklaunch (windowed) with
+    // a too-large ROM all land here.
     returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";
     return tsl::loop<Overlay, tsl::impl::LaunchFlags::None>(argc, argv);
 }

@@ -24,9 +24,9 @@
 
 #pragma once
 
-// GBOverlayGui calls tsl::swapTo<RomSelectorGui>() — forward declaration is
-// sufficient because swapTo only uses the type as a template argument.
-class RomSelectorGui;
+// GBOverlayGui never calls swapTo — all navigation is done via
+// setNextOverlay + close(), exactly as GBWindowedGui does.
+// No forward declarations needed here.
 
 // -- Shared emulation clock tick ----------------------------------------------
 // Defined here so it sees the static globals declared in main.cpp:
@@ -335,7 +335,7 @@ public:
 class GBOverlayGui : public tsl::Gui {
     bool m_waitForRelease = true;  // ignore input until all buttons are released
     u64  m_prevTouchKeys  = 0;     // track previous touch state
-    bool m_load_failed    = false; // deferred load failed; swap back to selector in update()
+    bool m_load_failed    = false; // deferred load failed; relaunch as normal overlay in update()
     bool m_restoreHapticState = false;
     bool runOnce = true;
 
@@ -374,12 +374,17 @@ public:
 
     virtual void update() override {
         // Deferred load failed (OOM, bad ROM header, etc.):
-        // In all modes — including quick-launch — swap to the ROM selector so the
-        // user sees the memory-tier notification and can pick a compatible game.
-        // "Can't load → open overlay like normal" rather than silently closing.
+        // Close this process and relaunch as a plain overlay so the ROM
+        // selector opens cleanly.  Mirrors GBWindowedGui::update() exactly —
+        // no swapTo; exitServices() handles teardown (audio pause, ROM unload,
+        // DMA free) in the correct order before the new process starts.
+        // The settings scroll is preserved automatically: exitServices() writes
+        // g_settings_scroll to INI, and the fresh initServices() restores it.
         if (m_load_failed) {
             m_load_failed = false;
-            tsl::swapTo<RomSelectorGui>();
+            if (g_self_path[0])
+                tsl::setNextOverlay(std::string(g_self_path));
+            tsl::Overlay::get()->close();
         }
 
         run_once_setup(runOnce, m_restoreHapticState);
@@ -416,6 +421,31 @@ public:
                 gb_audio_pause();
     
                 launchComboHasTriggered.store(true, std::memory_order_release);
+
+                // Reset the settings scroll only for genuine exits — quick-launch
+                // and direct mode — where pressing the Ultrahand combo means
+                // "leave the app entirely / close to Ultrahand".
+                //
+                // In g_overlay_mode the same combo is the normal "back to ROM
+                // selector" action (equivalent to pressing X in non-overlay mode),
+                // so the scroll position must be preserved exactly as it is for any
+                // other return-to-selector path.  exitServices() will write the
+                // non-empty g_settings_scroll to INI, and the -returning process's
+                // initServices() will restore it so SettingsGui lands at the right
+                // item on the next RIGHT-press.
+                //
+                // Two reasons to clear (when warranted) rather than just omitting
+                // the INI write:
+                //   1. g_settings_scroll[0] = '\0' silences exitServices()'s own
+                //      write (guarded by the same flag), covering every exit path.
+                //   2. Erasing the INI key removes any stale value written by a
+                //      prior session so initServices() on the next -returning launch
+                //      finds nothing to restore.
+                if (g_quick_launch || g_directMode) {
+                    g_settings_scroll[0] = '\0';
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+                }
+
                 if (!g_directMode && g_self_path[0]) {
                     const std::string returnArg = "-returning";
                     tsl::setNextOverlay(std::string(g_self_path), returnArg);
@@ -424,45 +454,6 @@ public:
                 tsl::Overlay::get()->close();
                 return true;
             }
-        }
-
-        // ── Normal mode only: X → back to ROM picker ──────────────────────────
-        // Checked before any other work so touch mapping, tap-detector updates,
-        // haptic setup, and gb_set_input are all skipped on the exit frame.
-        // In overlay overlay mode KEY_X is a free button passed to the GB core.
-        if (!g_quick_launch && combo_pressed(keysDown, keysHeld)) {
-            g_touch_keys = 0;
-            ult::noClickableItems.store(false, std::memory_order_release);
-
-            triggerExitFeedback();
-
-            if (g_overlay_mode && g_self_path[0]) {
-                // Player mode: mirror the windowed combo exit exactly.
-                // Pause audio immediately so output stops before the process winds
-                // down; exitServices() will call gb_unload_rom() (saves state +
-                // SRAM) and gb_audio_free_dma() in the correct teardown order.
-                gb_audio_pause();
-                tsl::setNextOverlay(g_self_path, "-returning");
-                tsl::Overlay::get()->close();
-            } else {
-                // Normal in-process swap: save + unload here because the Overlay
-                // process stays alive and RomSelectorGui needs a clean slate.
-                // exitServices() is NOT called on swapTo, so we do it ourselves.
-                gb_unload_rom();  // saves state, writes SRAM, shuts down audio
-
-                if (ult::useSoundEffects && !ult::limitedMemory)
-                    ult::Audio::initialize();
-
-                jumpToTop.store(false, std::memory_order_release);
-                jumpToBottom.store(false, std::memory_order_release);
-                skipUp.store(false, std::memory_order_release);
-                skipDown.store(false, std::memory_order_release);
-                // Signal RomSelectorGui to swallow input until all keys are
-                // released — in-game button presses must not fire list jumps.
-                g_waitForInputRelease = true;
-                tsl::swapTo<RomSelectorGui>();
-            }
-            return true;
         }
 
         // ── Shared touch state — computed once, used by vp-tap and touch-keys ──
