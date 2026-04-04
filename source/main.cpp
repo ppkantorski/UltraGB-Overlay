@@ -149,7 +149,7 @@ static void write_default_config_if_missing() {
     set_if_missing("save_dir",      g_save_dir);
     set_if_missing("volume",        "50");
     set_if_missing("vol_backup",    "50");
-    set_if_missing("pixel_perfect", "0");
+    //set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
     set_if_missing("lcd_grid",      "0");
     set_if_missing("ingame_haptics", "1");
@@ -663,7 +663,7 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
 #include "gb_overlay.hpp"
 
 class RomSelectorGui;       // forward declare
-class GameConfigGui;        // forward declare
+class GameSettingsGui;      // forward declare
 class SettingsGui;          // forward declare
 class SaveStatesGui;        // forward declare
 class SlotActionGui;        // forward declare
@@ -675,7 +675,7 @@ class QuickComboSelectorGui; // forward declare
 
 // Deferred normal ROM launch: relaunch this overlay with -overlay so GBOverlayGui
 // always starts in a fresh process (no residual menu heap / glyph state).
-// All three call sites (RomSelectorGui, SlotActionGui, GameConfigGui) use this
+// All three call sites (RomSelectorGui, SlotActionGui, GameSettingsGui) use this
 // single entry point — no swapTo<GBOverlayGui> anywhere in normal flow.
 //static void launch_emulator(const char* romPath) {
 //    // Do NOT clear g_settings_scroll here — the user expects to land back on the
@@ -919,7 +919,7 @@ public:
 //
 // Each slot shows a timestamp footer (ult::OPTION_SYMBOL if empty).
 // Clicking a slot opens SaveDataSlotActionGui.
-// B returns to GameConfigGui, jumping to "Save Data".
+// B returns to GameSettingsGui, jumping to "Save Data".
 // =============================================================================
 class SaveDataGui : public tsl::Gui {
     std::string m_rom_path;
@@ -972,7 +972,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            tsl::swapTo<GameConfigGui>(m_rom_path, m_display_name, "Save Data");
+            tsl::swapTo<GameSettingsGui>(m_rom_path, m_display_name, "Save Data");
             return true;
         }
         return false;
@@ -984,7 +984,7 @@ public:
 //
 // Each slot shows a timestamp footer (ult::OPTION_SYMBOL.c_str() if empty).
 // Clicking a slot opens SlotActionGui.
-// B returns to GameConfigGui, jumping to "Save States".
+// B returns to GameSettingsGui, jumping to "Save States".
 // =============================================================================
 class SaveStatesGui : public tsl::Gui {
     std::string m_rom_path;
@@ -1037,7 +1037,7 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            tsl::swapTo<GameConfigGui>(m_rom_path, m_display_name, "Save States");
+            tsl::swapTo<GameSettingsGui>(m_rom_path, m_display_name, "Save States");
             return true;
         }
         return false;
@@ -1045,7 +1045,7 @@ public:
 };
 
 // =============================================================================
-// GameConfigGui — per-game configuration screen
+// GameSettingsGui — per-game settings screen
 //
 // Opened by pressing Y on a ROM entry in RomSelectorGui.
 //
@@ -1055,15 +1055,15 @@ public:
 //   • "Save States" — opens SaveStatesGui with 10 named slots
 //   • "Reset"       — cold-boots the game (deletes internal state first)
 //
-// Header: "Configure ◆ <GAMENAME>"
+// Header: "Settings ◆ <GAMENAME>"
 // B returns to RomSelectorGui.
 // =============================================================================
-class GameConfigGui : public tsl::Gui {
+class GameSettingsGui : public tsl::Gui {
     std::string m_rom_path;
     std::string m_display_name;
     std::string m_jump_to;   // item label to restore scroll on re-entry
 public:
-    GameConfigGui(std::string romPath, std::string displayName, std::string jumpTo = "")
+    GameSettingsGui(std::string romPath, std::string displayName, std::string jumpTo = "")
         : m_rom_path(std::move(romPath))
         , m_display_name(std::move(displayName))
         , m_jump_to(std::move(jumpTo))
@@ -1738,6 +1738,24 @@ public:
 };
 
 // =============================================================================
+// strip_rom_extension
+//
+// Returns the ROM basename with its file extension removed for display purposes.
+// Strips ".gb" and ".gbc" (case-insensitive).  The original filename (with
+// extension) is still used for all path operations; this affects display only.
+// =============================================================================
+static std::string strip_rom_extension(const char* name) {
+    std::string s(name);
+    const size_t dot = s.rfind('.');
+    if (dot == std::string::npos) return s;
+    std::string ext = s.substr(dot);
+    for (char& c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (ext == ".gb" || ext == ".gbc")
+        s.erase(dot);
+    return s;
+}
+
+// =============================================================================
 // RomSelectorGui — left page (ROM picker)
 //
 // Each visit constructs a fresh list as a local in createUI() and hands it to
@@ -1784,7 +1802,7 @@ public:
         // Static: ult::DIVIDER_SYMBOL is set once at startup and never changes,
         // so this concatenation only needs to run on the very first createUI() call.
         static const std::string kRomListHeader =
-            "Game Boy Games " + ult::DIVIDER_SYMBOL + " \uE0E3 Configure";
+            "Game Boy Games " + ult::DIVIDER_SYMBOL + " \uE0E3 Settings";
         list->addItem(new tsl::elm::CategoryHeader(kRomListHeader));
 
         // ── ROM list via scandir — no std::vector, no full-path string per entry ──
@@ -1806,7 +1824,7 @@ public:
                 });
             list->addItem(empty, 200);
         } else {
-            // If returning from GameConfigGui, m_jump_to holds the configured ROM's
+            // If returning from GameSettingsGui, m_jump_to holds the configured ROM's
             // basename so we land back on it.  On first open (m_jump_to empty) we
             // scroll to the last-played (inProgress) entry instead.
             const std::string& jumpLabel = m_jump_to;
@@ -1826,27 +1844,29 @@ public:
                 const bool playable   = rom_is_playable(fullPath);
                 const bool inProgress = isLast && playable;
 
-                if (inProgress && inProgressLabel.empty())
-                    inProgressLabel = name;
+                // Strip extension for display — path reconstruction still uses `name`.
+                const std::string displayStr = strip_rom_extension(name);
 
-                auto* item = new tsl::elm::SilentListItem(name, inProgress ? ult::INPROGRESS_SYMBOL : "", true);
+                if (inProgress && inProgressLabel.empty())
+                    inProgressLabel = displayStr;
+
+                auto* item = new tsl::elm::SilentListItem(displayStr.c_str(), inProgress ? ult::INPROGRESS_SYMBOL : "", true);
                 if (!playable)
                     item->setTextColor(tsl::warningTextColor);
 
-                // Capture only the basename (≤255 bytes) inline in the closure.
-                // Full path is reconstructed onto the stack at click time only —
-                // zero extra heap per ROM during list construction.
+                // Capture the basename WITH extension for path reconstruction, and
+                // the stripped display string for UI labels and scroll restoration.
                 const std::string romNameStr(name);
                 
-                item->setClickListener([romNameStr, playable](u64 keys) -> bool {
+                item->setClickListener([romNameStr, displayStr, playable](u64 keys) -> bool {
                     char p[PATH_BUFFER_SIZE];
                     snprintf(p, sizeof(p), "%s%s", g_rom_dir, romNameStr.c_str());
-                    strncpy(g_rom_selector_scroll, romNameStr.c_str(), sizeof(g_rom_selector_scroll) - 1);
+                    strncpy(g_rom_selector_scroll, displayStr.c_str(), sizeof(g_rom_selector_scroll) - 1);
                     g_rom_selector_scroll[sizeof(g_rom_selector_scroll) - 1] = '\0';
                     if (keys & KEY_Y) {
                         triggerRumbleClick.store(true, std::memory_order_release);
                         triggerSettingsSound.store(true, std::memory_order_release);
-                        tsl::swapTo<GameConfigGui>(p, romNameStr);
+                        tsl::swapTo<GameSettingsGui>(p, displayStr);
                         return true;
                     }
                     if (!(keys & KEY_A)) return false;
@@ -1868,9 +1888,9 @@ public:
         }
 
         // ── Frame ────────────────────────────────────────────────────────
-        // Footer: right-arrow "Settings" button.
+        // Footer: right-arrow "Config" button.
         // frame takes ownership of list; Tesla takes ownership of frame.
-        auto* frame = new UltraGBOverlayFrame("", "Settings");
+        auto* frame = new UltraGBOverlayFrame("", "Configure");
         frame->setContent(list);
         return frame;
     }
@@ -1900,7 +1920,7 @@ public:
         }
 
         // simulatedNextPage fires when the user taps the footer page button.
-        // On the Games page the footer shows right-arrow "Settings".
+        // On the Games page the footer shows right-arrow "Config".
         const bool simulatedNext = ult::simulatedNextPage.exchange(
             false, std::memory_order_acq_rel);
         const bool sliderActive = ult::allowSlide.load(std::memory_order_acquire);
