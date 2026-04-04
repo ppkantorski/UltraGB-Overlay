@@ -1,9 +1,19 @@
 ##################################################################################
-# Makefile for GB Emulator Overlay
-# Based on Tetris Overlay by ppkantorski
+# Makefile for UltraGB Overlay
+# Author: ppkantorski
+# Description:
+#   This Makefile is used to build the UltraGB Overlay homebrew application for
+#   Nintendo Switch.
 #
-# GitHub: https://github.com/ppkantorski/Tetris-Overlay (reference)
+#   For more details and usage instructions, please refer to the project's
+#   documentation and README.md.
+#
+#   GitHub Repository: https://github.com/ppkantorski/UltraGB-Overlay
+#
+# Licensed under GPLv2
+# Copyright (c) 2026 ppkantorski
 ##################################################################################
+
 
 .SUFFIXES:
 
@@ -17,7 +27,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.7.0
+APP_VERSION := 0.7.1
 TARGET      := ultragb
 BUILD       := build
 SOURCES     := source
