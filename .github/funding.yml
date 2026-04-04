@@ -1,0 +1,14 @@
+################################################################################
+# FUNDING.yml for Ultrahand-GB Repository
+# Author: ppkantorski
+# Description:
+#   This FUNDING.yml file is used to configure the sponsor button for the UltraGB
+#   repository on GitHub. It specifies the supported funding model platforms and their
+#   respective account information.
+#
+#   GitHub Repository: https://github.com/ppkantorski/UltraGB-Overlay
+#
+################################################################################
+
+github: ppkantorski
+ko_fi: ppkantorski
