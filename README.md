@@ -158,7 +158,7 @@ ROMs that exceed the current tier's playable size are shown in the selector with
 ## Requirements
 
 - Nintendo Switch with [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) custom firmware
-- [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay) and [nx-ovlloader v2.0.0+](https://github.com/ppkantorski/nx-ovlloader) installed
+- [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay) and [nx-ovlloader v2.0.0](https://github.com/ppkantorski/nx-ovlloader) installed
 - ROMs in `.gb` or `.gbc` format placed anywhere accessible on the SD card
 
 ---
