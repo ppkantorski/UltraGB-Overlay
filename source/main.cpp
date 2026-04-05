@@ -161,10 +161,12 @@ static void load_config() {
         if (!v.empty()) g_overlay_free_mode = (v == "1");
     }
 
-    // ovl_free_pos_x / ovl_free_pos_y — free-overlay layer position in VI space
+    // ovl_free_pos_x — VI-space X.  ovl_free_pos_y — render row offset (0..OVL_FREE_TOP_TRIM).
+    // Old saves stored VI-space Y (0..126); clamping to OVL_FREE_TOP_TRIM migrates them safely.
     { int v = 0;
       if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreePosX), v)) g_ovl_free_pos_x = v;
-      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreePosY), v)) g_ovl_free_pos_y = v; }
+      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlFreePosY), v))
+          g_ovl_free_pos_y = std::max(0, std::min((int)OVL_FREE_TOP_TRIM, v)); }
 }
 
 // Write a config key with its default value only when the key is absent.
@@ -191,7 +193,7 @@ static void write_default_config_if_missing() {
     set_if_missing("win_output",    "720");
     set_if_missing("ovl_free_mode", "0");
     set_if_missing("ovl_free_pos_x","0");
-    set_if_missing("ovl_free_pos_y","126");
+    set_if_missing("ovl_free_pos_y","84");
 }
 
 // The following functions were moved to gb_utils.hpp:
@@ -2407,9 +2409,13 @@ static void clamp_win_scale(bool earlyLimited, bool earlyRegularMemory,
 // main() — the 4-line block was identical at both sites.
 static void setup_windowed_framebuffer() {
     g_win_scale_locked             = true;
-    ult::DefaultFramebufferWidth   = GB_W * g_win_scale;
-    ult::DefaultFramebufferHeight  = GB_H * g_win_scale;
+    ult::DefaultFramebufferWidth   = static_cast<u32>(GB_W * g_win_scale);
+    // windowedLayerPixelPerfect must be resolved BEFORE win_fb_height() so the
+    // half-screen height uses the correct base (720 for 720p, 1080 for 1080p).
     ult::windowedLayerPixelPerfect = g_win_1080 && poll_console_docked();
+    // Anchor mode (top vs bottom) is computed dynamically from g_win_pos_y each
+    // frame via anchor_bottom() in gb_windowed.hpp — no session flag needed.
+    ult::DefaultFramebufferHeight  = static_cast<u32>(win_fb_height());
 }
 
 // =============================================================================
@@ -2537,7 +2543,19 @@ int main(int argc, char* argv[]) {
         const std::string wrom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowedRom);
         clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
                         wrom.empty() ? nullptr : wrom.c_str());
-        setup_windowed_framebuffer();   // sets g_win_scale_locked = true
+        // Read the saved window Y position now so setup_windowed_framebuffer()
+        // so g_win_pos_y is populated before setup_windowed_framebuffer() and createUI().
+        // centre).  X is also read here for consistency; load_config() will
+        // re-read both later but g_win_scale_locked prevents it from clobbering
+        // the stored value.  parse_uint leaves globals at their defaults (0)
+        // on empty/invalid string, which is a safe top-anchor position.
+        { int v = 0;
+          if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosX), v))
+              g_win_pos_x = v;
+          if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosY), v))
+              g_win_pos_y = v; }
+        g_win_limited_fb = (earlyLimited && g_win_scale == 3);  // simple FB: only scale 3 on 4MB heap needs this
+        setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 
     } else if (session == SessionType::FreeOverlayPlayer) {
         // Free overlay: 448×OVL_FREE_FB_H framebuffer, windowed-style floating

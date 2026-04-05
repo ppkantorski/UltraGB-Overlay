@@ -1057,6 +1057,198 @@ static bool launch_game(const char* romPath) {
 // Threading: identical to drawBitmapRGBA4444 — ult::numThreads threads,
 // each calling ult::inPlotBarrier.arrive_and_wait() before joining.
 // =============================================================================
+// ── Wallpaper / transparent-row swizzle tables for the fixed 448×720 FB ──────
+// Shared between draw_wallpaper_direct (wallpaper blending) and
+// clear_fb_rows_transparent_448 (direct zero-write for transparent rows).
+//
+// Pre-computed once on first use; total static storage: 720×4 + 56×4 = 3,104 B.
+// OWV = ((448/2) >> 4) << 3 = 112 — same constant as in gb_renderer.h.
+static constexpr u32 kWP_W  = 448u;
+static constexpr u32 kWP_H  = 720u;
+static constexpr u32 kWP_GW = kWP_W / 8u;   // 56 groups of 8 pixels per row
+
+static u32  s_wp_yParts[kWP_H];             // y-contribution to block-linear offset
+static u32  s_wp_xGroupParts[kWP_GW];       // x-contribution for start of each group
+static bool s_wp_tables_ready = false;
+
+static void init_wallpaper_swizzle_tables() {
+    if (__builtin_expect(s_wp_tables_ready, 1)) return;
+    static constexpr u32 kOWV = 112u;       // ((448/2)>>4)<<3 — constant for 448-wide FB
+    for (u32 y = 0u; y < kWP_H; ++y) {
+        s_wp_yParts[y] = ((((y & 127u) >> 4u) + ((y >> 7u) * kOWV)) << 9u)
+                       + ((y & 8u) << 5u) + ((y & 6u) << 4u) + ((y & 1u) << 3u);
+    }
+    for (u32 g = 0u; g < kWP_GW; ++g) {
+        const u32 x     = g * 8u;
+        // (x & 7) == 0 always (x is a multiple of 8) → last term is 0.
+        s_wp_xGroupParts[g] = ((x >> 5u) << 12u) + ((x & 16u) << 3u) + ((x & 8u) << 1u);
+    }
+    s_wp_tables_ready = true;
+}
+
+// clear_fb_rows_transparent_448
+//
+// Write RGBA4444 = 0x0000 (fully transparent) to every pixel in rows
+// [y_start, y_end) of the 448-wide overlay framebuffer, bypassing Tesla's
+// blend formula (which cannot produce alpha = 0 via drawRect — a colour with
+// a=0 blends as: out = dst × 1 + src × 0 = dst unchanged).
+//
+// Uses 8-pixel NEON stores into the block-linear swizzle addresses —
+// identical pattern to draw_wallpaper_direct.  For the worst-case 84 rows:
+//   84 × 56 groups × 1 vst1q_u16 = 4,704 stores ≈ < 5 µs on Cortex-A57.
+[[gnu::noinline]]
+static void clear_fb_rows_transparent_448(tsl::gfx::Renderer* renderer,
+                                           u32 y_start, u32 y_end) {
+    if (y_start >= y_end) return;
+    init_wallpaper_swizzle_tables();
+    auto* const      fb    = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+    const uint16x8_t vzero = vdupq_n_u16(0u);
+    for (u32 y = y_start; y < y_end; ++y) {
+        const u32 yp = s_wp_yParts[y];
+        for (u32 g = 0u; g < kWP_GW; ++g)
+            vst1q_u16(fb + yp + s_wp_xGroupParts[g], vzero);
+    }
+}
+
+// =============================================================================
+// kOvlCorner — R=10 quarter-circle corner mask (31 pixels per corner).
+//
+// For a corner at (corner_x, corner_y) with arc centre at (R, R) = (10,10)
+// inside the corner, a pixel at offset (dx, dy) from the corner is OUTSIDE
+// the arc when: (R − dx)² + (R − dy)² > R² = 100.
+// Those pixels must be transparent (zero) for the rounded look.
+//
+// Computed by scanning dx,dy ∈ [0, R-1] = [0, 9]:
+//   dy=0 : dx 0-9  all outside  (10px) — (10)²+(10-dx)² always > 100
+//   dy=1 : dx 0-5  outside      ( 6px) — (9)²+(10-dx)² > 100 for dx≤5
+//   dy=2 : dx 0-3  outside      ( 4px) — (8)²+(10-dx)² > 100 for dx≤3
+//   dy=3 : dx 0-2  outside      ( 3px) — (7)²+(10-dx)² > 100 for dx≤2
+//   dy=4 : dx 0-1  outside      ( 2px) — (6)²+(10-dx)² > 100 for dx≤1
+//   dy=5 : dx 0-1  outside      ( 2px) — (5)²+(10-dx)² > 100 for dx≤1
+//   dy=6 : dx 0    outside      ( 1px) — (4)²+(10-0)²=116 > 100
+//   dy=7 : dx 0    outside      ( 1px) — (3)²+(10-0)²=109 > 100
+//   dy=8 : dx 0    outside      ( 1px) — (2)²+(10-0)²=104 > 100
+//   dy=9 : dx 0    outside      ( 1px) — (1)²+(10-0)²=101 > 100
+//   Total: 31 pixels per corner × 4 corners = 124 scalar writes.
+// =============================================================================
+struct OvlCornerPx { int8_t dx, dy; };
+static constexpr OvlCornerPx kOvlCorner[31] = {
+    {0,0},{1,0},{2,0},{3,0},{4,0},{5,0},{6,0},{7,0},{8,0},{9,0},  // dy=0
+    {0,1},{1,1},{2,1},{3,1},{4,1},{5,1},                           // dy=1
+    {0,2},{1,2},{2,2},{3,2},                                        // dy=2
+    {0,3},{1,3},{2,3},                                              // dy=3
+    {0,4},{1,4},                                                    // dy=4
+    {0,5},{1,5},                                                    // dy=5
+    {0,6},{0,7},{0,8},{0,9}                                         // dy=6-9
+};
+
+// =============================================================================
+// clear_ovl_corners_448
+//
+// Zero the 31 pixels per corner (124 total) that lie outside the R=10 arc,
+// making them fully transparent so the compositor shows the game behind.
+// Operates directly on the block-linear framebuffer via the swizzle LUTs.
+// Cost: 124 scalar 16-bit stores — ~125 ns on Cortex-A57.
+//
+// Must be called AFTER fillScreen / wallpaper so those writes don't undo it.
+// render_ovl_free_border() draws arc border pixels on top immediately after.
+// =============================================================================
+[[gnu::noinline]]
+static void clear_ovl_corners_448(uint16_t* const fb, int fb_top, int fb_bot) {
+    init_wallpaper_swizzle_tables();
+    static constexpr int fbW = static_cast<int>(kWP_W);  // 448
+    for (int i = 0; i < 31; ++i) {
+        const int dx = kOvlCorner[i].dx;
+        const int dy = kOvlCorner[i].dy;
+        const int rx = fbW - 1 - dx;  // mirrored x for right-side corners
+        // Block-linear address: yPart + xGroupPart + within-group offset.
+        // Groups are 8 pixels wide; dx ∈ [0,9] → groups 0-1; rx ∈ [438,447] → groups 54-55.
+        const u32 xp_l = s_wp_xGroupParts[dx >> 3] + static_cast<u32>(dx & 7);
+        const u32 xp_r = s_wp_xGroupParts[rx >> 3] + static_cast<u32>(rx & 7);
+        // Top-left and top-right
+        const u32 yp_t = s_wp_yParts[static_cast<u32>(fb_top + dy)];
+        fb[yp_t + xp_l] = 0u;
+        fb[yp_t + xp_r] = 0u;
+        // Bottom-left and bottom-right
+        const u32 yp_b = s_wp_yParts[static_cast<u32>(fb_bot - 1 - dy)];
+        fb[yp_b + xp_l] = 0u;
+        fb[yp_b + xp_r] = 0u;
+    }
+}
+
+// =============================================================================
+// render_ovl_free_border
+//
+// Rounded-corner 1-pixel border for the free-overlay content region, R=10.
+// Straight edges shortened by R at each end; arc pixels fill the curve.
+//
+// Arc pixel positions come from the midpoint (Bresenham) circle algorithm
+// centered at (R,R)=(10,10) from each corner, radius R=10.
+//
+// Running the algorithm (d=3-2R=-17, start x=10 y=0):
+//   Second octant → corner (dx,dy): (9,0),(8,0),(7,0),(6,1),(5,1),(4,2),(3,3)
+//   First  octant → corner (dx,dy): (2,4),(1,5),(1,6),(0,7),(0,8),(0,9)
+//
+// Merged into minimal drawRect calls per corner:
+//   dy=0   → dx=7,8,9      (width-3 rect — connects to straight top/bottom edge)
+//   dy=1   → dx=5,6        (width-2 rect)
+//   dy=2   → dx=4          (1×1)
+//   dy=3   → dx=3          (1×1)
+//   dy=4   → dx=2          (1×1)
+//   dy=5,6 → dx=1          (height-2 rect)
+//   dy=7–9 → dx=0          (height-3 rect — connects to straight left/right edge)
+// 7 arc calls × 4 corners + 4 straight = 32 drawRect calls total.
+// =============================================================================
+[[gnu::noinline]]
+static void render_ovl_free_border(tsl::gfx::Renderer* renderer,
+                                    int fb_top, int fb_bot, tsl::Color col) {
+    static constexpr int R   = 10;
+    const int fbw = static_cast<int>(tsl::cfg::FramebufferWidth);  // 448
+    const int cnt = fb_bot - fb_top;
+
+    // Straight edges — shortened by R at each end so they meet the arc cleanly.
+    renderer->drawRect(R,       fb_top,       fbw - 2*R, 1,         col);  // top
+    renderer->drawRect(R,       fb_bot - 1,   fbw - 2*R, 1,         col);  // bottom
+    renderer->drawRect(0,       fb_top + R,   1,         cnt - 2*R, col);  // left
+    renderer->drawRect(fbw - 1, fb_top + R,   1,         cnt - 2*R, col);  // right
+
+    // ── Top-left arc ──────────────────────────────────────────────────────────
+    renderer->drawRect(7,  fb_top,     3, 1, col);  // dy=0 : dx=7,8,9
+    renderer->drawRect(5,  fb_top + 1, 2, 1, col);  // dy=1 : dx=5,6
+    renderer->drawRect(4,  fb_top + 2, 1, 1, col);  // dy=2 : dx=4
+    renderer->drawRect(3,  fb_top + 3, 1, 1, col);  // dy=3 : dx=3
+    renderer->drawRect(2,  fb_top + 4, 1, 1, col);  // dy=4 : dx=2
+    renderer->drawRect(1,  fb_top + 5, 1, 2, col);  // dy=5,6 : dx=1
+    renderer->drawRect(0,  fb_top + 7, 1, 3, col);  // dy=7–9 : dx=0
+
+    // ── Top-right arc (mirror x: rx = fbw-1-dx) ───────────────────────────────
+    renderer->drawRect(fbw - 10, fb_top,     3, 1, col);  // dy=0 : rx=438,439,440
+    renderer->drawRect(fbw - 7,  fb_top + 1, 2, 1, col);  // dy=1 : rx=441,442
+    renderer->drawRect(fbw - 5,  fb_top + 2, 1, 1, col);  // dy=2 : rx=443
+    renderer->drawRect(fbw - 4,  fb_top + 3, 1, 1, col);  // dy=3 : rx=444
+    renderer->drawRect(fbw - 3,  fb_top + 4, 1, 1, col);  // dy=4 : rx=445
+    renderer->drawRect(fbw - 2,  fb_top + 5, 1, 2, col);  // dy=5,6 : rx=446
+    renderer->drawRect(fbw - 1,  fb_top + 7, 1, 3, col);  // dy=7–9 : rx=447
+
+    // ── Bottom-left arc (mirror y: ry = fb_bot-1-dy) ─────────────────────────
+    renderer->drawRect(7,  fb_bot - 1,  3, 1, col);  // dy=0
+    renderer->drawRect(5,  fb_bot - 2,  2, 1, col);  // dy=1
+    renderer->drawRect(4,  fb_bot - 3,  1, 1, col);  // dy=2
+    renderer->drawRect(3,  fb_bot - 4,  1, 1, col);  // dy=3
+    renderer->drawRect(2,  fb_bot - 5,  1, 1, col);  // dy=4
+    renderer->drawRect(1,  fb_bot - 7,  1, 2, col);  // dy=5,6
+    renderer->drawRect(0,  fb_bot - 10, 1, 3, col);  // dy=7–9
+
+    // ── Bottom-right arc (mirror x and y) ────────────────────────────────────
+    renderer->drawRect(fbw - 10, fb_bot - 1,  3, 1, col);
+    renderer->drawRect(fbw - 7,  fb_bot - 2,  2, 1, col);
+    renderer->drawRect(fbw - 5,  fb_bot - 3,  1, 1, col);
+    renderer->drawRect(fbw - 4,  fb_bot - 4,  1, 1, col);
+    renderer->drawRect(fbw - 3,  fb_bot - 5,  1, 1, col);
+    renderer->drawRect(fbw - 2,  fb_bot - 7,  1, 2, col);
+    renderer->drawRect(fbw - 1,  fb_bot - 10, 1, 3, col);
+}
+
 [[gnu::noinline]]
 static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                                    u32 skip_row_start,
@@ -1064,7 +1256,8 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                                    u32 skip_grp_start,
                                    u32 skip_grp_end,
                                    u32 src_row_offset,
-                                   u32 fb_height) {
+                                   u32 fb_height,
+                                   u32 fb_y_start) {
     // ── Same entry guards as Renderer::drawWallpaper() ──────────────────────
     if (!ult::expandedMemory || ult::refreshWallpaper.load(std::memory_order_acquire)) return;
 
@@ -1076,35 +1269,12 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
         // bypass the check when src_row_offset > 0 (free-overlay call site).
         (ult::correctFrameSize || src_row_offset > 0u))
     {
-        // ── Static precomputed offset tables ─────────────────────────────────
-        // yParts[y]       : y-contribution to the block-linear framebuffer offset.
-        // xGroupParts[g]  : x-contribution for the start of 8-pixel group g
-        //                   (g = 0..55; 56 groups × 8 pixels = 448 px/row).
-        //
-        // Pure functions of the fixed 448×720 / offsetWidthVar=112 geometry.
-        // Initialised on the first call; never reallocated.
-        // Total static storage: 720×4 + 56×4 = 3,104 bytes.
-        static constexpr u32 kW  = 448u;
-        static constexpr u32 kH  = 720u;
-        static constexpr u32 kGW = kW / 8u;  // 56 groups of 8 pixels per row
-
-        static u32  s_yParts[kH];
-        static u32  s_xGroupParts[kGW];
-        static bool s_tables_ready = false;
-
-        if (__builtin_expect(!s_tables_ready, 0)) {
-            const u32 owv = offsetWidthVar;
-            for (u32 y = 0u; y < kH; ++y) {
-                s_yParts[y] = ((((y & 127u) >> 4) + ((y >> 7) * owv)) << 9)
-                            + ((y & 8u) << 5) + ((y & 6u) << 4) + ((y & 1u) << 3);
-            }
-            for (u32 g = 0u; g < kGW; ++g) {
-                const u32 x = g * 8u;
-                // (x & 7) == 0 always (x is a multiple of 8), so that term is 0.
-                s_xGroupParts[g] = ((x >> 5) << 12) + ((x & 16u) << 3) + ((x & 8u) << 1);
-            }
-            s_tables_ready = true;
-        }
+        // ── Use pre-computed file-scope swizzle tables ────────────────────────
+        // s_wp_yParts / s_wp_xGroupParts / s_wp_tables_ready are now at file
+        // scope and shared with clear_fb_rows_transparent_448.  Both functions
+        // are always used together in the same TU, so the one-time init cost is
+        // shared regardless of which is called first.
+        init_wallpaper_swizzle_tables();
 
         // ── Background color — read once from framebuffer[0] ─────────────────
         // fillScreen wrote a(defaultBackgroundColor) uniformly to every pixel;
@@ -1133,30 +1303,66 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
         // (all bottom) — a 9:1 ratio. Thread 3 is the wall-clock bottleneck.
         //
         // Instead, distribute rows by work units:
-        //   full row   = kGW groups (56)
-        //   middle row = skip_grp_start + (kGW - skip_grp_end) groups (= 6)
+        //   full row   = kWP_GW groups (56)
+        //   middle row = skip_grp_start + (kWP_GW - skip_grp_end) groups (= 6)
         //
         // This balances all four threads to ~5,580 groups each, giving ~1.8×
         // speedup over the equal-row approach for the overlay case.
         //
-        // For the no-skip default (skip_row_start == skip_row_end == kH), every
-        // row weighs kGW and the split degenerates to equal rows — identical
+        // For the no-skip default (skip_row_start == skip_row_end == kWP_H), every
+        // row weighs kWP_GW and the split degenerates to equal rows — identical
         // behaviour to the old chunkSize formula. No regression.
-        const u32 mid_row_work = skip_grp_start + (kGW - skip_grp_end);
-        const u32 total_work   = skip_row_start * kGW
-                               + (skip_row_end - skip_row_start) * mid_row_work
-                               + (fb_height - skip_row_end) * kGW;
-        const u32 target       = (total_work + numThreads - 1u) / numThreads;
+        const u32 mid_row_work = skip_grp_start + (kWP_GW - skip_grp_end);
+        // Compute work only for rows [fb_y_start, fb_height) — rows before
+        // fb_y_start are transparent padding that will be zeroed separately,
+        // so blending wallpaper into them is wasted work.
+        const u32 eff_top_end  = (skip_row_start > fb_y_start) ? std::min(skip_row_start, fb_height) : fb_y_start;
+        const u32 eff_mid_end  = std::min(skip_row_end, fb_height);
+        const u32 eff_bot_rows = (fb_height > eff_mid_end) ? (fb_height - eff_mid_end) : 0u;
+        // Named per-band work totals — used both for total_work and for the
+        // analytical thread-boundary formula below.
+        const u32 top_band_work = (eff_top_end > fb_y_start)
+            ? (eff_top_end - fb_y_start) * kWP_GW : 0u;
+        const u32 mid_band_work = (eff_mid_end > skip_row_start)
+            ? (eff_mid_end - skip_row_start) * mid_row_work : 0u;
+        const u32 total_work    = top_band_work + mid_band_work + eff_bot_rows * kWP_GW;
+        const u32 target        = (total_work + numThreads - 1u) / numThreads;
 
         // thread_starts[t] / thread_starts[t+1] are the row range for thread t.
         // Stack array — numThreads is always small (≤ 4 on Switch).
         u32 thread_starts[9] = {};  // [0..numThreads], max 8 threads + sentinel
-        thread_starts[0] = 0u;
+        thread_starts[0] = fb_y_start;
         {
-            u32 cum = 0u, ti = 1u;
-            for (u32 y = 0u; y < fb_height && ti < numThreads; ++y) {
-                cum += (y >= skip_row_start && y < skip_row_end) ? mid_row_work : kGW;
-                if (cum >= ti * target) thread_starts[ti++] = y + 1u;
+            // Analytical O(numThreads) boundary computation.
+            //
+            // The three-band work model is piecewise-linear in row number:
+            //   top band [fb_y_start, skip_row_start): W(y) = (y − fb_y_start) × kWP_GW
+            //   mid band [skip_row_start, eff_mid_end): W += mid_row_work per row
+            //   bot band [eff_mid_end, fb_height):     W += kWP_GW per row
+            //
+            // Solving W(y) = ti × target in closed form eliminates the O(fb_height)
+            // row-scan loop — replaced by at most 3 integer divisions per boundary.
+            // Verified against the equivalent scan loop for all Switch use-cases:
+            //   fixed overlay: fb_y_start=0,  skip 108–468, 720 rows → saves 720 iters
+            //   free  overlay: fb_y_start=84, skip 108–468, 720 rows → saves 636 iters
+            for (u32 ti = 1u; ti < numThreads; ++ti) {
+                const u32 W = ti * target;
+                u32 row;
+                if (W <= top_band_work) {
+                    // Boundary is in the top (full-row) band.
+                    // (y − fb_y_start + 1) × kWP_GW ≥ W  →  y = fb_y_start + ⌈W / kWP_GW⌉ − 1
+                    // thread_starts = y + 1 = fb_y_start + ⌈W / kWP_GW⌉
+                    row = fb_y_start + (W + kWP_GW - 1u) / kWP_GW;
+                } else if (mid_band_work > 0u && W <= top_band_work + mid_band_work) {
+                    // Boundary is in the mid (skip-stripped) band.
+                    const u32 rem = W - top_band_work;
+                    row = skip_row_start + (rem + mid_row_work - 1u) / mid_row_work;
+                } else {
+                    // Boundary is in the bot (full-row) band.
+                    const u32 rem = W - top_band_work - mid_band_work;
+                    row = eff_mid_end + (rem + kWP_GW - 1u) / kWP_GW;
+                }
+                thread_starts[ti] = std::min(row, fb_height);
             }
             thread_starts[numThreads] = fb_height;
         }
@@ -1204,7 +1410,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 
                     const uint8x8_t byte0_out = vorr_u8(vshl_n_u8(out_g, 4), out_r);
                     const uint8x8_t byte1_out = vorr_u8(v_bg_a4, out_b);
-                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_xGroupParts[g]),
+                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_wp_xGroupParts[g]),
                             uint8x8x2_t{{byte0_out, byte1_out}});
                 };
 
@@ -1233,7 +1439,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 
                     const uint8x8_t byte0_out = vorr_u8(vshl_n_u8(out_g, 4), out_r);
                     const uint8x8_t byte1_out = vorr_u8(v_bg_a4, out_b);
-                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_xGroupParts[g]),
+                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_wp_xGroupParts[g]),
                             uint8x8x2_t{{byte0_out, byte1_out}});
                 };
 
@@ -1253,25 +1459,25 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                 const auto run_bands = [&](auto&& do_group) {
                     const u32 top_end   = std::min(rowEnd, skip_row_start);
                     for (u32 y = rowStart; y < top_end; ++y) {
-                        const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
-                        for (u32 g = 0u; g < kGW; ++g) do_group(yPart, rs, g);
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
                     }
 
                     const u32 mid_start = std::max(rowStart, skip_row_start);
                     const u32 mid_end   = std::min(rowEnd,   skip_row_end);
                     for (u32 y = mid_start; y < mid_end; ++y) {
-                        const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
                         for (u32 g = 0u;           g < skip_grp_start; ++g) do_group(yPart, rs, g);
-                        for (u32 g = skip_grp_end; g < kGW;            ++g) do_group(yPart, rs, g);
+                        for (u32 g = skip_grp_end; g < kWP_GW;         ++g) do_group(yPart, rs, g);
                     }
 
                     const u32 bot_start = std::max(rowStart, skip_row_end);
                     for (u32 y = bot_start; y < rowEnd; ++y) {
-                        const u32       yPart = s_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kW * 2u);
-                        for (u32 g = 0u; g < kGW; ++g) do_group(yPart, rs, g);
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
                     }
 
                     ult::inPlotBarrier.arrive_and_wait();

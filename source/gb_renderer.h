@@ -164,10 +164,26 @@ static uint32_t s_outer_row_lut[VP_H];   // row_part(VP_Y + oy), oy = 0..VP_H-1
 static bool     s_outer_lut_ready = false;
 
 static void init_outer_lut() {
+    // Track the last g_render_y_offset the row LUT was built for.
+    // In fixed overlay mode this is always 0.
+    // In free overlay mode it varies as the user repositions the overlay
+    // (g_render_y_offset = g_ovl_free_pos_y - OVL_FREE_TOP_TRIM, range
+    // -OVL_FREE_TOP_TRIM..0 = -84..0).  Without this check the LUT is
+    // built once at offset 0 and never reflects the new base row, so the
+    // GB screen blit and letterbox stay frozen at the original position
+    // while every other element (wallpaper, buttons, logo) correctly shifts.
+    //
+    // Rebuilding costs: ~400 col + ~360 row iterations at ~5 ns each ≈ 4 µs.
+    // Only fires when the offset actually changes — zero cost in steady state.
+    static int s_last_y_offset = INT_MIN;  // INT_MIN forces the very first build
+    if (s_outer_lut_ready && g_render_y_offset == s_last_y_offset)
+        return;
+    s_last_y_offset = g_render_y_offset;
+
     build_col_lut(s_outer_col_lut, VP_X, VP_W);
-    // In free overlay mode g_render_y_offset == -(int)OVL_FREE_TOP_TRIM,
-    // shifting the LUT base from VP_Y=108 to 1.  The inner-viewport pointer
-    // offset (VP2_Y - VP_Y = 36) is unchanged regardless of the shift.
+    // In free overlay mode g_render_y_offset == (g_ovl_free_pos_y - OVL_FREE_TOP_TRIM),
+    // shifting the LUT base from VP_Y=108 down toward VP_X=24 at the extremes.
+    // The inner-viewport pointer offset (VP2_Y - VP_Y = 36) is unchanged.
     build_row_lut(s_outer_row_lut, VP_Y + g_render_y_offset, VP_H, OWV);
     // Derive inner-viewport pointers from the outer arrays — no separate allocation.
     s_col_lut = s_outer_col_lut + (VP2_X - VP_X);   // +40
@@ -699,7 +715,7 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
 }
 
 inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
-    if (!s_outer_lut_ready) init_outer_lut();
+    init_outer_lut();  // rebuilds row LUT whenever g_render_y_offset changes
 
     // Always single-thread.
     //
@@ -826,7 +842,7 @@ static inline void fill_letterbox_rect(uint16_t* __restrict__ fb,
 }
 
 inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
-    if (!s_outer_lut_ready) init_outer_lut();
+    init_outer_lut();  // rebuilds row LUT whenever g_render_y_offset changes
 
     // Get framebuffer pointer once — same pattern as render_gb_screen_chunk.
     // PACKED_LB = 0xE111 (RGBA4444: r=1 g=1 b=1 a=0xE, nearly opaque dark grey).

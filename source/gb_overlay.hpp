@@ -75,7 +75,7 @@ public:
         // init_outer_lut() (called lazily inside render_gb_screen / letterbox)
         // builds the row LUT with the trimmed viewport base.  Reset to 0 in
         // normal overlay mode so the two modes never bleed into each other.
-        g_render_y_offset = g_overlay_free_mode ? -(int)OVL_FREE_TOP_TRIM : 0;
+        g_render_y_offset = g_overlay_free_mode ? (g_ovl_free_pos_y - (int)OVL_FREE_TOP_TRIM) : 0;
 
         // Zero the footer-button width atomics every frame.
         // The Overlay's touch handler computes backTouched / nextPageTouched as:
@@ -106,17 +106,32 @@ public:
         // stores throughout.
         if (ult::expandedMemory && g_overlay_wallpaper) {
             if (g_overlay_free_mode) {
-                // Free mode: framebuffer is OVL_FREE_FB_H (636) rows tall, sourced from
-                // row OVL_FREE_TOP_TRIM (84) of the full wallpaper.  The GB viewport
-                // lands at rows VP_Y+g_render_y_offset .. VP_Y+VP_H+g_render_y_offset
-                // = 24 .. 384, so the skip region shifts accordingly.
+                // Free mode: framebuffer is OVL_FREE_FB_H (720) rows tall.
+                // g_ovl_free_pos_y transparent rows sit at the top; content occupies
+                // rows g_ovl_free_pos_y .. g_ovl_free_pos_y + OVL_FREE_CONTENT_H - 1.
+                //
+                // Wallpaper src_row_offset is (OVL_FREE_TOP_TRIM - pos_y) so that
+                // every visible content row reads the same wallpaper source row as the
+                // old 636-row approach — wallpaper appearance is position-invariant.
+                //
+                // fb_y_start = pos_y skips the transparent top rows entirely —
+                // blending wallpaper into rows that are about to be zeroed by
+                // clear_fb_rows_transparent_448 is pure waste.  At pos_y=84
+                // (default position) this saves 84×56 = 4,704 NEON group ops
+                // (~21% of total wallpaper work) per frame across all threads.
+                const u32 wSrcOff  = static_cast<u32>(OVL_FREE_TOP_TRIM - g_ovl_free_pos_y);
+                const u32 wFbH     = static_cast<u32>(OVL_FREE_CONTENT_H + g_ovl_free_pos_y);
+                const u32 skipRowS = static_cast<u32>(VP_Y + g_render_y_offset);
+                const u32 skipRowE = static_cast<u32>(VP_Y + VP_H + g_render_y_offset);
+                const u32 wYStart  = static_cast<u32>(g_ovl_free_pos_y);
                 draw_wallpaper_direct(renderer,
-                    static_cast<u32>(VP_Y   + g_render_y_offset),  // skip_row_start = 24
-                    static_cast<u32>(VP_Y + VP_H + g_render_y_offset), // skip_row_end = 384
-                    static_cast<u32>(VP_X)       / 8u,             // skip_grp_start = 3
-                    static_cast<u32>(VP_X + VP_W) / 8u,            // skip_grp_end   = 53
-                    static_cast<u32>(OVL_FREE_TOP_TRIM),            // src_row_offset = 84
-                    static_cast<u32>(OVL_FREE_FB_H));               // fb_height      = 636
+                    skipRowS,
+                    skipRowE,
+                    static_cast<u32>(VP_X)       / 8u,
+                    static_cast<u32>(VP_X + VP_W) / 8u,
+                    wSrcOff,
+                    wFbH,
+                    wYStart);
             } else {
                 draw_wallpaper_direct(renderer,
                     static_cast<u32>(VP_Y),           // skip_row_start = 108
@@ -126,9 +141,38 @@ public:
             }
         }
 
+        // ── Free overlay transparent row enforcement ─────────────────────────
+        // Must run regardless of whether wallpaper is enabled.  fillScreen
+        // (above) writes a non-transparent defaultBackgroundColor to every row;
+        // the game shows through only where alpha = 0.  Tesla's drawRect blend
+        // formula cannot produce alpha = 0 (a src colour with a=0 blends as
+        // dst × 1 + src × 0 = dst unchanged), so we must write 0x0000 directly
+        // to the raw framebuffer via clear_fb_rows_transparent_448.
+        //
+        //   Top    transparent rows: [0,              g_ovl_free_pos_y)
+        //   Bottom transparent rows: [wFbH,           OVL_FREE_FB_H)
+        //     where wFbH = g_ovl_free_pos_y + OVL_FREE_CONTENT_H
+        //   When pos_y == OVL_FREE_TOP_TRIM (84): wFbH==720 → no bottom rows.
+        if (g_overlay_free_mode) {
+            const u32 pos_y   = static_cast<u32>(g_ovl_free_pos_y);
+            const u32 bot_row = pos_y + static_cast<u32>(OVL_FREE_CONTENT_H);
+            if (pos_y > 0u)
+                clear_fb_rows_transparent_448(renderer, 0u, pos_y);
+            if (bot_row < static_cast<u32>(OVL_FREE_FB_H))
+                clear_fb_rows_transparent_448(renderer, bot_row,
+                                              static_cast<u32>(OVL_FREE_FB_H));
+            // Zero the 10 corner pixels per corner (40 total) outside the R=5
+            // quarter-circle arc, so they stay transparent.  < 100 ns overhead.
+            // Called here so the non-running early-return path also gets clean corners.
+            auto* const fb16 = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+            clear_ovl_corners_448(fb16, static_cast<int>(pos_y),
+                                         static_cast<int>(bot_row));
+        }
+
         // Title and widget — only drawn in fixed overlay mode.
-        // In free mode the top OVL_FREE_TOP_TRIM rows are absent from the
-        // framebuffer entirely; drawing there would write out of bounds.
+        // In free mode the framebuffer is full height (720 rows) but the top
+        // g_ovl_free_pos_y rows are transparent padding; the title/widget
+        // area doesn't exist in free mode so we skip it entirely.
         if (!g_overlay_free_mode) {
             draw_ultragb_title(renderer, 20, 67, 50);
 #if USING_WIDGET_DIRECTIVE
@@ -210,7 +254,9 @@ public:
             // dw/dh are also saved to g_dpad_glyph_w/h so the scissor block below
             // can read them as plain floats rather than carrying its own static guard.
             //
-            // In free overlay mode g_render_y_offset is already set (= -OVL_FREE_TOP_TRIM)
+            // In free overlay mode g_render_y_offset = g_ovl_free_pos_y - OVL_FREE_TOP_TRIM,
+            // so it varies with vertical position.  We apply it to every framebuffer
+            // Y coordinate so all elements shift together as a unit.
             // at the top of draw(), so hit-center Y values are automatically placed in
             // the correct framebuffer-relative coordinate space for the trimmed layer.
             const auto [dw, dh] = renderer->getTextDimensions("\uE115", false, DPAD_SIZE);
@@ -247,7 +293,7 @@ public:
         // D-pad backing: two rects forming a plus/cross shape.
         // All constants are directly tuneable — no getTextDimensions needed.
         // Adjust DPAD_CX/CY to centre, ARM_W/H for shaft width, FULL for span.
-        // In free overlay mode g_render_y_offset is -OVL_FREE_TOP_TRIM; we apply it
+        // In free overlay mode g_render_y_offset = pos_y - OVL_FREE_TOP_TRIM; we apply it
         // at runtime (not compile-time) so the backing tracks the shifted viewport.
         {
             static constexpr s32 DPAD_CX      = DPAD_DRAW_X + 67;
@@ -345,7 +391,20 @@ public:
         //   green = foreground focus regained
         // Alpha fades out over the last 15 frames so the border disappears
         // smoothly instead of cutting off.
-        if (g_focus_flash > 0) {
+        //
+        // In free overlay mode the border is clamped to the active content
+        // area (fb_top..fb_bot) so it never draws into transparent padding rows.
+        {
+        const int fb_top = g_overlay_free_mode ? g_ovl_free_pos_y : 0;
+        const int fb_bot = g_overlay_free_mode
+            ? g_ovl_free_pos_y + OVL_FREE_CONTENT_H
+            : static_cast<int>(tsl::cfg::FramebufferHeight);
+
+        // Capture before decrement — used below to decide whether to re-zero
+        // corners and whether the flash was active this frame.
+        const bool flash_was_active = (g_focus_flash > 0);
+
+        if (flash_was_active) {
             const u8 al = g_focus_flash > 15
                 ? static_cast<u8>(0xF)
                 : static_cast<u8>(g_focus_flash * 0xF / 15);
@@ -353,11 +412,11 @@ public:
                 ? tsl::Color{0xF, 0x0, 0x0, al}
                 : tsl::Color{0x0, 0xF, 0x0, al};
             static constexpr int B = 4;
-            const int fbH = static_cast<int>(tsl::cfg::FramebufferHeight);
-            renderer->drawRect(0,        0,         FB_W, B,               fc);
-            renderer->drawRect(0,        fbH - B,   FB_W, B,               fc);
-            renderer->drawRect(0,        B,         B,    fbH - B * 2,     fc);
-            renderer->drawRect(FB_W - B, B,         B,    fbH - B * 2,     fc);
+            const int fbH = fb_bot - fb_top;
+            renderer->drawRect(0,        fb_top,         FB_W, B,           fc);
+            renderer->drawRect(0,        fb_bot - B,     FB_W, B,           fc);
+            renderer->drawRect(0,        fb_top + B,     B,    fbH - B * 2, fc);
+            renderer->drawRect(FB_W - B, fb_top + B,     B,    fbH - B * 2, fc);
             --g_focus_flash;
         }
 
@@ -367,41 +426,47 @@ public:
             else
                 renderer->drawRect(0, 0, 1, static_cast<int>(tsl::cfg::FramebufferHeight), a(tsl::edgeSeparatorColor));
         } else {
-            const int fbw = static_cast<int>(tsl::cfg::FramebufferWidth);
-            const int fbh = static_cast<int>(tsl::cfg::FramebufferHeight);
-            const auto col = a(tsl::edgeSeparatorColor);
-            
-            renderer->drawRect(0,    0,   1,   fbh, col); // left
-            renderer->drawRect(fbw-1,0,   fbw, fbh, col); // right
-            renderer->drawRect(0,    0,   fbw, 1,   col); // top
-            renderer->drawRect(0,    fbh-1, fbw, fbh, col); // bottom
+            // Re-zero corners only when the focus-flash border was drawn this
+            // frame — its drawRect calls are the only thing between the first
+            // clear_ovl_corners_448 (in the transparent-row setup above) and here
+            // that can write into corner pixels.  Skipping the re-zero in normal
+            // gameplay (flash_was_active == false every frame) saves 124 scalar
+            // stores ≈ 125 ns per frame at no cost.
+            auto* const fb16 = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+            if (flash_was_active)
+                clear_ovl_corners_448(fb16, fb_top, fb_bot);
+            // Skip border during drag: the reposition overlay immediately draws its
+            // own full-width red border on top, making the rounded border invisible.
+            // Skipping saves 32 drawRect calls ≈ 10–15 µs per dragging frame.
+            if (!s_ovl_free_dragging)
+                render_ovl_free_border(renderer, fb_top, fb_bot, a(tsl::edgeSeparatorColor));
         }
 
         // ── Free overlay reposition overlay ──────────────────────────────────
         // Mirrors GBWindowedElement exactly: while dragging, dim the frozen
         // frame and show a red border + centred "Paused" text.
         if (g_overlay_free_mode && s_ovl_free_dragging) {
-            const s32 fw = static_cast<s32>(tsl::cfg::FramebufferWidth);
-            const s32 fh = static_cast<s32>(tsl::cfg::FramebufferHeight);
+            const s32 fw  = static_cast<s32>(tsl::cfg::FramebufferWidth);
+            const s32 fbt = static_cast<s32>(fb_top);
+            const s32 fbb = static_cast<s32>(fb_bot);
+            const s32 fbc = fbb - fbt;  // content height
 
             static constexpr tsl::Color DIM  = {0x0, 0x0, 0x0, 0x8};
-            renderer->drawRect(0, 0, fw, fh, DIM);
+            renderer->drawRect(0, fbt, fw, fbc, DIM);
 
             static constexpr int        BORD = 4;
             static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
-            renderer->drawRect(0,         0,          fw,   BORD,          RED);
-            renderer->drawRect(0,         fh - BORD,  fw,   BORD,          RED);
-            renderer->drawRect(0,         BORD,       BORD, fh - BORD * 2, RED);
-            renderer->drawRect(fw - BORD, BORD,       BORD, fh - BORD * 2, RED);
+            renderer->drawRect(0,         fbt,          fw,   BORD,          RED);
+            renderer->drawRect(0,         fbb - BORD,   fw,   BORD,          RED);
+            renderer->drawRect(0,         fbt + BORD,   BORD, fbc - BORD * 2, RED);
+            renderer->drawRect(fw - BORD, fbt + BORD,   BORD, fbc - BORD * 2, RED);
 
             static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
             static constexpr u32 FONT = 20;
 
             // Centre "Paused" within the 2× pixel-perfect GB screen region.
-            // In free overlay mode g_render_y_offset == -OVL_FREE_TOP_TRIM, so
-            // the screen in framebuffer coords is:
-            //   x: VP2_X .. VP2_X + VP2_W  (64 .. 384)
-            //   y: VP2_Y - OVL_FREE_TOP_TRIM .. +VP2_H  (60 .. 348)
+            // g_render_y_offset = pos_y - OVL_FREE_TOP_TRIM, so scr_y lands in
+            // the correct framebuffer row regardless of vertical position.
             const s32 scr_x = VP2_X;
             const s32 scr_y = static_cast<s32>(VP2_Y) + g_render_y_offset;
             const auto [tw, th] = renderer->getTextDimensions("Paused", false, FONT);
@@ -410,7 +475,8 @@ public:
                 scr_y + (static_cast<s32>(VP2_H) + static_cast<s32>(th)) / 2,
                 FONT, WHITE);
         }
-    }
+        } // end fb_top/fb_bot scope
+    }  // end draw()
 
     virtual void layout(u16, u16, u16, u16) override {
         this->setBoundaries(0, 0, FB_W, FB_H);
@@ -438,7 +504,7 @@ class GBOverlayGui : public tsl::Gui {
     int  m_touch_start_x = 0;     // HID x where the hold began (touch space)
     int  m_touch_start_y = 0;     // HID y where the hold began (touch space)
     int  m_pos_start_x   = 0;     // g_ovl_free_pos_x when hold began (VI space)
-    int  m_pos_start_y   = 0;     // g_ovl_free_pos_y when hold began (VI space)
+    int  m_pos_start_y   = 0;     // g_ovl_free_pos_y when hold began (render offset space, 0..OVL_FREE_TOP_TRIM)
     bool m_prev_touching = false;
 
     // ── Free overlay KEY_PLUS drag state (mirrors GBWindowedGui) ─────────────
@@ -481,7 +547,7 @@ class GBOverlayGui : public tsl::Gui {
     // Sync notification / virtual-button touch offsets to the current VI position.
     void sync_ovl_touch_offsets() {
         ult::layerEdge  = (g_ovl_free_pos_x * 2) / 3;
-        tsl::layerEdgeY = (g_ovl_free_pos_y * 2) / 3;
+        tsl::layerEdgeY = 0;  // VI layer Y is always 0; vertical shift uses render offset
     }
 
 public:
@@ -522,13 +588,11 @@ public:
             //screenshotsAreForceDisabled.store(true, std::memory_order_release);
             //tsl::gfx::Renderer::get().removeScreenshotStacks();
 
-            const int mx = vi_max_x();
-            const int my = vi_max_y();
-            g_ovl_free_pos_x = std::max(0, std::min(mx, g_ovl_free_pos_x));
-            g_ovl_free_pos_y = std::max(0, std::min(my, g_ovl_free_pos_y));
+            g_ovl_free_pos_x = std::max(0, std::min(vi_max_x(), g_ovl_free_pos_x));
+            g_ovl_free_pos_y = std::max(0, std::min((int)OVL_FREE_TOP_TRIM, g_ovl_free_pos_y));
             tsl::gfx::Renderer::get().setLayerPos(
                 static_cast<u32>(g_ovl_free_pos_x),
-                static_cast<u32>(g_ovl_free_pos_y));
+                0u);  // VI Y is always 0; vertical repositioning uses render offset
             sync_ovl_touch_offsets();
         }
 
@@ -669,7 +733,7 @@ public:
                 const bool htouching = poll_touch(htx, hty);
 
                 const int win_tx = (g_ovl_free_pos_x * 2) / 3;
-                const int win_ty = (g_ovl_free_pos_y * 2) / 3;
+                const int win_ty = 0;   // VI layer Y is always 0; touch window top = 0
                 const int win_w  = touch_win_w();
                 const int win_h  = touch_win_h();
 
@@ -678,8 +742,10 @@ public:
                 // Framebuffer pixels map 1:1 to touch-space pixels within the layer
                 // (1.5× FB→VI, then VI×2/3→touch cancels out), so we can add the
                 // screen's framebuffer offsets directly to the layer's touch-space origin.
+                // scr_ty accounts for the render offset: as pos_y grows the screen moves
+                // down within the framebuffer, shifting the touch target accordingly.
                 const int scr_tx = win_tx + VP2_X;
-                const int scr_ty = win_ty + static_cast<int>(VP2_Y) - OVL_FREE_TOP_TRIM; // VP2_Y - 84
+                const int scr_ty = static_cast<int>(VP2_Y) - OVL_FREE_TOP_TRIM + g_ovl_free_pos_y;
                 const bool in_screen = htouching
                     && htx >= scr_tx && htx < scr_tx + VP2_W
                     && hty >= scr_ty && hty < scr_ty + VP2_H;
@@ -719,15 +785,16 @@ public:
 
                     if (m_dragging) {
                         const int dx = (htx - m_touch_start_x) * 3 / 2;
-                        const int dy = (hty - m_touch_start_y) * 3 / 2;
+                        const int dy =  hty - m_touch_start_y;   // render-offset space: 1 touch px = 1 row
                         const int nx = std::max(0, std::min(vi_max_x(), m_pos_start_x + dx));
-                        const int ny = std::max(0, std::min(vi_max_y(), m_pos_start_y + dy));
+                        const int ny = std::max(0, std::min((int)OVL_FREE_TOP_TRIM, m_pos_start_y + dy));
                         if (nx != g_ovl_free_pos_x || ny != g_ovl_free_pos_y) {
                             g_ovl_free_pos_x = nx;
                             g_ovl_free_pos_y = ny;
+                            g_btns_measured  = false;  // hit centres depend on render offset
                             tsl::gfx::Renderer::get().setLayerPos(
                                 static_cast<u32>(g_ovl_free_pos_x),
-                                static_cast<u32>(g_ovl_free_pos_y));
+                                0u);  // VI Y always 0
                             sync_ovl_touch_offsets();
                         }
                     }
@@ -746,6 +813,7 @@ public:
                         triggerExitFeedback();
                         gb_audio_resume();
                         g_gb_frame_next_ns = 0;
+                        g_btns_measured    = false;  // recalculate hit centres at new render offset
                     }
                     s_ovl_free_dragging = false;
                     m_hold_armed        = false;
@@ -812,13 +880,14 @@ public:
                             m_joy_acc_y -= static_cast<float>(dy);
 
                             const int nx = std::max(0, std::min(vi_max_x(), g_ovl_free_pos_x + dx));
-                            const int ny = std::max(0, std::min(vi_max_y(), g_ovl_free_pos_y + dy));
+                            const int ny = std::max(0, std::min((int)OVL_FREE_TOP_TRIM, g_ovl_free_pos_y + dy));
                             if (nx != g_ovl_free_pos_x || ny != g_ovl_free_pos_y) {
                                 g_ovl_free_pos_x = nx;
                                 g_ovl_free_pos_y = ny;
+                                g_btns_measured  = false;  // hit centres depend on render offset
                                 tsl::gfx::Renderer::get().setLayerPos(
                                     static_cast<u32>(g_ovl_free_pos_x),
-                                    static_cast<u32>(g_ovl_free_pos_y));
+                                    0u);  // VI Y always 0
                                 sync_ovl_touch_offsets();
                             }
                         } else {
@@ -832,6 +901,7 @@ public:
                             triggerExitFeedback();
                             gb_audio_resume();
                             g_gb_frame_next_ns = 0;
+                            g_btns_measured    = false;  // recalculate hit centres at new render offset
                             s_ovl_free_dragging = false;
                             m_plus_dragging     = false;
                         }

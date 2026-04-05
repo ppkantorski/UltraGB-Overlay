@@ -87,7 +87,7 @@ static const std::string kKeySettingsScroll{"settings_scroll"};
 static const std::string kKeyPlayerRom     {"overlay_rom"};  // ROM path for -overlay relaunch
 static const std::string kKeyOvlFreeMode  {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
 static const std::string kKeyOvlFreePosX  {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
-static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // VI-space Y of the free overlay layer
+static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
 
 // =============================================================================
 // ROM size thresholds
@@ -156,28 +156,30 @@ static char g_overlay_rom_path[PATH_BUFFER_SIZE] = {};
 
 // ── Free overlay mode ──────────────────────────────────────────────────────────
 // When true the overlay is relaunched with -freeoverlay <path>: the layer is
-// trimmed by OVL_FREE_TOP_TRIM rows (removing the title/widget region) and can
-// be repositioned freely by holding KEY_PLUS + left stick, exactly like windowed
-// mode.  The stored position is separate from the windowed mode position.
+// full-height (720 rows) so the VI compositor's bounding-box is stable at all
+// positions and screenshots work correctly.  Vertical repositioning is achieved
+// by shifting content within the framebuffer (g_ovl_free_pos_y transparent rows
+// at the top) rather than moving the VI layer, which stays at y=0 always.
+// X repositioning still uses viSetLayerPosition normally.
 //
-// OVL_FREE_TOP_TRIM = VP_Y - VP_X: strips enough rows so the gap above the GB
-// border inside the free layer equals the side gap (VP_X-1 = 23 px on each
-// side), giving equal wallpaper padding on all three exposed edges.
-//   VP_Y - VP_X = 108 - 24 = 84 rows stripped from the top.
-//   GB border top appears at framebuffer y = (VP_Y-1) - OVL_FREE_TOP_TRIM
-//                                          = 107 - 84 = 23 = VP_X - 1  ✓
+// OVL_FREE_TOP_TRIM = VP_Y - VP_X: the maximum vertical shift is 84 rows, so
+// the gap above the GB border equals the side gap (VP_X-1 = 23 px) at the
+// extremes, giving equal wallpaper padding on all three exposed edges.
+//   GB border top in FB = VP_Y + g_render_y_offset
+//                       = VP_Y + (g_ovl_free_pos_y - OVL_FREE_TOP_TRIM)
+//   When pos_y=OVL_FREE_TOP_TRIM(84): render_y_offset=0  → border at VP_Y=108 (same as fixed overlay)
+//   When pos_y=0:                     render_y_offset=-84 → border at 24 = VP_X-1 ✓
 //
-// Layer VI size at 720p (1.5× scaling):  448*1.5 × 636*1.5 = 672 × 954
-//   VI max X = 1920 - 672 = 1248
-//   VI max Y = 1080 - 954 = 126
-// Default pos_y = 126 keeps the GB border at roughly the same screen position
-// as in the normal (full-screen) overlay.
-static constexpr int OVL_FREE_TOP_TRIM = VP_Y - VP_X;            // 84 rows
-static constexpr int OVL_FREE_FB_H     = FB_H - OVL_FREE_TOP_TRIM; // 636
+// Layer VI size at 720p (1.5× scaling):  448*1.5 × 720*1.5 = 672 × 1080
+//   VI layer is full-screen height → VI max Y = 0 (layer never moves vertically).
+//   VI max X = 1920 - 672 = 1248  (X repositioning still via viSetLayerPosition).
+static constexpr int OVL_FREE_TOP_TRIM  = VP_Y - VP_X;              // 84 rows
+static constexpr int OVL_FREE_CONTENT_H = FB_H - OVL_FREE_TOP_TRIM; // 636 — content window height (unchanged)
+static constexpr int OVL_FREE_FB_H      = FB_H;                      // 720 — full-height framebuffer; VI layer fills the full screen height so the compositor's bounding-box is position-invariant and screenshots work correctly at any position
 
 static bool g_overlay_free_mode = false;  // true when launched with -freeoverlay
-static int  g_ovl_free_pos_x    = 0;      // VI-space X; 0 = left edge
-static int  g_ovl_free_pos_y    = 126;    // VI-space Y; 126 = VI max_y → GB border aligned with normal overlay
+static int  g_ovl_free_pos_x    = 0;               // VI-space X; 0 = left edge
+static int  g_ovl_free_pos_y    = OVL_FREE_TOP_TRIM; // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM); OVL_FREE_TOP_TRIM=84 → content flush with bottom → same visual position as normal overlay
 
 // Set true when a windowed quick-launch is triggered from loadInitialGui().
 static bool g_win_quick_exit = false;
@@ -197,6 +199,12 @@ static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
 // g_win_scale serves two roles — see main.cpp save/load comments for full detail.
 static int  g_win_scale        = 1;
 static bool g_win_scale_locked = false;
+
+// True when running on a 4 MB heap at scale 3 in windowed mode.
+// In this mode the framebuffer is exactly game-sized (no anchor padding),
+// the layer is positioned directly at g_win_pos_y, and screenshots are
+// disabled.  Set once in main() before setup_windowed_framebuffer().
+static bool g_win_limited_fb = false;
 
 // Windowed output resolution mode.
 // false = 720p-scaled (default)   true = 1080p pixel-perfect.

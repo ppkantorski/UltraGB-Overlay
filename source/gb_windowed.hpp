@@ -98,12 +98,113 @@ static bool     s_win_dragging  = false;
 // Consumed in WindowedOverlay::update() to trigger a clean relaunch with 720p sizing.
 static bool     s_undock_relaunch = false;
 
-// Update the notification hit-test offsets to match the current VI layer position.
-// Must be called whenever g_win_pos_x / g_win_pos_y change.
+// ── Windowed mode row-LUT update tracking ─────────────────────────────────────
+// s_win_owv / s_win_fh: saved per-session constants used by update_win_row_lut
+// to rebuild s_win_row in place (no realloc) when the FB y_offset changes.
+static uint32_t s_win_owv           = 0u;
+static int      s_win_fh            = 0;
+static int      s_win_last_y_offset = -1;  // -1 forces first build
+
+// ── Windowed framebuffer positioning helpers ───────────────────────────────────
+// The framebuffer is always win_fb_height() rows (half-screen + half-game).
+// The VI layer position and FB y-offset together place the game at g_win_pos_y
+// using continuous clamped functions — no binary anchor switch.
+//
+//   layer_fb_top  = screen_fb_h() − win_fb_height()
+//   layer_vi_top  = layer_fb_top × 1.5  (720p)  or  layer_fb_top  (1080p)
+//
+//   win_layer_vi_y  = max(0, g_win_pos_y − layer_vi_top)
+//   win_fb_y_offset = min(layer_fb_top, g_win_pos_y × 2/3)   [720p]
+//
+//   on-screen top = win_layer_vi_y + win_fb_y_offset × 1.5 = g_win_pos_y  ✓
+//
+// y_ofs rises linearly until it hits layer_fb_top, after which it stays
+// constant and layer_vi_y takes over.  Neither variable jumps — the old
+// binary anchor switch caused a double-buffer desync glitch where
+// viSetLayerPosition fired immediately with the new layer Y while the
+// currently-displayed buffer still contained the old y_ofs, teleporting
+// the game to the wrong screen edge for one frame.
+//
+// Memory savings vs full-height 720-row FB:
+//   Scale 1: 432 rows  (−40 %)     Scale 4: 648 rows  (−10 %)
+//   Scale 2: 504 rows  (−30 %)     Scale 5: 720 rows  (same — game fills screen)
+//   Scale 3: 576 rows  (−20 %)
+
+// Full-screen height in FB pixels (720 or 1080).
+static inline int screen_fb_h() {
+    return ult::windowedLayerPixelPerfect ? 1080 : 720;
+}
+
+// Framebuffer height.
+//   Normal mode     — half screen + half game (rounded up): supports the dynamic
+//                     top/bottom anchor, which needs room for both halves.
+//   Limited-memory  — exactly GB_H*scale: no padding, layer Y = g_win_pos_y directly.
+//                     Screenshots are disabled in this mode anyway.
+static inline int win_fb_height() {
+    const int game_h = GB_H * g_win_scale;
+    if (g_win_limited_fb) return game_h;
+    return screen_fb_h() / 2 + (game_h + 1) / 2;
+}
+
+// VI-space Y of the layer's top edge.
+//
+// Old design used a binary top/bottom anchor switch at the screen midpoint,
+// which caused a double-buffer desync glitch: viSetLayerPosition fires
+// immediately in the drag handler, but the currently DISPLAYED buffer was
+// drawn the previous frame with the old y_ofs.  For one frame the compositor
+// saw old_y_ofs + new_layer_y → game teleported to the wrong screen edge.
+//
+// New design: continuous clamped functions with no discontinuity.
+//
+//   layer_vi_top  = (screen_fb_h() − win_fb_height()) × 1.5   [VI pixels]
+//   win_layer_vi_y = max(0, g_win_pos_y − layer_vi_top)
+//
+//   y_ofs rises linearly until it hits layer_fb_top, then stays constant.
+//   layer_vi_y stays at 0 until y_ofs is clamped, then rises linearly.
+//   Neither jumps discontinuously → double-buffer lag is ≤1 pixel, invisible.
+//
+//   Proof (720p, non-pixel-perfect, any scale):
+//     layer_vi_top  = layer_fb_top × 3/2
+//     on-screen top = layer_vi_y + y_ofs × 1.5
+//     top region (pos_y ≤ layer_vi_top):
+//       layer_vi_y = 0,  y_ofs = pos_y×2/3
+//       → 0 + pos_y×2/3 × 1.5 = pos_y  ✓
+//     bottom region (pos_y > layer_vi_top):
+//       layer_vi_y = pos_y − layer_vi_top,  y_ofs = layer_fb_top
+//       → (pos_y − layer_vi_top) + layer_fb_top×1.5
+//       = pos_y − layer_fb_top×1.5 + layer_fb_top×1.5 = pos_y  ✓
+static inline int win_layer_vi_y() {
+    if (g_win_limited_fb) return g_win_pos_y;
+    const int layer_fb_top = screen_fb_h() - win_fb_height();
+    const int layer_vi_top = ult::windowedLayerPixelPerfect ? layer_fb_top : (layer_fb_top * 3 / 2);
+    return std::max(0, g_win_pos_y - layer_vi_top);
+}
+
+// FB row within the layer where game content starts.
+// Rises linearly with g_win_pos_y until clamped at layer_fb_top, then constant.
+// Always 0 in limited-memory mode.
+static inline int win_fb_y_offset() {
+    if (g_win_limited_fb) return 0;
+    const int layer_fb_top = screen_fb_h() - win_fb_height();
+    const int fb_row = ult::windowedLayerPixelPerfect ? g_win_pos_y : (g_win_pos_y * 2 / 3);
+    return std::min(layer_fb_top, fb_row);
+}
+
+// VI-space Y bounds for drag clamping — anchor-independent.
+// The game may travel from screen top (0) to screen bottom continuously.
+static inline int vi_min_y_content() { return 0; }
+static inline int vi_max_y_content() {
+    const int game_h = GB_H * g_win_scale;
+    return ult::windowedLayerPixelPerfect
+        ? (1080 - game_h)
+        : (1080 - game_h * 3 / 2);
+}
+
+// Update the notification hit-test offsets to match the current game-content
+// position.  Must be called whenever g_win_pos_x / g_win_pos_y change.
 static void sync_notif_touch_offsets() {
-    // layerEdge already drives the notification hit-test X — repurpose it.
-    ult::layerEdge = (g_win_pos_x * 2) / 3;
-    tsl::layerEdgeY = (g_win_pos_y * 2) / 3;
+    ult::layerEdge  = (g_win_pos_x * 2) / 3;
+    tsl::layerEdgeY = (g_win_pos_y * 2) / 3;  // game content top in touch space
 }
 
 // Allocate and populate col/row LUTs sized exactly for the given scale.
@@ -121,11 +222,23 @@ static void init_win_luts(int scale) {
     const unsigned fw  = static_cast<unsigned>(GB_W) * static_cast<unsigned>(scale);
     const unsigned fh  = static_cast<unsigned>(GB_H) * static_cast<unsigned>(scale);
     const uint32_t owv = (static_cast<uint32_t>(fw) >> 5u) << 3u;
-    s_win_col = new uint32_t[fw];
-    s_win_row = new uint32_t[fh];
+    s_win_col  = new uint32_t[fw];
+    s_win_row  = new uint32_t[fh];
+    s_win_owv  = owv;
+    s_win_fh   = static_cast<int>(fh);
     build_col_lut(s_win_col, 0, static_cast<int>(fw));
-    build_row_lut(s_win_row, 0, static_cast<int>(fh), owv);
+    const int y0 = win_fb_y_offset();
+    build_row_lut(s_win_row, y0, s_win_fh, s_win_owv);
+    s_win_last_y_offset = y0;
     s_win_lut_ready = true;
+}
+
+// Rebuild s_win_row in place when the game content y_offset changes (drag).
+// No-op in steady state — single int comparison.
+static inline void update_win_row_lut(int y_offset) {
+    if (!s_win_lut_ready || y_offset == s_win_last_y_offset) return;
+    build_row_lut(s_win_row, y_offset, s_win_fh, s_win_owv);
+    s_win_last_y_offset = y_offset;
 }
 
 // =============================================================================
@@ -477,10 +590,41 @@ class GBWindowedElement : public tsl::elm::Element {
 public:
     void draw(tsl::gfx::Renderer* renderer) override {
 
-        if (!g_gb.running || !g_emu_active || !g_gb_fb) {
-            renderer->fillScreen({0x0, 0x0, 0x0, 0xF});
-            return;
-        }
+        // ── Always clear the full framebuffer to transparent first ────────────
+        // Fixes stale-pixel corruption on both double-buffer frames: any row
+        // outside [y_ofs, y_ofs + game_h) must be transparent so the anchored
+        // half-screen FB doesn't show garbage below/above the game content.
+        // This also acts as the early-return clear when the game isn't running.
+        //
+        // IMPORTANT: use the block-linear–aligned height, not the logical height.
+        //
+        // Tesla uses Tegra block-linear with 128-row super-rows (the `y>>7` term
+        // in getPixelOffset).  For a framebuffer whose logical height H is not a
+        // multiple of 128, pixels in the last partial super-row have block-linear
+        // addresses that exceed W×H — they land in the alignment-padding region
+        // that libnx allocates but that a naive W×H×2 memset doesn't reach.
+        //
+        // Concretely (scale 2, H=504, W=320):
+        //   logical size  = 320×504 = 161,280 uint16 slots
+        //   addr(319,503) = 163,583             → overflows by 2,303 slots
+        //   libnx alloc   = 320×512×2 = 327,680 bytes (rounds H up to 512)
+        //   naive memset  = 320×504×2 = 322,560 bytes  ← misses the overflow slots
+        //
+        // Those un-zeroed slots hold stale data from previous frames; VI
+        // composites them faithfully and they appear as repeated/corrupt pixels
+        // just beyond the game-window edge.
+        //
+        // Fix: round H up to the next 128-row boundary (matching libnx's own
+        // size formula) so the memset covers every block-linear slot.
+        uint16_t* const fb          = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+        const int       fb_h_log    = win_fb_height();
+        const int       fb_h_phys   = (fb_h_log + 127) & ~127;  // round up to 128-row block
+        const size_t    fb_bytes    = static_cast<size_t>(GB_W * g_win_scale)
+                                    * static_cast<size_t>(fb_h_phys)
+                                    * sizeof(uint16_t);
+        std::memset(fb, 0, fb_bytes);
+
+        if (!g_gb.running || !g_emu_active || !g_gb_fb) return;
 
         // Detect operation-mode change (handheld ↔ docked).
         // When the mode changes the audio output device changes and the kernel
@@ -492,7 +636,7 @@ public:
         {
             const bool  is_docked    = poll_console_docked();
             static bool s_was_docked = is_docked;
-            
+
             if (is_docked != s_was_docked) {
                 s_was_docked = is_docked;
                 gb_audio_request_resync();
@@ -516,23 +660,27 @@ public:
         if (!s_win_dragging) gb_tick_frame();
         else                 ++g_frame_count;
 
+        // ── Row LUT: rebuild if the game's y_offset changed since last frame ──
+        // Happens on every drag frame; zero-cost in steady state (one int cmp).
+        const int y_ofs = win_fb_y_offset();
+        update_win_row_lut(y_ofs);
+
         // ── Scaled pixel blit ─────────────────────────────────────────────────
         // Delegates to launch_win_blit<LCD_GRID, SCALE> which:
         //   • Caches the raw framebuffer pointer once (no per-pixel indirection).
-        //   • Splits source rows across ult::renderThreads (idle in windowed mode).
+        //   • Splits source rows across the WinBlitPool worker threads.
         //   • Uses RLE to convert colour once per same-colour horizontal run.
         //   • Uses NEON vst1q_u16 for 8-pixel aligned destination tile spans.
         //   • Unrolls inner loops fully via compile-time SCALE template.
         // See win_blit_rows / launch_win_blit above for the full implementation.
         if (!s_win_lut_ready) init_win_luts(g_win_scale);
 
-        // Cache framebuffer pointer once — eliminates per-pixel
-        // getCurrentFramebuffer() load that setPixelAtOffset() would perform.
-        uint16_t* const fb      = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
-        const int        scale   = g_win_scale;
-        const bool       is565   = g_fb_is_rgb565;
-        const bool       prpk    = g_fb_is_prepacked;
-        const bool       do_grid = g_lcd_grid && scale >= 2;
+        // fb pointer already obtained at the top of draw() — reuse it.
+        // (getCurrentFramebuffer() always returns the same pointer within a frame.)
+        const int  scale   = g_win_scale;
+        const bool is565   = g_fb_is_rgb565;
+        const bool prpk    = g_fb_is_prepacked;
+        const bool do_grid = g_lcd_grid && scale >= 2;
 
         // Resolve SCALE at compile time so inner loops are fully unrolled.
         // LCD_GRID branches are compile-time eliminated in each instantiation.
@@ -551,7 +699,11 @@ public:
         else         dispatch.operator()<false>();
 
         // ── Pass-through flash border + drag overlay ─────────────────────────
-        // fw/fh computed once here; used by both conditional blocks below.
+        // fw/fh: game content dimensions in FB pixels.
+        // y_ofs: FB row where game content starts (0 for top anchor when game
+        //        is at screen top; nonzero when the game has been dragged down).
+        // All drawRect calls are offset by y_ofs so they land on the game region,
+        // not the transparent padding rows at the top/bottom of the FB.
         const s32 fw = static_cast<s32>(GB_W * g_win_scale);
         const s32 fh = static_cast<s32>(GB_H * g_win_scale);
 
@@ -563,10 +715,10 @@ public:
                 ? tsl::Color{0xF, 0x0, 0x0, al}
                 : tsl::Color{0x0, 0xF, 0x0, al};
             static constexpr int B = 4;
-            renderer->drawRect(0,      0,       fw, B,           fc);
-            renderer->drawRect(0,      fh - B,  fw, B,           fc);
-            renderer->drawRect(0,      B,       B,  fh - B * 2,  fc);
-            renderer->drawRect(fw - B, B,       B,  fh - B * 2,  fc);
+            renderer->drawRect(0,      y_ofs,              fw, B,           fc);
+            renderer->drawRect(0,      y_ofs + fh - B,     fw, B,           fc);
+            renderer->drawRect(0,      y_ofs + B,           B,  fh - B * 2,  fc);
+            renderer->drawRect(fw - B, y_ofs + B,           B,  fh - B * 2,  fc);
             --g_focus_flash;
         }
 
@@ -576,31 +728,32 @@ public:
 
             // Semi-transparent black veil (~50 % opacity in RGBA4444).
             static constexpr tsl::Color DIM = {0x0, 0x0, 0x0, 0x8};
-            renderer->drawRect(0, 0, fw, fh, DIM);
+            renderer->drawRect(0, y_ofs, fw, fh, DIM);
 
             // Red border (4 px) so the window boundary is obvious.
             static constexpr int        BORD = 4;
             static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
-            renderer->drawRect(0,         0,          fw,   BORD,              RED);
-            renderer->drawRect(0,         fh - BORD,  fw,   BORD,              RED);
-            renderer->drawRect(0,         BORD,       BORD, fh - BORD * 2,     RED);
-            renderer->drawRect(fw - BORD, BORD,       BORD, fh - BORD * 2,     RED);
+            renderer->drawRect(0,         y_ofs,                  fw,   BORD,          RED);
+            renderer->drawRect(0,         y_ofs + fh - BORD,      fw,   BORD,          RED);
+            renderer->drawRect(0,         y_ofs + BORD,           BORD, fh - BORD * 2, RED);
+            renderer->drawRect(fw - BORD, y_ofs + BORD,           BORD, fh - BORD * 2, RED);
 
-            // "Paused" centred in white.
+            // "Paused" centred in white within the game content region.
             static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
             const u32 fontSize = static_cast<u32>(14 * g_win_scale);
             const auto [tw, th] = renderer->getTextDimensions("Paused", false, fontSize);
             renderer->drawString("Paused", false,
                 (fw - static_cast<s32>(tw)) / 2,
-                (fh + static_cast<s32>(th)) / 2,
+                y_ofs + (fh + static_cast<s32>(th)) / 2,
                 fontSize, WHITE);
         }
     }
 
     void layout(u16, u16, u16, u16) override {
-        // The framebuffer IS the layer; always fill it entirely.
-        // Size = GB_W*scale × GB_H*scale, matching DefaultFramebufferWidth/Height.
-        setBoundaries(0, 0, GB_W * g_win_scale, GB_H * g_win_scale);
+        // The element covers the entire allocated framebuffer — game content rows
+        // plus the transparent padding rows above/below determined by the anchor.
+        // Width = GB_W*scale, Height = win_fb_height() (half-screen + half-game).
+        setBoundaries(0, 0, GB_W * g_win_scale, win_fb_height());
     }
 
     tsl::elm::Element* requestFocus(tsl::elm::Element*, tsl::FocusDirection) override {
@@ -760,7 +913,14 @@ class GBWindowedGui : public tsl::Gui {
     // Using the live cfg value keeps hit-testing correct in both modes and
     // automatically reflects any underscan correction applied to the layer.
     static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
-    static int touch_win_h() { return static_cast<int>(tsl::cfg::LayerHeight) * 2 / 3; }
+    // Game content height in HID touch space — not the full (anchored) layer height.
+    //   720p:  touch = GB_H*scale (FB height maps 1:1 to touch space)
+    //   1080p: touch = GB_H*scale * 2/3
+    static int touch_win_h() {
+        return ult::windowedLayerPixelPerfect
+            ? (GB_H * g_win_scale * 2 / 3)
+            : (GB_H * g_win_scale);
+    }
 
 public:
     ~GBWindowedGui() {
@@ -784,6 +944,15 @@ public:
         g_emu_active     = !m_load_failed;
         m_waitForRelease = !m_load_failed;
 
+        // In limited-memory mode (4 MB heap) the FB is exactly game-sized and the
+        // anchor-padding trick that makes screenshots work is not used.  The
+        // screenshot layer would display garbage, so remove it entirely.
+        if (g_win_limited_fb) {
+            screenshotsAreDisabled.store(true, std::memory_order_release);
+            screenshotsAreForceDisabled.store(true, std::memory_order_release);
+            tsl::gfx::Renderer::get().removeScreenshotStacks();
+        }
+
         // Suppress Tesla's footer touch handling entirely.
         ult::noClickableItems.store(true,  std::memory_order_release);
         ult::backWidth.store(0.0f,         std::memory_order_release);
@@ -792,21 +961,21 @@ public:
         ult::halfGap.store(0.0f,           std::memory_order_release);
         ult::hasNextPageButton.store(false, std::memory_order_release);
 
-        // Clamp the saved/default position to the valid range for the current
-        // scale.  This is the only guard needed: if the user changed the scale
-        // between sessions the old position may land outside the screen.
-        //   E.g. pos_x=1600 was valid at 1× (max=1680) but invalid at 3× (max=1200).
+        // Clamp to the valid range for the current anchor mode and scale.
         {
-            const int mx = vi_max_x();
-            const int my = vi_max_y();
-            g_win_pos_x = std::max(0, std::min(mx, g_win_pos_x));
-            g_win_pos_y = std::max(0, std::min(my, g_win_pos_y));
+            const int mx  = vi_max_x();
+            const int mny = vi_min_y_content();
+            const int mxy = vi_max_y_content();
+            g_win_pos_x = std::max(0,   std::min(mx,  g_win_pos_x));
+            g_win_pos_y = std::max(mny, std::min(mxy, g_win_pos_y));
         }
 
-        // Position the VI layer at the clamped/default location.
+        // Layer X moves freely.  Layer Y is fixed for the session:
+        //   top anchor    → Y = 0
+        //   bottom anchor → Y = win_layer_vi_y() (layer bottom = screen bottom)
         tsl::gfx::Renderer::get().setLayerPos(
             static_cast<u32>(g_win_pos_x),
-            static_cast<u32>(g_win_pos_y));
+            static_cast<u32>(win_layer_vi_y()));
         sync_notif_touch_offsets();
 
         // Initialise the persistent blit thread pool once per windowed session.
@@ -1086,19 +1255,21 @@ public:
                 }
 
                 if (m_dragging) {
-                    // Convert touch delta to VI delta (×3/2) and apply.
-                    // Clamp to the scale-appropriate VI bounds so the window
-                    // never crosses a screen edge regardless of scale.
-                    const int dx = (tx - m_touch_start_x) * 3 / 2;
-                    const int dy = (ty - m_touch_start_y) * 3 / 2;
-                    const int nx = std::max(0, std::min(vi_max_x(), m_pos_start_x + dx));
-                    const int ny = std::max(0, std::min(vi_max_y(), m_pos_start_y + dy));
+                    const int dx     = (tx - m_touch_start_x) * 3 / 2;
+                    const int dy     = (ty - m_touch_start_y) * 3 / 2;
+                    const int nx     = std::max(0, std::min(vi_max_x(), m_pos_start_x + dx));
+                    const int ny     = std::max(vi_min_y_content(),
+                                                std::min(vi_max_y_content(), m_pos_start_y + dy));
+
                     if (nx != g_win_pos_x || ny != g_win_pos_y) {
                         g_win_pos_x = nx;
                         g_win_pos_y = ny;
+                        // Layer X moves freely; layer Y is computed continuously
+                        // from g_win_pos_y — no anchor switch, no discontinuity.
                         tsl::gfx::Renderer::get().setLayerPos(
                             static_cast<u32>(g_win_pos_x),
-                            static_cast<u32>(g_win_pos_y));
+                            static_cast<u32>(win_layer_vi_y()));
+                        sync_notif_touch_offsets();
                     }
                 }
 
@@ -1200,14 +1371,16 @@ public:
                         m_joy_acc_x -= static_cast<float>(dx);
                         m_joy_acc_y -= static_cast<float>(dy);
                 
-                        const int nx = std::max(0, std::min(vi_max_x(), g_win_pos_x + dx));
-                        const int ny = std::max(0, std::min(vi_max_y(), g_win_pos_y + dy));
+                        const int nx     = std::max(0, std::min(vi_max_x(), g_win_pos_x + dx));
+                        const int ny     = std::max(vi_min_y_content(),
+                                                    std::min(vi_max_y_content(), g_win_pos_y + dy));
+
                         if (nx != g_win_pos_x || ny != g_win_pos_y) {
                             g_win_pos_x = nx;
                             g_win_pos_y = ny;
                             tsl::gfx::Renderer::get().setLayerPos(
                                 static_cast<u32>(g_win_pos_x),
-                                static_cast<u32>(g_win_pos_y));
+                                static_cast<u32>(win_layer_vi_y()));
                             sync_notif_touch_offsets();
                         }
                     } else {

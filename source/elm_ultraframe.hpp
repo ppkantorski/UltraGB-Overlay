@@ -52,7 +52,8 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
 static void draw_wallpaper_direct(tsl::gfx::Renderer*,
                                    u32 = 720u, u32 = 720u,
                                    u32 = 0u,   u32 = 0u,
-                                   u32 = 0u,   u32 = 720u);
+                                   u32 = 0u,   u32 = 720u,
+                                   u32 = 0u);
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
