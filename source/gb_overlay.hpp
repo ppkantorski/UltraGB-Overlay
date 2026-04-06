@@ -77,6 +77,29 @@ public:
         // normal overlay mode so the two modes never bleed into each other.
         g_render_y_offset = g_overlay_free_mode ? (g_ovl_free_pos_y - (int)OVL_FREE_TOP_TRIM) : 0;
 
+        // Cache values read repeatedly throughout this function.
+        //   free_mode    — g_overlay_free_mode is read 8+ times; a const local
+        //                  guarantees one load and lets the compiler freely
+        //                  propagate the value without aliasing concerns.
+        //   has_wallpaper — avoids re-evaluating the conjunction twice.
+        //   fb16          — getCurrentFramebuffer() is otherwise called 4 times
+        //                   (pre_wp_bg, letterbox block, two corner-zeroing sites);
+        //                   one cached pointer eliminates the extra calls.
+        //                   ORDERING: fb16[0] is read as pre_wp_bg AFTER fillScreen
+        //                   writes to the buffer — the pointer itself is stable.
+        const bool     free_mode    = g_overlay_free_mode;
+        const bool     has_wallpaper = ult::expandedMemory && g_overlay_wallpaper;
+        uint16_t* const fb16        = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+
+        // Compute content bounds once — reused for transparent-row clearing,
+        // corner zeroing, focus-flash border, edge separator, and drag overlay.
+        // Previously computed twice: once as pos_y/bot_row (u32, inside the free-mode
+        // if block) and again as fb_top/fb_bot ternaries inside the flash scope.
+        const int fb_top = free_mode ? g_ovl_free_pos_y : 0;
+        const int fb_bot = free_mode
+            ? g_ovl_free_pos_y + (int)OVL_FREE_CONTENT_H
+            : static_cast<int>(tsl::cfg::FramebufferHeight);
+
         // Zero the footer-button width atomics every frame.
         // The Overlay's touch handler computes backTouched / nextPageTouched as:
         //   touchPos.x >= backLeftEdge && touchPos.x < (backLeftEdge + backWidth)
@@ -94,7 +117,7 @@ public:
         // When wallpaper is active, force the default 000000/D so a custom bg
         // colour does not bleed into exposed edges around the wallpaper image.
         {
-            const tsl::Color effBg = (ult::expandedMemory && g_overlay_wallpaper)
+            const tsl::Color effBg = has_wallpaper
                 ? tsl::Color{0x0, 0x0, 0x0, 0xD} : g_ovl_bg_col;
             renderer->fillScreen(renderer->a(effBg));
         }
@@ -116,10 +139,9 @@ public:
         // pre_wp_bg: background colour from fillScreen, captured from framebuffer[0]
         // BEFORE wallpaper blends into it.  Used by fill_vp_corners_448 later so
         // the corner blend matches draw_wallpaper_direct exactly.
-        const uint16_t pre_wp_bg =
-            static_cast<const uint16_t*>(renderer->getCurrentFramebuffer())[0];
-        if (ult::expandedMemory && g_overlay_wallpaper) {
-            if (g_overlay_free_mode) {
+        const uint16_t pre_wp_bg = fb16[0];  // read after fillScreen, before wallpaper
+        if (has_wallpaper) {
+            if (free_mode) {
                 // Free mode: framebuffer is OVL_FREE_FB_H (720) rows tall.
                 // g_ovl_free_pos_y transparent rows sit at the top; content occupies
                 // rows g_ovl_free_pos_y .. g_ovl_free_pos_y + OVL_FREE_CONTENT_H - 1.
@@ -167,27 +189,23 @@ public:
         //   Bottom transparent rows: [wFbH,           OVL_FREE_FB_H)
         //     where wFbH = g_ovl_free_pos_y + OVL_FREE_CONTENT_H
         //   When pos_y == OVL_FREE_TOP_TRIM (84): wFbH==720 → no bottom rows.
-        if (g_overlay_free_mode) {
-            const u32 pos_y   = static_cast<u32>(g_ovl_free_pos_y);
-            const u32 bot_row = pos_y + static_cast<u32>(OVL_FREE_CONTENT_H);
-            if (pos_y > 0u)
-                clear_fb_rows_transparent_448(renderer, 0u, pos_y);
-            if (bot_row < static_cast<u32>(OVL_FREE_FB_H))
-                clear_fb_rows_transparent_448(renderer, bot_row,
+        if (free_mode) {
+            if (static_cast<u32>(fb_top) > 0u)
+                clear_fb_rows_transparent_448(renderer, 0u, static_cast<u32>(fb_top));
+            if (static_cast<u32>(fb_bot) < static_cast<u32>(OVL_FREE_FB_H))
+                clear_fb_rows_transparent_448(renderer, static_cast<u32>(fb_bot),
                                               static_cast<u32>(OVL_FREE_FB_H));
             // Zero the 10 corner pixels per corner (40 total) outside the R=5
             // quarter-circle arc, so they stay transparent.  < 100 ns overhead.
             // Called here so the non-running early-return path also gets clean corners.
-            auto* const fb16 = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
-            clear_ovl_corners_448(fb16, static_cast<int>(pos_y),
-                                         static_cast<int>(bot_row));
+            clear_ovl_corners_448(fb16, fb_top, fb_bot);
         }
 
         // Title and widget — only drawn in fixed overlay mode.
         // In free mode the framebuffer is full height (720 rows) but the top
         // g_ovl_free_pos_y rows are transparent padding; the title/widget
         // area doesn't exist in free mode so we skip it entirely.
-        if (!g_overlay_free_mode) {
+        if (!free_mode) {
             draw_ultragb_title(renderer, 20, 67, 50);
 #if USING_WIDGET_DIRECTIVE
             renderer->drawWidget();
@@ -243,17 +261,25 @@ public:
         render_gb_letterbox(renderer);
         // Theme-aware letterbox override: always use g_ovl_frame_packed (frame_color +
         // frame_alpha keys) — even when wallpaper is active the frame color applies.
+        // renderer->a() is applied here (not at load time) so opacity fade, opaque-
+        // screenshot mode, and disableTransparency are all respected.  The adjusted
+        // color is packed once and shared across all four fill calls — no per-pixel cost.
         // After filling, zero the R=10 outer corners of the 400×360 letterbox rectangle
         // so the wallpaper/background shows through — same rounding style as the outer
         // overlay window's top corners.  Inner corners (game screen edge) stay square.
         {
             static constexpr int ix = 40, iy = 36, iw = 320, ih = 288;
-            auto* const fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
-            fill_letterbox_rect(fb, 0,       ix,       0,       VP_H, g_ovl_frame_packed);
-            fill_letterbox_rect(fb, ix + iw, VP_W,     0,       VP_H, g_ovl_frame_packed);
-            fill_letterbox_rect(fb, ix,      ix + iw,  0,       iy,   g_ovl_frame_packed);
-            fill_letterbox_rect(fb, ix,      ix + iw,  iy + ih, VP_H, g_ovl_frame_packed);
-            fill_vp_corners_448(fb, pre_wp_bg);
+            const tsl::Color    fc           = renderer->a(g_ovl_frame_col);
+            const uint16_t      frame_packed = static_cast<uint16_t>(
+                static_cast<uint16_t>(fc.r)        |
+                (static_cast<uint16_t>(fc.g) <<  4) |
+                (static_cast<uint16_t>(fc.b) <<  8) |
+                (static_cast<uint16_t>(fc.a) << 12));
+            fill_letterbox_rect(fb16, 0,       ix,       0,       VP_H, frame_packed);
+            fill_letterbox_rect(fb16, ix + iw, VP_W,     0,       VP_H, frame_packed);
+            fill_letterbox_rect(fb16, ix,      ix + iw,  0,       iy,   frame_packed);
+            fill_letterbox_rect(fb16, ix,      ix + iw,  iy + ih, VP_H, frame_packed);
+            fill_vp_corners_448(fb16, pre_wp_bg);
         }
         render_gb_screen(renderer);
         // Theme-aware viewport border + arc border at the 4 outer letterbox corners.
@@ -352,7 +378,7 @@ public:
             static constexpr s32 ARM_W   = 46;
             static constexpr s32 ARM_H   = 48;   // +2 vertically taller
             static constexpr s32 FULL    = 131;  // +3 for vertical length
-            static constexpr s32 LIP     = 4;   // uniform border, matches A/B circle thickness
+            static constexpr s32 LIP     = 3;   // uniform border, matches A/B circle thickness
             // Vertical bar — shifted 1px down, bottom extended 2px
             renderer->drawRect(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 4,
                                ARM_W + LIP*2, FULL + LIP*2 + 2-1, BK);
@@ -429,10 +455,10 @@ public:
         }
         renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y  + g_render_y_offset, ABTN_SIZE,   VBTN_COLOR);
         renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y  + g_render_y_offset, BBTN_SIZE,   VBTN_COLOR);
-        renderer->drawString("\uE0F0", false, SELECT_DRAW_X, SELECT_DRAW_Y + g_render_y_offset + 1, SELECT_SIZE, VBTN_COLOR);
+        renderer->drawString("\uE0F0", false, SELECT_DRAW_X -3, SELECT_DRAW_Y + g_render_y_offset + 1, SELECT_SIZE, VBTN_COLOR);
         renderer->drawString(ult::DIVIDER_SYMBOL, false,
             FB_W / 2 - g_div_half_w, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, 0xF444);
-        renderer->drawString("\uE0EF", false, START_DRAW_X, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, VBTN_COLOR);
+        renderer->drawString("\uE0EF", false, START_DRAW_X +3, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, VBTN_COLOR);
 
         // ── Focus pass-through flash border ──────────────────────────────────
         // Draws a 4-pixel coloured border for g_focus_flash frames after the
@@ -445,17 +471,14 @@ public:
         // In free overlay mode the border is clamped to the active content
         // area (fb_top..fb_bot) so it never draws into transparent padding rows.
         {
-        const int fb_top = g_overlay_free_mode ? g_ovl_free_pos_y : 0;
-        const int fb_bot = g_overlay_free_mode
-            ? g_ovl_free_pos_y + OVL_FREE_CONTENT_H
-            : static_cast<int>(tsl::cfg::FramebufferHeight);
+        // fb_top / fb_bot are already computed at function scope — no ternary needed.
 
         // draw_focus_flash returns true when the border was drawn this frame.
         // Used below to decide whether to re-zero rounded corners.
         const bool flash_was_active = draw_focus_flash(
             renderer, 0, fb_top, static_cast<s32>(FB_W), fb_bot - fb_top);
 
-        if (!g_overlay_free_mode) {
+        if (!free_mode) {
             if (!ult::useRightAlignment)
                 renderer->drawRect(447, 0, 448, static_cast<int>(tsl::cfg::FramebufferHeight), a(tsl::edgeSeparatorColor));
             else
@@ -467,7 +490,6 @@ public:
             // that can write into corner pixels.  Skipping the re-zero in normal
             // gameplay (flash_was_active == false every frame) saves 124 scalar
             // stores ≈ 125 ns per frame at no cost.
-            auto* const fb16 = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
             if (flash_was_active)
                 clear_ovl_corners_448(fb16, fb_top, fb_bot);
             // Skip border during drag: the reposition overlay immediately draws its
@@ -478,37 +500,18 @@ public:
         }
 
         // ── Free overlay reposition overlay ──────────────────────────────────
-        // Mirrors GBWindowedElement exactly: while dragging, dim the frozen
-        // frame and show a red border + centred "Paused" text.
-        if (g_overlay_free_mode && s_ovl_free_dragging) {
+        // draw_drag_dim_border (gb_renderer.h) handles dim + red border + text.
+        // "Paused" is centred within the 2× pixel-perfect screen region (VP2).
+        // scr_y accounts for g_render_y_offset so the text tracks pos_y correctly.
+        if (free_mode && s_ovl_free_dragging) {
             const s32 fw  = static_cast<s32>(tsl::cfg::FramebufferWidth);
             const s32 fbt = static_cast<s32>(fb_top);
-            const s32 fbb = static_cast<s32>(fb_bot);
-            const s32 fbc = fbb - fbt;  // content height
-
-            static constexpr tsl::Color DIM  = {0x0, 0x0, 0x0, 0x8};
-            renderer->drawRect(0, fbt, fw, fbc, DIM);
-
-            static constexpr int        BORD = 4;
-            static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
-            renderer->drawRect(0,         fbt,          fw,   BORD,          RED);
-            renderer->drawRect(0,         fbb - BORD,   fw,   BORD,          RED);
-            renderer->drawRect(0,         fbt + BORD,   BORD, fbc - BORD * 2, RED);
-            renderer->drawRect(fw - BORD, fbt + BORD,   BORD, fbc - BORD * 2, RED);
-
-            static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
-            static constexpr u32 FONT = 20;
-
-            // Centre "Paused" within the 2× pixel-perfect GB screen region.
-            // g_render_y_offset = pos_y - OVL_FREE_TOP_TRIM, so scr_y lands in
-            // the correct framebuffer row regardless of vertical position.
-            const s32 scr_x = VP2_X;
+            const s32 fbc = static_cast<s32>(fb_bot) - fbt;  // content height
             const s32 scr_y = static_cast<s32>(VP2_Y) + g_render_y_offset;
-            const auto [tw, th] = renderer->getTextDimensions("Paused", false, FONT);
-            renderer->drawString("Paused", false,
-                scr_x + (static_cast<s32>(VP2_W) - static_cast<s32>(tw)) / 2,
-                scr_y + (static_cast<s32>(VP2_H) + static_cast<s32>(th)) / 2,
-                FONT, WHITE);
+            draw_drag_dim_border(renderer,
+                fbt, fw, fbc,
+                (s32)VP2_X, scr_y, (s32)VP2_W, (s32)VP2_H,
+                20u);
         }
         } // end fb_top/fb_bot scope
     }  // end draw()
@@ -555,13 +558,11 @@ class GBOverlayGui : public tsl::Gui {
     static constexpr uint64_t PLUS_HOLD_NS = kPlusHoldNs;
     static constexpr int      JOY_DEADZONE = kJoyDeadzone;
 
-    // VI bounds — derived from the layer size Tesla set.
-    static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
+    // VI bounds — vi_max_x() / touch_win_w() are shared free functions in gb_globals.hpp.
     // vi_max_y() intentionally omitted: overlay Y repositioning is bounded by
     // OVL_FREE_TOP_TRIM, not by LayerHeight.  vi_max_y() was never called.
 
     // Layer footprint in HID touch space. W shared with windowed; H has no pixel-perfect branch here.
-    static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
     static int touch_win_h() { return static_cast<int>(tsl::cfg::LayerHeight) * 2 / 3; }
 
     // Sync notification / virtual-button touch offsets to the current VI position.

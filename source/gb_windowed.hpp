@@ -107,23 +107,42 @@ static int      s_win_last_y_offset = -1;  // -1 forces first build
 
 // ── Windowed framebuffer positioning helpers ───────────────────────────────────
 // The framebuffer is always win_fb_height() rows (half-screen + half-game).
-// The VI layer position and FB y-offset together place the game at g_win_pos_y
-// using continuous clamped functions — no binary anchor switch.
+// The VI layer position is FIXED to one screen edge; the FB y-offset slides
+// the game content within the layer so it appears at g_win_pos_y on screen.
 //
 //   layer_fb_top  = screen_fb_h() − win_fb_height()
-//   layer_vi_top  = layer_fb_top × 1.5  (720p)  or  layer_fb_top  (1080p)
+//   layer_vi_top  = layer_fb_top × 3/2  (720p)  or  layer_fb_top  (1080p)
+//   threshold     = layer_vi_top  (= vi_max_y_content() / 2 — exact screen midpoint)
 //
-//   win_layer_vi_y  = max(0, g_win_pos_y − layer_vi_top)
-//   win_fb_y_offset = min(layer_fb_top, g_win_pos_y × 2/3)   [720p]
+//   TOP HALF   (pos_y ≤ layer_vi_top):
+//     layer_vi_y  = 0                         layer FIXED — glued to screen top (ceiling)
+//     y_ofs       = pos_y × 2/3  (720p)       game slides DOWN through the FB
+//                 = pos_y        (1080p)
+//     screen_top  = 0 + y_ofs × 1.5 = pos_y  ✓
+//     Transparent rows ABOVE the game (0..y_ofs−1) are anchored to screen top.
+//     Transparent rows BELOW the game extend toward the layer bottom edge.
 //
-//   on-screen top = win_layer_vi_y + win_fb_y_offset × 1.5 = g_win_pos_y  ✓
+//   BOTTOM HALF (pos_y > layer_vi_top):
+//     layer_vi_y  = layer_vi_top               layer FIXED — glued to screen bottom (floor)
+//     y_ofs       = (pos_y−layer_vi_top) × 2/3 (720p)   game slides UP toward FB bottom
+//                 = (pos_y−layer_vi_top)        (1080p)
+//     screen_top  = layer_vi_top + y_ofs × 1.5 = pos_y  ✓
+//     Transparent rows BELOW the game (y_ofs+game_h..end) are anchored to screen bottom.
 //
-// y_ofs rises linearly until it hits layer_fb_top, after which it stays
-// constant and layer_vi_y takes over.  Neither variable jumps — the old
-// binary anchor switch caused a double-buffer desync glitch where
-// viSetLayerPosition fired immediately with the new layer Y while the
-// currently-displayed buffer still contained the old y_ofs, teleporting
-// the game to the wrong screen edge for one frame.
+//   TRANSITION at pos_y = layer_vi_top — seamless by construction:
+//     top    anchor: layer_vi_y = 0,           y_ofs = layer_fb_top
+//       → screen = 0 + layer_fb_top × 1.5 = layer_vi_top  ✓
+//     bottom anchor: layer_vi_y = layer_vi_top, y_ofs = 0
+//       → screen = layer_vi_top + 0           = layer_vi_top  ✓
+//     Both anchors produce the SAME on-screen game position at the threshold.
+//     y_ofs changes continuously within each half so motion is smooth everywhere.
+//
+//   GLITCH PREVENTION:
+//     setLayerPos is called from draw() AFTER the pixel blit, never from
+//     handleInput().  This guarantees the layer VI position and FB y_ofs are
+//     always derived from the same g_win_pos_y in the same frame — the
+//     double-buffer desync (new layer Y applied to the PREVIOUS frame's FB
+//     with the old y_ofs) cannot occur.
 //
 // Memory savings vs full-height 720-row FB:
 //   Scale 1: 432 rows  (−40 %)     Scale 4: 648 rows  (−10 %)
@@ -146,48 +165,56 @@ static inline int win_fb_height() {
     return screen_fb_h() / 2 + (game_h + 1) / 2;
 }
 
-// VI-space Y of the layer's top edge.
+// VI-space Y of the layer's top edge — FIXED to one screen edge at all times.
 //
-// Old design used a binary top/bottom anchor switch at the screen midpoint,
-// which caused a double-buffer desync glitch: viSetLayerPosition fires
-// immediately in the drag handler, but the currently DISPLAYED buffer was
-// drawn the previous frame with the old y_ofs.  For one frame the compositor
-// saw old_y_ofs + new_layer_y → game teleported to the wrong screen edge.
+// TOP HALF   (pos_y ≤ layer_vi_top): layer_vi_y = 0           (ceiling anchor)
+// BOTTOM HALF (pos_y > layer_vi_top): layer_vi_y = layer_vi_top (floor anchor)
 //
-// New design: continuous clamped functions with no discontinuity.
-//
-//   layer_vi_top  = (screen_fb_h() − win_fb_height()) × 1.5   [VI pixels]
-//   win_layer_vi_y = max(0, g_win_pos_y − layer_vi_top)
-//
-//   y_ofs rises linearly until it hits layer_fb_top, then stays constant.
-//   layer_vi_y stays at 0 until y_ofs is clamped, then rises linearly.
-//   Neither jumps discontinuously → double-buffer lag is ≤1 pixel, invisible.
-//
-//   Proof (720p, non-pixel-perfect, any scale):
-//     layer_vi_top  = layer_fb_top × 3/2
-//     on-screen top = layer_vi_y + y_ofs × 1.5
-//     top region (pos_y ≤ layer_vi_top):
-//       layer_vi_y = 0,  y_ofs = pos_y×2/3
-//       → 0 + pos_y×2/3 × 1.5 = pos_y  ✓
-//     bottom region (pos_y > layer_vi_top):
-//       layer_vi_y = pos_y − layer_vi_top,  y_ofs = layer_fb_top
-//       → (pos_y − layer_vi_top) + layer_fb_top×1.5
-//       = pos_y − layer_fb_top×1.5 + layer_fb_top×1.5 = pos_y  ✓
+// The layer never moves; win_fb_y_offset() slides the game within the FB so
+// it appears at g_win_pos_y on screen.  setLayerPos is called from draw()
+// after the blit so layer position and FB y_ofs are always consistent.
 static inline int win_layer_vi_y() {
     if (g_win_limited_fb) return g_win_pos_y;
     const int layer_fb_top = screen_fb_h() - win_fb_height();
     const int layer_vi_top = ult::windowedLayerPixelPerfect ? layer_fb_top : (layer_fb_top * 3 / 2);
-    return std::max(0, g_win_pos_y - layer_vi_top);
+    return (g_win_pos_y <= layer_vi_top) ? 0 : layer_vi_top;
 }
 
 // FB row within the layer where game content starts.
-// Rises linearly with g_win_pos_y until clamped at layer_fb_top, then constant.
-// Always 0 in limited-memory mode.
+//
+// The layer is FIXED (see win_layer_vi_y); this offset slides the game within
+// the FB so it appears at g_win_pos_y on screen.
+//
+// TOP HALF   (pos_y ≤ layer_vi_top):
+//   screen_top = layer_vi_y(0) + y_ofs × scale_factor = pos_y
+//   → y_ofs = pos_y / scale_factor
+//     720p:  y_ofs = pos_y × 2/3    range [0, layer_fb_top]
+//     1080p: y_ofs = pos_y           range [0, layer_fb_top]
+//
+// BOTTOM HALF (pos_y > layer_vi_top):
+//   screen_top = layer_vi_top + y_ofs × scale_factor = pos_y
+//   → y_ofs = (pos_y − layer_vi_top) / scale_factor
+//     720p:  y_ofs = (pos_y − layer_vi_top) × 2/3    range [0, layer_fb_top]
+//     1080p: y_ofs = (pos_y − layer_vi_top)            range [0, layer_fb_top]
+//
+// Always 0 in limited-memory mode (no padding rows, layer tracks pos_y directly).
 static inline int win_fb_y_offset() {
     if (g_win_limited_fb) return 0;
     const int layer_fb_top = screen_fb_h() - win_fb_height();
-    const int fb_row = ult::windowedLayerPixelPerfect ? g_win_pos_y : (g_win_pos_y * 2 / 3);
-    return std::min(layer_fb_top, fb_row);
+    const int layer_vi_top = ult::windowedLayerPixelPerfect ? layer_fb_top : (layer_fb_top * 3 / 2);
+    if (g_win_pos_y <= layer_vi_top) {
+        // Ceiling anchor — layer top = screen top (VI 0).
+        // Slide game down from FB row 0: y_ofs grows as pos_y increases.
+        return ult::windowedLayerPixelPerfect
+            ? g_win_pos_y
+            : (g_win_pos_y * 2 / 3);
+    } else {
+        // Floor anchor — layer bottom = screen bottom.
+        // Slide game up from FB row 0: y_ofs grows as pos_y increases past threshold.
+        return ult::windowedLayerPixelPerfect
+            ? (g_win_pos_y - layer_vi_top)
+            : ((g_win_pos_y - layer_vi_top) * 2 / 3);
+    }
 }
 
 // VI-space Y bounds for drag clamping — anchor-independent.
@@ -709,6 +736,16 @@ public:
         if (do_grid) dispatch.operator()<true>();
         else         dispatch.operator()<false>();
 
+        // ── Sync layer position with the just-rendered FB ────────────────────
+        // Called here, after the blit, so the layer VI position and y_ofs are
+        // always derived from the same g_win_pos_y in the same frame.
+        // Keeping setLayerPos out of handleInput() prevents the double-buffer
+        // desync that occurs when viSetLayerPosition fires on the currently-
+        // displayed (front) buffer before draw() has updated the back buffer.
+        tsl::gfx::Renderer::get().setLayerPos(
+            static_cast<u32>(g_win_pos_x),
+            static_cast<u32>(win_layer_vi_y()));
+
         // ── Pass-through flash border + drag overlay ─────────────────────────
         // fw/fh: game content dimensions in FB pixels.
         // y_ofs: FB row where game content starts (0 for top anchor when game
@@ -722,29 +759,13 @@ public:
 
         // ── Reposition overlay ────────────────────────────────────────────────
         // While dragging: dim the frozen frame and show "Paused" centred.
-        if (s_win_dragging) {
-
-            // Semi-transparent black veil (~50 % opacity in RGBA4444).
-            static constexpr tsl::Color DIM = {0x0, 0x0, 0x0, 0x8};
-            renderer->drawRect(0, y_ofs, fw, fh, DIM);
-
-            // Red border (4 px) so the window boundary is obvious.
-            static constexpr int        BORD = 4;
-            static constexpr tsl::Color RED  = {0xF, 0x0, 0x0, 0xF};
-            renderer->drawRect(0,         y_ofs,                  fw,   BORD,          RED);
-            renderer->drawRect(0,         y_ofs + fh - BORD,      fw,   BORD,          RED);
-            renderer->drawRect(0,         y_ofs + BORD,           BORD, fh - BORD * 2, RED);
-            renderer->drawRect(fw - BORD, y_ofs + BORD,           BORD, fh - BORD * 2, RED);
-
-            // "Paused" centred in white within the game content region.
-            static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
-            const u32 fontSize = static_cast<u32>(14 * g_win_scale);
-            const auto [tw, th] = renderer->getTextDimensions("Paused", false, fontSize);
-            renderer->drawString("Paused", false,
-                (fw - static_cast<s32>(tw)) / 2,
-                y_ofs + (fh + static_cast<s32>(th)) / 2,
-                fontSize, WHITE);
-        }
+        // draw_drag_dim_border (gb_renderer.h) handles dim + red border + text.
+        // Text is centred within the full game-content rect (x=0, y=y_ofs, fw×fh).
+        if (s_win_dragging)
+            draw_drag_dim_border(renderer,
+                y_ofs, fw, fh,
+                0, y_ofs, fw, fh,
+                static_cast<u32>(14 * g_win_scale));
     }
 
     void layout(u16, u16, u16, u16) override {
@@ -865,13 +886,8 @@ class GBWindowedGui : public tsl::Gui {
     bool m_load_failed = false;
 
     // VI bounds (scale-dependent) — derived from cfg::LayerWidth/Height.
-    static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
+    // vi_max_x() / touch_win_w() are shared free functions in gb_globals.hpp.
     // vi_max_y() intentionally omitted: windowed Y repositioning uses vi_max_y_content().
-
-    // Window footprint in HID touch space (0–1279 × 0–719).
-    // W body is identical to GBOverlayGui.
-    // H body differs (pixel-perfect branch) so it stays per-class.
-    static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
     // Game content height in HID touch space.
     //   720p:  touch = GB_H*scale   1080p: touch = GB_H*scale * 2/3
     static int touch_win_h() {
@@ -928,9 +944,8 @@ public:
             g_win_pos_y = std::max(mny, std::min(mxy, g_win_pos_y));
         }
 
-        // Layer X moves freely.  Layer Y is fixed for the session:
-        //   top anchor    → Y = 0
-        //   bottom anchor → Y = win_layer_vi_y() (layer bottom = screen bottom)
+        // Initial layer position before the first draw().  After that, draw()
+        // calls setLayerPos each frame so it stays in sync with the FB y_ofs.
         tsl::gfx::Renderer::get().setLayerPos(
             static_cast<u32>(g_win_pos_x),
             static_cast<u32>(win_layer_vi_y()));
@@ -1222,11 +1237,8 @@ public:
                     if (nx != g_win_pos_x || ny != g_win_pos_y) {
                         g_win_pos_x = nx;
                         g_win_pos_y = ny;
-                        // Layer X moves freely; layer Y is computed continuously
-                        // from g_win_pos_y — no anchor switch, no discontinuity.
-                        tsl::gfx::Renderer::get().setLayerPos(
-                            static_cast<u32>(g_win_pos_x),
-                            static_cast<u32>(win_layer_vi_y()));
+                        // Layer position is updated in draw() after the blit
+                        // so VI position and FB y_ofs are always in sync.
                         sync_notif_touch_offsets();
                     }
                 }
@@ -1326,9 +1338,7 @@ public:
                         if (nx != g_win_pos_x || ny != g_win_pos_y) {
                             g_win_pos_x = nx;
                             g_win_pos_y = ny;
-                            tsl::gfx::Renderer::get().setLayerPos(
-                                static_cast<u32>(g_win_pos_x),
-                                static_cast<u32>(win_layer_vi_y()));
+                            // Layer position updated in draw() after blit.
                             sync_notif_touch_offsets();
                         }
                     } else {
@@ -1359,103 +1369,3 @@ public:
         return m_dragging || m_plus_dragging;
     }
 };
-
-// =============================================================================
-// WindowedOverlay
-// =============================================================================
-//class WindowedOverlay : public tsl::Overlay {
-//    // Guard for onShow/onHide: only resume audio when we actually paused it.
-//    // On the very first show, gb_audio_init() inside gb_load_rom has already
-//    // started the audio thread — calling gb_audio_resume() on a never-paused
-//    // system causes glitches.  We only resume after a genuine onHide() call.
-//    bool m_audio_paused = false;
-//
-//public:
-//    void initServices() override {
-//        tsl::overrideBackButton = true;
-//        ult::COPY_BUFFER_SIZE   = 1024;
-//
-//        // Prevent Tesla from hiding the overlay when the user touches outside
-//        // the framebuffer region.  disableHiding suppresses it.
-//        // All hiding is done explicitly via the launch combo.
-//        tsl::disableHiding = true;
-//
-//        ult::createDirectory(CONFIG_DIR);
-//        ult::createDirectory(SAVE_BASE_DIR);
-//        ult::createDirectory(STATE_BASE_DIR);
-//        ult::createDirectory(STATE_DIR);
-//        ult::createDirectory(CONFIGURE_DIR);
-//
-//        load_config();
-//        write_default_config_if_missing();
-//        ult::createDirectory(g_rom_dir);
-//        ult::createDirectory(g_save_dir);
-//
-//        // Read windowed quick-exit flag.  Set when the user triggered Quick Launch
-//        // in windowed mode — the exit combo should close entirely, not return to
-//        // the UltraGB menu.  Clear it immediately so it never persists across
-//        // unrelated windowed launches.
-//        {
-//            const std::string qe = ult::parseValueFromIniSection(
-//                kConfigFile, kConfigSection, kKeyWinQuickExit);
-//            g_win_quick_exit = (qe == "1");
-//            if (g_win_quick_exit)
-//                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
-//        }
-//
-//        // Read the ROM path from config.ini.
-//        const std::string wrom = ult::parseValueFromIniSection(
-//            kConfigFile, kConfigSection, kKeyWindowedRom);
-//        if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
-//            strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
-//            g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
-//        }
-//        // Erase immediately so the key never persists across unrelated launches.
-//        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
-//    }
-//
-//    void exitServices() override {
-//        tsl::hlp::requestForeground(false);  // reclaim HID if pass-through was active
-//        tsl::disableHiding = false;  // restore default for any subsequent overlay
-//        ult::layerEdge  = 0;       // restore for normal overlay hit-tests
-//        tsl::layerEdgeY = 0;
-//        // Shut down the blit thread pool first — workers must not be running
-//        // when gb_unload_rom frees g_gb_fb and nulls g_gb.rom.  shutdown()
-//        // joins all workers so the blit is guaranteed complete before we continue.
-//        if (s_win_pool_active) {
-//            s_win_pool.shutdown();
-//            s_win_pool_active = false;
-//        }
-//        gb_unload_rom();             // saves quick-resume state + SRAM
-//        gb_audio_free_dma();
-//        free_lcd_ghosting();
-//    }
-//
-//    void onHide() override {
-//        tsl::hlp::requestForeground(true);  // reclaim HID if pass-through was active
-//        g_gb.running   = false;
-//        g_emu_active   = false;
-//        gb_audio_pause();
-//        m_audio_paused = true;
-//    }
-//
-//    void onShow() override {
-//        if (g_gb.rom) {
-//            g_gb_frame_next_ns = 0;
-//            g_gb.running  = true;
-//            g_emu_active  = true;
-//            if (m_audio_paused) {
-//                gb_audio_resume();
-//                m_audio_paused = false;
-//            }
-//        }
-//    }
-//
-//    std::unique_ptr<tsl::Gui> loadInitialGui() override {
-//        if (g_win_rom_path[0]) {
-//            strncpy(g_pending_rom_path, g_win_rom_path, sizeof(g_pending_rom_path) - 1);
-//            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-//        }
-//        return initially<GBWindowedGui>();
-//    }
-//};

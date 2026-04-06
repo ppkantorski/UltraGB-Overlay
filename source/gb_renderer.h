@@ -425,22 +425,30 @@ static inline void update_sprite_flicker_state() {
     }
 }
 
-inline void apply_lcd_ghosting() {
-    if (!g_lcd_ghosting || ult::limitedMemory) return;
-    const int total = GB_W * GB_H;
-
+// Allocates all three ghosting buffers on first use.
+// [[gnu::noinline]] — cold path, called at most once per ROM load.
+// Returns false if any allocation fails so apply_lcd_ghosting can bail early.
+[[gnu::noinline]]
+static bool alloc_ghosting_buffers(int total) {
     if (!s_prev_fb) {
         s_prev_fb = static_cast<uint16_t*>(malloc(total * sizeof(uint16_t)));
-        if (!s_prev_fb) return;
+        if (!s_prev_fb) return false;
     }
     if (!s_flicker_pixel_curr) {
         s_flicker_pixel_curr = static_cast<uint8_t*>(calloc(total, 1));
-        if (!s_flicker_pixel_curr) return;
+        if (!s_flicker_pixel_curr) return false;
     }
     if (!s_flicker_pixel_prev) {
         s_flicker_pixel_prev = static_cast<uint8_t*>(calloc(total, 1));
-        if (!s_flicker_pixel_prev) return;
+        if (!s_flicker_pixel_prev) return false;
     }
+    return true;
+}
+
+inline void apply_lcd_ghosting() {
+    if (!g_lcd_ghosting || ult::limitedMemory) return;
+    const int total = GB_W * GB_H;
+    if (!alloc_ghosting_buffers(total)) return;
 
     if (!s_prev_fb_valid) {
         memcpy(s_prev_fb, g_gb_fb, total * sizeof(uint16_t));
@@ -860,6 +868,7 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
     fill_letterbox_rect(fb, ix,      ix + iw,  0,       iy,   PACKED_LB); // top
     fill_letterbox_rect(fb, ix,      ix + iw,  iy + ih, VP_H, PACKED_LB); // bottom
 }
+
 // =============================================================================
 // ── Wallpaper / transparent-row swizzle tables for the fixed 448×720 FB ──────
 // Shared between draw_wallpaper_direct (wallpaper blending) and
@@ -1361,4 +1370,53 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
     }
 
     ult::inPlot.store(false, std::memory_order_release);
+}
+
+// =============================================================================
+// draw_drag_dim_border — shared reposition-active overlay
+//
+// Called by GBWindowedElement::draw() and GBOverlayElement::draw() while a
+// touch-drag or joystick reposition is active.  Both paths produce the same
+// visual: a semi-transparent dim over the game region, a 4 px red inset border
+// marking the window boundary, and "Paused" centred within a caller-specified
+// sub-region.
+//
+// Parameters
+//   renderer            — Tesla renderer
+//   y                   — FB row where the dimmed/bordered content starts
+//   w                   — content width  (full FB width, starting at x=0)
+//   h                   — content height
+//   txt_rx, txt_ry      — top-left of the text-centering sub-region
+//   txt_rw, txt_rh      — size of the text-centering sub-region
+//   font_size           — font size for getTextDimensions / drawString
+//
+// [[gnu::noinline]] forces exactly one copy in .text so the five drawRect +
+// one drawString calls are not duplicated at each call site.
+// =============================================================================
+[[gnu::noinline]]
+static void draw_drag_dim_border(tsl::gfx::Renderer* renderer,
+    s32 y, s32 w, s32 h,
+    s32 txt_rx, s32 txt_ry, s32 txt_rw, s32 txt_rh,
+    u32 font_size)
+{
+    static constexpr tsl::Color DIM   = {0x0, 0x0, 0x0, 0x8};
+    static constexpr tsl::Color RED   = {0xF, 0x0, 0x0, 0xF};
+    static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
+    static constexpr int        BORD  = 4;
+
+    // Semi-transparent black veil (~50 % opacity in RGBA4444).
+    renderer->drawRect(0, y, w, h, DIM);
+
+    // Red border (4 px inset) so the window boundary is obvious during drag.
+    renderer->drawRect(0,        y,            w,    BORD,          RED);
+    renderer->drawRect(0,        y + h - BORD, w,    BORD,          RED);
+    renderer->drawRect(0,        y + BORD,     BORD, h - BORD * 2,  RED);
+    renderer->drawRect(w - BORD, y + BORD,     BORD, h - BORD * 2,  RED);
+
+    // "Paused" centred within the caller-supplied text sub-region.
+    const auto [tw, th] = renderer->getTextDimensions("Paused", false, font_size);
+    renderer->drawString("Paused", false,
+        txt_rx + (txt_rw - static_cast<s32>(tw)) / 2,
+        txt_ry + (txt_rh + static_cast<s32>(th)) / 2,
+        font_size, WHITE);
 }

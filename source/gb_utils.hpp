@@ -1184,6 +1184,31 @@ static void fill_vp_corners_448(uint16_t* const fb16, const uint16_t bg_packed) 
     }
 }
 // =============================================================================
+// write_theme_defaults
+//
+// Writes the eight canonical default key/value pairs to an [theme] section
+// in `path`.  Shared by write_default_ovl_theme_if_missing() and
+// DropdownSelectorGui::apply_theme() — both call identical sets of values,
+// so a single loop over a static table eliminates 13 redundant call-site
+// expansions in the binary.
+// =============================================================================
+[[gnu::noinline]]
+static void write_theme_defaults(const std::string& path) {
+    static constexpr const char* kv[][2] = {
+        {"bg_color",       "000000"},
+        {"bg_alpha",       "13"    },
+        {"button_color",   "333333"},
+        {"border_color",   "333333"},
+        {"backdrop_color", "000000"},
+        {"frame_color",    "111111"},
+        {"frame_alpha",    "14"    },
+        {"gb_text_color",  "ffffff"},
+    };
+    for (const auto& p : kv)
+        ult::setIniFileValue(path, "theme", p[0], p[1], "");
+}
+
+// =============================================================================
 // write_default_ovl_theme_if_missing
 //
 // Creates OVL_THEMES_DIR and writes canonical default values to OVL_THEME_FILE
@@ -1194,14 +1219,7 @@ static void write_default_ovl_theme_if_missing() {
     ult::createDirectory(OVL_THEMES_DIR);
     const std::string path(OVL_THEME_FILE);
     if (ult::isFile(path)) return;
-    ult::setIniFileValue(path, "theme", "bg_color",      "000000",  "");
-    ult::setIniFileValue(path, "theme", "bg_alpha",      "13",      "");
-    ult::setIniFileValue(path, "theme", "button_color",  "333333",  "");
-    ult::setIniFileValue(path, "theme", "border_color",  "333333",  "");
-    ult::setIniFileValue(path, "theme", "backdrop_color","000000",  "");
-    ult::setIniFileValue(path, "theme", "frame_color",   "111111",  "");
-    ult::setIniFileValue(path, "theme", "frame_alpha",   "14",      "");
-    ult::setIniFileValue(path, "theme", "gb_text_color", "ffffff",  "");
+    write_theme_defaults(path);
 }
 
 // =============================================================================

@@ -404,3 +404,20 @@ static constexpr float    kJoyMaxSens   = 0.0005f;          // x^8 curve maximum
 // =============================================================================
 static bool     g_console_docked  = false;  // last known dock state
 static uint32_t g_dock_next_check = 0;      // g_frame_count value at which to re-query
+
+// =============================================================================
+// Shared VI / touch-space bounds helpers
+//
+// Both GBWindowedGui and GBOverlayGui need these two identical calculations.
+// Defining them once here as file-scope functions (internal linkage via static)
+// gives the compiler a single definition to inline or emit — no duplicate
+// symbols in .text, no separate static-member stubs per class.
+//
+// vi_max_x()    — maximum safe VI-space X so the layer stays on screen.
+// touch_win_w() — layer width in HID touch space (0–1279); VI×2/3.
+//
+// Note: touch_win_h() intentionally stays per-class — windowed has a
+// pixel-perfect branch while overlay does not.
+// =============================================================================
+static inline int vi_max_x()    { return 1920 - static_cast<int>(tsl::cfg::LayerWidth); }
+static inline int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth) * 2 / 3; }

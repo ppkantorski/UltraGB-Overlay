@@ -481,11 +481,13 @@ bool gb_load_rom(const char* path) {
     //   ROM < 2 MB  → needs 6 MB heap (locked only on 4 MB)
     //   ROM 2–4 MB  → needs 8 MB heap (locked on 4 MB and 6 MB)
     //   ROM >= 4 MB → needs 10 MB heap (locked on 4 MB, 6 MB, and 8 MB)
-    const bool ghostingHardLocked =
-        ult::limitedMemory ||
-        (!ult::expandedMemory && sz >= kROM_2MB) ||
-        (ult::expandedMemory && !ult::furtherExpandedMemory && sz >= kROM_4MB);
-    g_lcd_ghosting = ghostingHardLocked ? false : load_game_lcd_ghosting(path);
+    {
+        const bool ghostingHardLocked =
+            ult::limitedMemory ||
+            (!ult::expandedMemory && sz >= kROM_2MB) ||
+            (ult::expandedMemory && !ult::furtherExpandedMemory && sz >= kROM_4MB);
+        g_lcd_ghosting = ghostingHardLocked ? false : load_game_lcd_ghosting(path);
+    }
 
     size_t ramSz = 0;
     gb_get_save_size_s(g_gb.gb, &ramSz);
@@ -630,22 +632,21 @@ void gb_set_input(u64 keysHeld) {
 // =============================================================================
 // ROM scanner
 // =============================================================================
-static bool is_gb_rom(const char* name) {
-    const size_t len = strlen(name);
+// filter function for scandir(); accepts .gb / .gbc files only.
+// is_gb_rom inlined here — it was only ever called from this one site.
+static int gb_rom_filter(const struct dirent* e) {
+    const char* n = e->d_name;
+    const size_t len = strlen(n);
     if (len >= 4) {
-        const char* e = name + len - 4;
-        if (e[0]=='.' && tolower((uint8_t)e[1])=='g' &&
-            tolower((uint8_t)e[2])=='b' && tolower((uint8_t)e[3])=='c') return true;
+        const char* x = n + len - 4;
+        if (x[0]=='.' && tolower((uint8_t)x[1])=='g' &&
+            tolower((uint8_t)x[2])=='b' && tolower((uint8_t)x[3])=='c') return 1;
     }
     if (len >= 3) {
-        const char* e = name + len - 3;
-        if (e[0]=='.' && tolower((uint8_t)e[1])=='g' && tolower((uint8_t)e[2])=='b') return true;
+        const char* x = n + len - 3;
+        if (x[0]=='.' && tolower((uint8_t)x[1])=='g' && tolower((uint8_t)x[2])=='b') return 1;
     }
-    return false;
-}
-// scan_roms_scandir — filter function for scandir(); accepts .gb / .gbc files only.
-static int gb_rom_filter(const struct dirent* e) {
-    return is_gb_rom(e->d_name) ? 1 : 0;
+    return 0;
 }
 
 // draw_ultragb_title — shared animated title renderer.
@@ -701,8 +702,7 @@ class RomSelectorGui;       // forward declare
 class GameSettingsGui;      // forward declare
 class SettingsGui;          // forward declare
 class SaveSlotsGui;         // forward declare  (merged SaveStatesGui + SaveDataGui)
-class SlotActionGui;        // forward declare  (merged SlotActionGui + SaveDataSlotActionGui)
-class ConfirmGui;           // forward declare
+class SlotActionGui;        // forward declare  (merged SlotActionGui + SaveDataSlotActionGui + ConfirmGui)
 class DropdownSelectorGui;  // forward declare  (merged QuickComboSelectorGui + OvlThemeSelectorGui)
 
 // Actions that flow through ConfirmGui.
@@ -731,149 +731,41 @@ static constexpr const char* confirm_action_label(ConfirmAction a) {
 }
 
 // =============================================================================
-// SlotActionGui — Save/Load/Delete (states) or Backup/Restore/Delete (save data)
+// SlotActionGui — Save/Load/Delete (states) or Backup/Restore/Delete (save data),
+//                 with built-in Yes/No confirmation (former ConfirmGui merged in).
 //
 // m_is_data=false → state slots (Save / Load / Delete)
 // m_is_data=true  → save-data slots (Backup / Restore / Delete)
 //
-// Both modes share the same structure: a slot header, three action items with
-// pre-flight empty-slot checks where appropriate, and B → parent slot list.
-// Merging eliminates a full duplicate vtable + createUI + handleInput body.
+// m_confirming=false → shows the three action items (action-list mode)
+// m_confirming=true  → shows Yes/No for m_pending_action (confirm mode)
+//
+// Merging ConfirmGui in eliminates its vtable and the tsl::swapTo<ConfirmGui>
+// template instantiation — each swapTo<T> generates a unique instantiation
+// chain that LTO only partially folds, so removing T saves real binary space.
 // =============================================================================
 class SlotActionGui : public tsl::Gui {
-    std::string m_rom_path;
-    std::string m_display_name;
-    std::string m_jump_to;
-    int         m_slot;
-    bool        m_is_data;
-public:
-    SlotActionGui(std::string romPath, std::string displayName,
-                  int slot, bool isData, std::string jumpTo = "")
-        : m_rom_path(std::move(romPath))
-        , m_display_name(std::move(displayName))
-        , m_jump_to(std::move(jumpTo))
-        , m_slot(slot)
-        , m_is_data(isData)
-    {}
+    std::string   m_rom_path;
+    std::string   m_display_name;
+    std::string   m_jump_to;
+    ConfirmAction m_pending_action;   // valid only when m_confirming == true
+    int           m_slot;
+    bool          m_is_data;
+    bool          m_confirming;
 
-    virtual tsl::elm::Element* createUI() override {
-        auto* list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader(make_slot_detail_header(m_slot, m_display_name)));
+    // ── Helpers shared between the confirm screen and do_yes() paths ──────────
 
-        const std::string& romPath    = m_rom_path;
-        const std::string& displayName = m_display_name;
-        const int  slot   = m_slot;
-        const bool isData = m_is_data;
-
-        // ── Item 1: Save / Backup ─────────────────────────────────────────────
-        // No pre-flight — ConfirmGui::do_yes handles the empty-source case.
-        const ConfirmAction act1 = isData ? ConfirmAction::DataBackup : ConfirmAction::StateSave;
-        auto* item1 = new tsl::elm::SilentListItem(isData ? "Backup" : "Save");
-        item1->setClickListener([romPath, displayName, slot, act1](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            triggerEnterFeedback();
-            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act1);
-            return true;
-        });
-        list->addItem(item1);
-
-        // ── Item 2: Load / Restore ────────────────────────────────────────────
-        // Pre-flight: bail early if the slot file doesn't exist yet.
-        const ConfirmAction act2 = isData ? ConfirmAction::DataRestore : ConfirmAction::StateLoad;
-        auto* item2 = new tsl::elm::SilentListItem(isData ? "Restore" : "Load");
-        item2->setClickListener([romPath, displayName, slot, isData, act2](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            char slotPath[PATH_BUFFER_SIZE] = {};
-            if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
-            triggerEnterFeedback();
-            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act2);
-            return true;
-        });
-        list->addItem(item2);
-
-        // ── Item 3: Delete ────────────────────────────────────────────────────
-        // Same path builder as item 2.
-        const ConfirmAction act3 = isData ? ConfirmAction::DataDelete : ConfirmAction::StateDelete;
-        auto* item3 = new tsl::elm::SilentListItem("Delete");
-        item3->setClickListener([romPath, displayName, slot, isData, act3](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            char slotPath[PATH_BUFFER_SIZE] = {};
-            if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
-            triggerEnterFeedback();
-            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act3);
-            return true;
-        });
-        list->addItem(item3);
-
-        // Restore focus to the item clicked before entering ConfirmGui.
-        if (!m_jump_to.empty())
-            list->jumpToItem(m_jump_to, "", true);
-
-        return make_bare_frame(list);
-    }
-
-    virtual bool handleInput(u64 keysDown, u64 keysHeld,
-                             const HidTouchState& touchPos,
-                             HidAnalogStickState leftJoy,
-                             HidAnalogStickState rightJoy) override {
-        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
-        if (keysDown & KEY_B) {
-            triggerExitFeedback();
-            tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name,
-                                      make_slot_label(m_slot), m_is_data);
-            return true;
-        }
-        return false;
-    }
-};
-
-// =============================================================================
-// ConfirmGui — single-purpose "Yes / No" confirmation screen
-//
-// Sits between SlotActionGui / SaveDataSlotActionGui and the actual action.
-// The CategoryHeader shows the action name (e.g. "Save", "Delete").
-//
-//   Yes — executes the action via do_yes(), then navigates onward exactly as
-//         the old direct-click code did.
-//   No  — calls do_back(), returning to the originating action Gui with focus
-//         restored to the item that was just clicked.
-//   B   — identical to No.
-//
-// Memory: one enum byte + three strings + one int — no std::function, no heap
-// closures beyond what tsl::elm already allocates for its list items.
-// =============================================================================
-class ConfirmGui : public tsl::Gui {
-    std::string  m_rom_path;
-    std::string  m_display_name;
-    int          m_slot;
-    ConfirmAction m_action;
-
-    // Navigate back to the originating action Gui, restoring focus.
-    void do_back() {
-        triggerExitFeedback();
-        const char* label  = confirm_action_label(m_action);
-        const bool  isData = (m_action >= ConfirmAction::DataBackup);
-        tsl::swapTo<SlotActionGui>(m_rom_path, m_display_name, m_slot, isData, label);
-    }
-
-    // Swap to the SaveSlotsGui for this slot; isData selects state vs data view.
     void swap_to_slots(bool isData) {
-        tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), isData);
+        tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name,
+                                  make_slot_label(m_slot), isData);
     }
 
-    // Shared failure path: wall-feedback + notify + return to action Gui.
     void do_fail(const char* msg) {
         triggerWallFeedback();
         show_notify(msg);
-        do_back();
+        do_back();   // return to action-list view
     }
 
-    // Shared delete path: erase main + timestamp files, swap to slots, notify.
-    // PathBuilder matches build_user_slot_path / build_save_backup_slot_path etc.
     using PathBuilder = void(*)(const char*, int, char*, size_t);
     void do_delete(PathBuilder buildMain, PathBuilder buildTs, bool isData) {
         char path[PATH_BUFFER_SIZE] = {};
@@ -887,14 +779,22 @@ class ConfirmGui : public tsl::Gui {
         show_notify("Slot deleted.");
     }
 
-    // Execute the confirmed action, then navigate onward.
+    // Return to action-list mode, restoring focus to the item that was just
+    // confirmed (formerly ConfirmGui::do_back + swapTo<SlotActionGui>).
+    void do_back() {
+        triggerExitFeedback();
+        const char* label = confirm_action_label(m_pending_action);
+        tsl::swapTo<SlotActionGui>(m_rom_path, m_display_name,
+                                   m_slot, m_is_data, label);
+        // confirming=false by default → shows action list
+    }
+
+    // Execute the confirmed action then navigate onward (formerly ConfirmGui::do_yes).
     void do_yes() {
-        switch (m_action) {
+        switch (m_pending_action) {
 
             case ConfirmAction::StateSave:
                 if (save_user_slot(m_rom_path.c_str(), m_slot)) {
-                    //triggerEnterFeedback();
-                    //triggerRumbleClick.store(true, std::memory_order_release);
                     swap_to_slots(false);
                     show_notify("State saved.");
                 } else {
@@ -917,7 +817,6 @@ class ConfirmGui : public tsl::Gui {
 
             case ConfirmAction::DataBackup:
                 if (backup_save_data_slot(m_rom_path.c_str(), m_slot)) {
-                    //triggerEnterFeedback();
                     show_notify("Save data backed up.");
                     swap_to_slots(true);
                 } else {
@@ -931,7 +830,6 @@ class ConfirmGui : public tsl::Gui {
                     break;
                 }
                 swap_to_slots(true);
-                //triggerEnterFeedback();
                 show_notify("Save data restored.");
                 break;
 
@@ -942,38 +840,106 @@ class ConfirmGui : public tsl::Gui {
     }
 
 public:
-    ConfirmGui(std::string romPath, std::string displayName, int slot, ConfirmAction action)
+    // Default pendingAction value is unused when confirming=false; StateSave
+    // is a harmless zero-value placeholder — it is never read in action-list mode.
+    SlotActionGui(std::string romPath, std::string displayName,
+                  int slot, bool isData, std::string jumpTo = "",
+                  ConfirmAction pendingAction = ConfirmAction::StateSave,
+                  bool confirming = false)
         : m_rom_path(std::move(romPath))
         , m_display_name(std::move(displayName))
+        , m_jump_to(std::move(jumpTo))
+        , m_pending_action(pendingAction)
         , m_slot(slot)
-        , m_action(action)
+        , m_is_data(isData)
+        , m_confirming(confirming)
     {}
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
 
-        // Header names the action — "Save", "Load", "Delete", "Backup", etc.
-        list->addItem(new tsl::elm::CategoryHeader(
-            std::string(make_slot_label(m_slot)) +
-            " " + ult::DIVIDER_SYMBOL + " " + confirm_action_label(m_action)));
+        if (m_confirming) {
+            // ── Confirmation screen (formerly ConfirmGui::createUI) ───────────
+            list->addItem(new tsl::elm::CategoryHeader(
+                std::string(make_slot_label(m_slot)) +
+                " " + ult::DIVIDER_SYMBOL + " " + confirm_action_label(m_pending_action)));
 
-        auto* yesItem = new tsl::elm::SilentListItem("Yes");
-        yesItem->setClickListener([this](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            if (m_action != ConfirmAction::DataDelete)
+            auto* yesItem = new tsl::elm::SilentListItem("Yes");
+            yesItem->setClickListener([this](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                if (m_pending_action != ConfirmAction::DataDelete)
+                    triggerEnterFeedback();
+                do_yes();
+                return true;
+            });
+            list->addItem(yesItem);
+
+            auto* noItem = new tsl::elm::SilentListItem("No");
+            noItem->setClickListener([this](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                do_back();
+                return true;
+            });
+            list->addItem(noItem);
+
+        } else {
+            // ── Action list ───────────────────────────────────────────────────
+            list->addItem(new tsl::elm::CategoryHeader(
+                make_slot_detail_header(m_slot, m_display_name)));
+
+            const std::string& romPath    = m_rom_path;
+            const std::string& displayName = m_display_name;
+            const int  slot   = m_slot;
+            const bool isData = m_is_data;
+
+            // ── Item 1: Save / Backup ─────────────────────────────────────────
+            // No pre-flight — do_yes handles the empty-source case.
+            const ConfirmAction act1 = isData ? ConfirmAction::DataBackup : ConfirmAction::StateSave;
+            auto* item1 = new tsl::elm::SilentListItem(isData ? "Backup" : "Save");
+            item1->setClickListener([romPath, displayName, slot, isData, act1](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
                 triggerEnterFeedback();
-            do_yes();
-            return true;
-        });
-        list->addItem(yesItem);
+                tsl::swapTo<SlotActionGui>(romPath, displayName, slot, isData, "", act1, true);
+                return true;
+            });
+            list->addItem(item1);
 
-        auto* noItem = new tsl::elm::SilentListItem("No");
-        noItem->setClickListener([this](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            do_back();
-            return true;
-        });
-        list->addItem(noItem);
+            // ── Item 2: Load / Restore ────────────────────────────────────────
+            // Pre-flight: bail early if the slot file doesn't exist yet.
+            const ConfirmAction act2 = isData ? ConfirmAction::DataRestore : ConfirmAction::StateLoad;
+            auto* item2 = new tsl::elm::SilentListItem(isData ? "Restore" : "Load");
+            item2->setClickListener([romPath, displayName, slot, isData, act2](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                char slotPath[PATH_BUFFER_SIZE] = {};
+                if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+                else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+                if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
+                triggerEnterFeedback();
+                tsl::swapTo<SlotActionGui>(romPath, displayName, slot, isData, "", act2, true);
+                return true;
+            });
+            list->addItem(item2);
+
+            // ── Item 3: Delete ────────────────────────────────────────────────
+            // Same path builder as item 2.
+            const ConfirmAction act3 = isData ? ConfirmAction::DataDelete : ConfirmAction::StateDelete;
+            auto* item3 = new tsl::elm::SilentListItem("Delete");
+            item3->setClickListener([romPath, displayName, slot, isData, act3](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                char slotPath[PATH_BUFFER_SIZE] = {};
+                if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+                else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+                if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
+                triggerEnterFeedback();
+                tsl::swapTo<SlotActionGui>(romPath, displayName, slot, isData, "", act3, true);
+                return true;
+            });
+            list->addItem(item3);
+
+            // Restore focus to the previously clicked item on re-entry.
+            if (!m_jump_to.empty())
+                list->jumpToItem(m_jump_to, "", true);
+        }
 
         return make_bare_frame(list);
     }
@@ -984,7 +950,13 @@ public:
                              HidAnalogStickState rightJoy) override {
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
-            do_back();
+            if (m_confirming) {
+                do_back();   // do_back fires triggerExitFeedback internally
+            } else {
+                triggerExitFeedback();
+                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name,
+                                          make_slot_label(m_slot), m_is_data);
+            }
             return true;
         }
         return false;
@@ -1288,7 +1260,7 @@ public:
 // SelectorMode::QuickCombo — combo picker (stays on list after selection)
 // SelectorMode::OvlTheme   — theme picker (swaps back to SettingsGui on select)
 // =============================================================================
-enum class SelectorMode : uint8_t { QuickCombo, OvlTheme };
+enum class SelectorMode : uint8_t { QuickCombo, OvlTheme, WindowedSub, OverlaySub };
 
 static int ovl_theme_filter(const struct dirent* e) {
     const char* n = e->d_name;
@@ -1301,8 +1273,10 @@ static int ovl_theme_filter(const struct dirent* e) {
 class DropdownSelectorGui : public tsl::Gui {
     std::string          m_rom_scroll;
     std::string          m_settings_scroll;
-    tsl::elm::ListItem*  m_lastSelected = nullptr;
+    tsl::elm::ListItem*  m_lastSelected  = nullptr;
+    tsl::elm::ListItem*  m_scale_item    = nullptr;  ///< WindowedSub — cross-refreshed by Docked Resolution.
     SelectorMode         m_mode;
+    bool                 m_return_to_submenu = false;
 
     // Transfer the checkmark from the previously selected item to `item`.
     void select_item(tsl::elm::ListItem* item) {
@@ -1337,27 +1311,31 @@ class DropdownSelectorGui : public tsl::Gui {
     // Overwrite OVL_THEME_FILE with the chosen theme and reload all colors.
     // srcPath == nullptr means "default" — write canonical default values.
     void apply_theme(const char* name, const char* srcPath) {
-        if (srcPath) {
+        if (srcPath)
             copy_file(srcPath, OVL_THEME_FILE);
-        } else {
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_color",      "000000",  "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_alpha",      "13",      "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "button_color",  "333333",  "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "border_color",  "333333",  "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "backdrop_color","000000",  "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "frame_color",   "111111",  "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "frame_alpha",   "14",      "");
-            ult::setIniFileValue(OVL_THEME_FILE, "theme", "gb_text_color", "ffffff",  "");
-        }
+        else
+            write_theme_defaults(OVL_THEME_FILE);
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlTheme, name, "");
         load_ovl_theme();
     }
 
+    // Return from OvlTheme: go back to OverlaySub if m_return_to_submenu,
+    // otherwise to SettingsGui.  Called after apply_theme and on KEY_B.
+    void do_theme_back() {
+        if (m_return_to_submenu)
+            tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string("Theme"),
+                                              SelectorMode::OverlaySub);
+        else
+            tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+    }
+
 public:
-    DropdownSelectorGui(std::string romScroll, std::string settingsScroll, SelectorMode mode)
+    DropdownSelectorGui(std::string romScroll, std::string settingsScroll,
+                        SelectorMode mode, bool returnToSubmenu = false)
         : m_rom_scroll(std::move(romScroll))
         , m_settings_scroll(std::move(settingsScroll))
-        , m_mode(mode) {}
+        , m_mode(mode)
+        , m_return_to_submenu(returnToSubmenu) {}
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
@@ -1428,9 +1406,113 @@ public:
             if (!jumpTarget.empty())
                 list->jumpToItem(jumpTarget, "", true);
 
+        } else if (m_mode == SelectorMode::OverlaySub) {
+            // ── Overlay sub-menu (SelectorMode::OverlaySub) ───────────────────
+            list->addItem(new tsl::elm::CategoryHeader("Overlay"));
+
+            // Position ────────────────────────────────────────────────────
+            {
+                auto* pos_item = new tsl::elm::ListItem(
+                    "Position",
+                    g_overlay_free_mode ? "Free" : "Fixed");
+                pos_item->setClickListener([pos_item](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    g_overlay_free_mode = !g_overlay_free_mode;
+                    pos_item->setValue(g_overlay_free_mode ? "Free" : "Fixed");
+                    save_ovl_free_mode();
+                    return true;
+                });
+                list->addItem(pos_item);
+            }
+
+            // Theme ────────────────────────────────────────────────────────────
+            {
+                auto* th_item = new tsl::elm::ListItem("Theme",
+                                                        std::string(g_ovl_theme_name));
+                th_item->setClickListener([this](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
+                                                     SelectorMode::OvlTheme, true);
+                    return true;
+                });
+                list->addItem(th_item);
+            }
+
+            if (ult::expandedMemory) {
+                auto* wallpaper_item = new tsl::elm::ToggleListItem(
+                    "Wallpaper", g_overlay_wallpaper, ult::ON, ult::OFF);
+                wallpaper_item->setStateChangedListener([](bool state) {
+                    g_overlay_wallpaper = state;
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOverlayWallpaper,
+                                         state ? "1" : "0", "");
+                });
+                list->addItem(wallpaper_item);
+            }
+
+            if (!m_settings_scroll.empty())
+                list->jumpToItem(m_settings_scroll, "", true);
+
+        } else if (m_mode == SelectorMode::WindowedSub) {
+            // ── Windowed sub-menu ─────────────────────────────────────────────
+            list->addItem(new tsl::elm::CategoryHeader("Windowed"));
+
+            // Scale ────────────────────────────────────────────────────────────
+            {
+                const bool romSmall = [&]() -> bool {
+                    if (ult::furtherExpandedMemory) return true;
+                    if (!g_last_rom_path[0])        return false;
+                    const std::string full = std::string(g_rom_dir) + g_last_rom_path;
+                    return get_rom_size(full.c_str()) < kROM_4MB;
+                }();
+                auto make_label = [romSmall]() -> std::string {
+                    const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
+                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                    static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
+                    return lbs[std::min(g_win_scale, ms_) - 1];
+                };
+                auto* scale_item = new tsl::elm::ListItem("Scale", make_label());
+                scale_item->setClickListener([scale_item, romSmall, make_label](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
+                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                    g_win_scale    = (std::min(g_win_scale, ms_) % ms_) + 1;
+                    save_win_scale();
+                    scale_item->setValue(make_label());
+                    return true;
+                });
+                m_scale_item = scale_item;
+                list->addItem(scale_item);
+            }
+
+            // Docked Resolution ────────────────────────────────────────────────
+            {
+                auto* out_item = new tsl::elm::ListItem("Docked Resolution",
+                                                         g_win_1080 ? "1080p" : "720p");
+                out_item->setClickListener([this, out_item](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    g_win_1080 = !g_win_1080;
+                    save_win_output();
+                    out_item->setValue(g_win_1080 ? "1080p" : "720p");
+                    if (m_scale_item) {
+                        const bool rs = ult::furtherExpandedMemory ? true
+                            : (g_last_rom_path[0] && get_rom_size(
+                                   (std::string(g_rom_dir) + g_last_rom_path).c_str()) < kROM_4MB);
+                        const bool c6 = ult::expandedMemory && poll_console_docked() && g_win_1080 && rs;
+                        const int  ms = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6 ? 6 : 5));
+                        static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
+                        m_scale_item->setValue(lbs[std::min(g_win_scale, ms) - 1]);
+                    }
+                    return true;
+                });
+                list->addItem(out_item);
+            }
+
+            if (!m_settings_scroll.empty())
+                list->jumpToItem(m_settings_scroll, "", true);
+
         } else {
             // ── Overlay Theme ─────────────────────────────────────────────────
-            list->addItem(new tsl::elm::CategoryHeader("Overlay Theme"));
+            list->addItem(new tsl::elm::CategoryHeader("Theme"));
 
             const std::string current(g_ovl_theme_name);
             std::string jumpTarget;
@@ -1448,7 +1530,7 @@ public:
                     apply_theme("default", nullptr);
                     select_item(item);
                     triggerEnterFeedback();
-                    tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                    do_theme_back();
                     return true;
                 });
                 list->addItem(item);
@@ -1477,7 +1559,7 @@ public:
                         apply_theme(tname.c_str(), tpath.c_str());
                         select_item(item);
                         triggerEnterFeedback();
-                        tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                        do_theme_back();
                         return true;
                     });
                     list->addItem(item);
@@ -1499,7 +1581,20 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+            switch (m_mode) {
+                case SelectorMode::OvlTheme:
+                    do_theme_back();
+                    break;
+                case SelectorMode::WindowedSub:
+                    tsl::swapTo<SettingsGui>(m_rom_scroll, std::string("Windowed"));
+                    break;
+                case SelectorMode::OverlaySub:
+                    tsl::swapTo<SettingsGui>(m_rom_scroll, std::string("Overlay"));
+                    break;
+                default: // QuickCombo
+                    tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                    break;
+            }
             return true;
         }
         return false;
@@ -1523,13 +1618,22 @@ class SettingsGui : public tsl::Gui {
     // Raw pointer into the list owned by the frame; valid for the lifetime of
     // this Gui (the slider is destroyed together with the list).
     VolumeTrackBar*     m_vol_slider      = nullptr;
-    tsl::elm::ListItem* m_scale_item      = nullptr;  ///< "Windowed Scale" — refreshed when Windowed Docked changes.
-    tsl::elm::ListItem* m_theme_item      = nullptr;  ///< "Overlay Theme"  — value refreshed on return from OvlThemeSelectorGui.
     tsl::elm::Element*  m_lastFocused     = nullptr;  ///< Tracks last-seen focus for update() change detection.
     u8                 m_vol             = 100;
     u8                 m_vol_backup      = 100;
     std::string        m_rom_scroll;       // ROM name to scroll to when returning to RomSelectorGui
     std::string        m_settings_scroll; // scroll target passed in at construction; forwarded to QuickComboSelectorGui so it can restore position on return
+
+    // Returns the label of the currently focused element.
+    // Extracted because the identical 3-line block appeared in both update()
+    // and handleInput() — sharing it eliminates one copy in the binary.
+    std::string focused_label() {
+        auto* f = getFocusedElement();
+        if (!f) return {};
+        return (f == m_vol_slider)
+            ? std::string("Game Boy")
+            : static_cast<tsl::elm::ListItem*>(f)->getText();
+    }
 
     // Toggle mute on/off and persist both volume and backup.
     // Called by the speaker-icon tap, the icon-tap callback, and KEY_Y.
@@ -1578,10 +1682,7 @@ public:
         auto* focused = getFocusedElement();
         if (focused && focused != m_lastFocused) {
             m_lastFocused = focused;
-            const std::string label = (focused == m_vol_slider)
-                ? "Game Boy"
-                : static_cast<tsl::elm::ListItem*>(focused)->getText();
-            set_settings_scroll(label.c_str());
+            set_settings_scroll(focused_label().c_str());
         }
     }
 
@@ -1626,122 +1727,20 @@ public:
         list->addItem(new tsl::elm::CategoryHeader("Display"));
 
 
-        // ── Windowed Mode ─────────────────────────────────────────────────────
-        // When ON, launching a ROM relaunches this overlay with -windowed <path>
-        // so the game runs as a small draggable 160×144 window with no UI chrome.
-        // Tap-hold (1 s) inside the window to reposition; launch combo to return.
-        auto* win_item = new tsl::elm::ToggleListItem("Windowed Mode", g_windowed_mode,
-                                                       ult::ON, ult::OFF);
-        win_item->setStateChangedListener([](bool state) {
-            g_windowed_mode = state;
-            save_windowed_mode();
-        });
-        list->addItem(win_item);
-
-        // ── Windowed Scale ────────────────────────────────────────────────────
-        // Cycles 1× → 2× → 3× → 4× → 5× → (6×) → 1× on each A press.
-        // Capped at 3× on 4 MB heap sessions.  Takes effect on the next
-        // windowed launch (framebuffer is sized before Tesla initialises).
-        // 6× is only available on expandedMemory + docked + 1080p.
-        // On the plain 8 MB heap (not furtherExpandedMemory), only ROMs < 4 MB
-        // have enough headroom; larger ROMs are capped at 5×.
+        // ── Mode ──────────────────────────────────────────────────────────────
+        // Cycles between "Overlay" (g_windowed_mode=false) and "Windowed"
+        // (g_windowed_mode=true).  Takes effect on the next ROM launch.
         {
-            const bool romSmall = [&]() -> bool {
-                if (ult::furtherExpandedMemory) return true;
-                if (!g_last_rom_path[0])        return false;
-                const std::string full = std::string(g_rom_dir) + g_last_rom_path;
-                return get_rom_size(full.c_str()) < kROM_4MB;
-            }();
-            // make_label captures only romSmall (stable for the session) and
-            // recomputes can6x / maxScale on every call so the displayed value
-            // stays correct if g_win_1080 changes via the Windowed Docked toggle.
-            auto make_label = [romSmall]() -> std::string {
-                const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
-                const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
-                const int s = std::min(g_win_scale, ms_);
-                static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x"};
-                return lbs[s - 1];
-            };
-
-            auto* scale_item = new tsl::elm::ListItem("Windowed Scale", make_label());
-            scale_item->setClickListener([scale_item, romSmall, make_label](u64 keys) -> bool {
+            auto* mode_item = new tsl::elm::ListItem("Mode",
+                                                      g_windowed_mode ? "Windowed" : "Overlay");
+            mode_item->setClickListener([mode_item](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
-                const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
-                const int cur = std::min(g_win_scale, ms_);
-                g_win_scale   = (cur % ms_) + 1;
-                save_win_scale();
-                scale_item->setValue(make_label());
+                g_windowed_mode = !g_windowed_mode;
+                save_windowed_mode();
+                mode_item->setValue(g_windowed_mode ? "Windowed" : "Overlay");
                 return true;
             });
-            m_scale_item = scale_item;
-            list->addItem(scale_item);
-        }
-
-        // ── Windowed Docked ───────────────────────────────────────────────────
-        // "720p"  — VI layer is ×1.5 the framebuffer (default).  Larger window
-        //           on-screen but non-integer scaling; LCD Grid looks blurry.
-        // "1080p" — VI layer equals the framebuffer exactly (1:1 display pixels).
-        //           Pixel-perfect; LCD Grid renders with clean integer boundaries.
-        //           Window appears smaller since no enlargement is applied.
-        // Takes effect on the next windowed launch.
-        {
-            auto* out_item = new tsl::elm::ListItem("Windowed Docked",
-                                                     g_win_1080 ? "1080p" : "720p");
-            out_item->setClickListener([this, out_item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                g_win_1080 = !g_win_1080;
-                save_win_output();
-                out_item->setValue(g_win_1080 ? "1080p" : "720p");
-                // Sync the Windowed Scale display — the effective maxScale may have
-                // changed (e.g. 1080p+docked unlocks 6×, 720p caps at 5×).
-                // g_win_scale (the stored INI intent) is never touched here; only the
-                // visible label is corrected so the user sees the value that would
-                // actually take effect on the next windowed launch.
-                if (m_scale_item) {
-                    const bool rs = ult::furtherExpandedMemory ? true
-                                  : (g_last_rom_path[0] && get_rom_size(
-                                         (std::string(g_rom_dir) + g_last_rom_path).c_str()) < kROM_4MB);
-                    const bool c6  = ult::expandedMemory && poll_console_docked() && g_win_1080 && rs;
-                    const int  ms  = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6 ? 6 : 5));
-                    static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
-                    m_scale_item->setValue(lbs[std::min(g_win_scale, ms) - 1]);
-                }
-                return true;
-            });
-            list->addItem(out_item);
-        }
-
-        // ── Overlay Position ──────────────────────────────────────────────────
-        // "Fixed" (default) — full overlay with title/widget chrome at the top,
-        //   identical to the current behaviour.
-        // "Free"  — the top OVL_FREE_TOP_TRIM rows (title/widget region) are
-        //   stripped from the layer.  The layer can be repositioned by holding
-        //   KEY_PLUS for 1 s then moving the left stick, exactly like windowed
-        //   mode.  Position is stored independently from the windowed position.
-        {
-            auto* pos_item = new tsl::elm::ListItem(
-                "Overlay Position",
-                g_overlay_free_mode ? "Free" : "Fixed");
-            pos_item->setClickListener([pos_item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                g_overlay_free_mode = !g_overlay_free_mode;
-                pos_item->setValue(g_overlay_free_mode ? "Free" : "Fixed");
-                save_ovl_free_mode();
-                return true;
-            });
-            list->addItem(pos_item);
-        }
-
-        if (ult::expandedMemory) {
-            auto* wallpaper_item = new tsl::elm::ToggleListItem(
-                "Overlay Wallpaper", g_overlay_wallpaper, ult::ON, ult::OFF);
-            wallpaper_item->setStateChangedListener([](bool state) {
-                g_overlay_wallpaper = state;
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOverlayWallpaper,
-                                     state ? "1" : "0", "");
-            });
-            list->addItem(wallpaper_item);
+            list->addItem(mode_item);
         }
 
         // ── LCD Grid ──────────────────────────────────────────────────────────
@@ -1764,6 +1763,37 @@ public:
             list->addItem(grid_item);
         }
         
+
+        // ── Overlay ───────────────────────────────────────────────────────────
+        // Dropdown that opens DropdownSelectorGui(OverlaySub) — contains
+        // Position and Theme.
+        {
+            auto* ovl_item = new tsl::elm::ListItem("Overlay", ult::DROPDOWN_SYMBOL);
+            ovl_item->setClickListener([this](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                triggerEnterFeedback();
+                tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
+                                                  SelectorMode::OverlaySub);
+                return true;
+            });
+            list->addItem(ovl_item);
+        }
+
+        // ── Windowed ──────────────────────────────────────────────────────────
+        // Dropdown that opens DropdownSelectorGui(WindowedSub) — contains Scale
+        // and Docked Resolution.
+        {
+            auto* win_item = new tsl::elm::ListItem("Windowed", ult::DROPDOWN_SYMBOL);
+            win_item->setClickListener([this](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                triggerEnterFeedback();
+                tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
+                                                  SelectorMode::WindowedSub);
+                return true;
+            });
+            list->addItem(win_item);
+        }
+
         // ── Misc ────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
 
@@ -1792,21 +1822,6 @@ public:
                 return true;
             });
             list->addItem(qc_item);
-        }
-
-        // ── Overlay Theme ─────────────────────────────────────────────────────
-        // Selects bg/border/button-glyph colours for overlay player modes only.
-        {
-            auto* th_item = new tsl::elm::ListItem("Overlay Theme",
-                                                    std::string(g_ovl_theme_name));
-            th_item->setClickListener([this](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                set_settings_scroll("Overlay Theme");
-                tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string("Overlay Theme"), SelectorMode::OvlTheme);
-                return true;
-            });
-            m_theme_item = th_item;
-            list->addItem(th_item);
         }
 
         auto* haptics_item = new tsl::elm::ToggleListItem(
@@ -1856,12 +1871,7 @@ public:
             // actually matters (page flip).  m_vol_slider is the only non-ListItem, so
             // it gets its label by pointer comparison; every other focusable item is a
             // ListItem subclass and exposes getText() directly.
-            if (auto* focused = getFocusedElement()) {
-                const std::string label = (focused == m_vol_slider)
-                    ? "Game Boy"
-                    : static_cast<tsl::elm::ListItem*>(focused)->getText();
-                    set_settings_scroll(label.c_str());
-            }
+            set_settings_scroll(focused_label().c_str());
             tsl::swapTo<RomSelectorGui>(m_rom_scroll);
             return true;
         }
@@ -1893,11 +1903,18 @@ public:
 static std::string strip_rom_extension(const char* name) {
     std::string s(name);
     const size_t dot = s.rfind('.');
-    if (dot == std::string::npos) return s;
-    std::string ext = s.substr(dot);
-    for (char& c : ext) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    if (ext == ".gb" || ext == ".gbc")
-        s.erase(dot);
+    if (dot != std::string::npos) {
+        // Case-insensitive check via direct char comparison — avoids substr()
+        // heap allocation and the tolower for-loop that the old version used.
+        const char* e = s.c_str() + dot;
+        const size_t elen = s.size() - dot;
+        if (elen == 3 &&
+            (e[1]=='g'||e[1]=='G') && (e[2]=='b'||e[2]=='B'))
+            s.resize(dot);
+        else if (elen == 4 &&
+            (e[1]=='g'||e[1]=='G') && (e[2]=='b'||e[2]=='B') && (e[3]=='c'||e[3]=='C'))
+            s.resize(dot);
+    }
     return s;
 }
 
@@ -1959,7 +1976,7 @@ public:
         const int nRoms = scandir(g_rom_dir, &romEntries, gb_rom_filter, alphasort);
 
         if (nRoms <= 0) {
-            static char msg[512];
+            static char msg[256];
             snprintf(msg, sizeof(msg),
                 "No .gb or .gbc files found in:\n%s\n\n"
                 "Edit: sdmc:/config/ultragb/config.ini", g_rom_dir);
@@ -2197,22 +2214,19 @@ public:
         ult::createDirectory(STATE_BASE_DIR);
         ult::createDirectory(STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
-
-        load_config();                   // populates g_windowed_mode, g_last_rom_path, …
-        write_default_config_if_missing();
-        write_default_ovl_theme_if_missing();
-        load_ovl_theme();
         ult::createDirectory(g_rom_dir);
         ult::createDirectory(g_save_dir);
 
-        // ── Determine session type ────────────────────────────────────────────
-        // g_win_scale_locked is set by setup_windowed_framebuffer() in main()
-        // BEFORE tsl::loop() starts — it is the reliable indicator that this
-        // launch is actually a windowed session.  g_windowed_mode is only a
-        // config preference (windowed=1/0 in config.ini) and must NOT be used
-        // here: a user with windowed=1 stored would cause every cold start and
-        // -returning launch to be misidentified as a windowed game session,
-        // setting tsl::disableHiding and routing to GBWindowedGui incorrectly.
+        load_config();                   // populates g_windowed_mode, g_last_rom_path, …
+
+        // ── Determine session type early ──────────────────────────────────────
+        // Done here — immediately after load_config() — so game sessions can
+        // skip write_default_config_if_missing() and
+        // write_default_ovl_theme_if_missing().  Those two calls perform ~14
+        // additional parseValueFromIniSection reads (each opens + scans the
+        // config file) that are irrelevant when launching directly into a ROM.
+        // g_last_rom_path is now populated by load_config() so the check below
+        // is accurate.
         m_game_session = g_win_scale_locked                      ||
                          g_overlay_mode                          ||
                         (g_quick_launch && g_last_rom_path[0]   &&
@@ -2221,7 +2235,25 @@ public:
         if (m_game_session)
             tsl::disableHiding = true;   // launch combo must close, not hide
 
+        // ── Default-writes: skip for game sessions ────────────────────────────
+        // Config/theme defaults are only needed for UI rendering.  A game session
+        // (windowed, overlay, quick-launch) never opens the settings UI, so the
+        // disk writes — and the ~14 redundant file-scan reads they require to
+        // check each key — add pure latency with no benefit.
+        if (!m_game_session) {
+            write_default_config_if_missing();
+            write_default_ovl_theme_if_missing();
+        }
+        load_ovl_theme();
+
         // ── Mode-specific init ────────────────────────────────────────────────
+        // g_win_scale_locked is set by setup_windowed_framebuffer() in main()
+        // BEFORE tsl::loop() starts — it is the reliable indicator that this
+        // launch is actually a windowed session.  g_windowed_mode is only a
+        // config preference (windowed=1/0 in config.ini) and must NOT be used
+        // here: a user with windowed=1 stored would cause every cold start and
+        // -returning launch to be misidentified as a windowed game session,
+        // setting tsl::disableHiding and routing to GBWindowedGui incorrectly.
         if (g_win_scale_locked && !g_overlay_free_mode) {
             {
                 const std::string qe = ult::parseValueFromIniSection(
@@ -2362,9 +2394,9 @@ public:
         // GBOverlayGui (not GBWindowedGui).
         if (g_overlay_free_mode && g_overlay_rom_path[0]) {
             if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
-                show_notify(msg);
                 g_overlay_mode      = false;
                 g_overlay_free_mode = false;
+                show_notify(msg);
                 relaunch_self();
                 return initially<RomSelectorGui>();
             }
@@ -2383,8 +2415,8 @@ public:
         // ── Player overlay relaunch ──────────────────────────────────────────────
         if (g_overlay_mode && g_overlay_rom_path[0]) {
             if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
-                show_notify(msg);
                 g_overlay_mode = false;
+                show_notify(msg);
                 relaunch_self();
                 return initially<RomSelectorGui>();
             }
@@ -2609,9 +2641,9 @@ int main(int argc, char* argv[]) {
         // before g_win_scale_locked so it still routes to GBOverlayGui, not
         // GBWindowedGui.
         g_win_scale_locked            = true;
+        ult::windowedLayerPixelPerfect = false;  // 720p 1.5× scaling
         ult::DefaultFramebufferWidth  = static_cast<u32>(FB_W);
         ult::DefaultFramebufferHeight = static_cast<u32>(OVL_FREE_FB_H);
-        ult::windowedLayerPixelPerfect = false;  // 720p 1.5× scaling
 
     } else if (session == SessionType::Menu) {
         returnOverlayPath = ult::OVERLAY_PATH + "ovlmenu.ovl";
