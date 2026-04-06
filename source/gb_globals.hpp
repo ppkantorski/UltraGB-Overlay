@@ -39,6 +39,8 @@ static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
 //static constexpr const char* INTERNAL_SAVE_BASE_DIR  = "sdmc:/config/ultragb/saves/internal/";
 static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
+static constexpr const char* OVL_THEMES_DIR    = "sdmc:/config/ultragb/ovl_themes/";
+static constexpr const char* OVL_THEME_FILE    = "sdmc:/config/ultragb/ovl_theme.ini";
 
 static constexpr size_t PATH_BUFFER_SIZE = 128;
 static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
@@ -85,6 +87,7 @@ static const std::string kKeyWindowedRom   {"windowed_rom"};
 static const std::string kKeyWinQuickExit  {"win_quick_exit"};
 static const std::string kKeySettingsScroll{"settings_scroll"};
 static const std::string kKeyPlayerRom     {"overlay_rom"};  // ROM path for -overlay relaunch
+static const std::string kKeyOvlTheme     {"ovl_theme"};     // selected overlay theme filename stem
 static const std::string kKeyOvlFreeMode  {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
 static const std::string kKeyOvlFreePosX  {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
 static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
@@ -302,8 +305,40 @@ static constexpr int SELECT_R     = START_R;
 static constexpr int SELECT_DRAW_X = FB_W / 2 - BTN_GAP_HALF - SELECT_SIZE;
 static constexpr int SELECT_DRAW_Y = START_DRAW_Y;
 
-// Solid grey — fully opaque so glyphs read clearly against the wallpaper
-static const tsl::Color& VBTN_COLOR = tsl::buttonColor;
+// =============================================================================
+// Overlay theme color globals
+//
+// Loaded by load_ovl_theme() at startup (gb_utils.hpp).
+// Applied ONLY in overlay player modes; windowed mode never reads these.
+// When a wallpaper is active, bg_col/bg_packed are overridden at draw time
+// to 000000/D — not baked in here so toggling wallpaper takes effect live.
+//
+// Defaults: bg black/alpha-13, buttons+border #333333 (GBC-style dark grey).
+// MUST be declared before VBTN_COLOR which references g_ovl_btn_col.
+// =============================================================================
+static char       g_ovl_theme_name[64] = "default";
+static tsl::Color g_ovl_bg_col    {0x0, 0x0, 0x0, 0xD};  // bg_color + bg_alpha
+static tsl::Color g_ovl_btn_col   {0x3, 0x3, 0x3, 0xF};  // button_color — applied to glyphs
+static tsl::Color g_ovl_bdr_col   {0x3, 0x3, 0x3, 0xF};  // border_color
+static uint16_t   g_ovl_bg_packed = 0xD000u;              // packed RGBA4444 for direct-fb writes
+
+// backdrop_color — opaque black backing shapes drawn behind button glyphs.
+// Default: pure black, always fully opaque.
+static tsl::Color g_ovl_backdrop_col {0x0, 0x0, 0x0, 0xF};
+
+// frame_color / frame_alpha — fill color for the letterbox region (the area
+// around the 2× game screen where "GAME BOY COLOR" is written).
+// Default: #111111 at alpha 14 (0xE), matching the original 0xE111u packed value.
+static tsl::Color g_ovl_frame_col  {0x1, 0x1, 0x1, 0xE};
+static uint16_t   g_ovl_frame_packed = 0xE111u;  // packed RGBA4444; recomputed by load_ovl_theme()
+
+// gb_text_color — color of the "GAME BOY" (and "GAME BOY COLOR") prefix text
+// rendered inside the letterbox.  Default: white {0xF,0xF,0xF,0xF}.
+static tsl::Color g_ovl_text_col {0xF, 0xF, 0xF, 0xF};
+
+// Button glyph color — driven by active overlay theme (button_color key).
+// BK (the backing shapes behind glyphs) is separate, driven by backdrop_color.
+static const tsl::Color& VBTN_COLOR = g_ovl_btn_col;
 
 // Hit-test centres, populated on first draw from getTextDimensions().
 static int   g_dpad_hx       = DPAD_DRAW_X  + DPAD_SIZE  / 2;

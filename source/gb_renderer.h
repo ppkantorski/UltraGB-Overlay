@@ -758,13 +758,12 @@ inline void render_gb_screen(tsl::gfx::Renderer* renderer) {
 //   gap top    = VP2_Y + VP2_H = 144 + 288 = 432
 //   gap bottom = VP_Y  + VP_H  = 108 + 360 = 468
 //   gap height = 36px → 4px padding each side → font size 18.
-inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
+inline void render_gbc_logo(tsl::gfx::Renderer* renderer,
+                            tsl::Color text_col = {0xF, 0xF, 0xF, 0xF}) {
     static constexpr int LOGO_SIZE = 18;
     // gap top=432, gap bottom=468, centred baseline — shifted by g_render_y_offset
     // in free overlay mode (e.g. 458 - 107 = 351 in free mode).
     const int LOGO_Y = 432 + (468 - 432) / 2 + LOGO_SIZE / 2 - 1 + g_render_y_offset;
-
-    static constexpr tsl::Color WHITE = {0xF, 0xF, 0xF, 0xF};
 
     // In DMG or Native palette mode the hardware colour block is absent — show
     // plain "GAME BOY" only (no rainbow "COLOR" suffix).
@@ -776,7 +775,7 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
             measured_plain = true;
         }
         const int x = static_cast<int>(FB_W / 2 - w_plain / 2);
-        renderer->drawString("GAME BOY", false, x, LOGO_Y, LOGO_SIZE, WHITE);
+        renderer->drawString("GAME BOY", false, x, LOGO_Y, LOGO_SIZE, text_col);
         return;
     }
 
@@ -807,7 +806,7 @@ inline void render_gbc_logo(tsl::gfx::Renderer* renderer) {
     const u32 total_w = w_prefix + wC + wO + wL + wO2 + wR;
     int x = static_cast<int>(FB_W / 2 - total_w / 2);
 
-    renderer->drawString("GAME BOY ", false, x, LOGO_Y, LOGO_SIZE, WHITE);
+    renderer->drawString("GAME BOY ", false, x, LOGO_Y, LOGO_SIZE, text_col);
     x += static_cast<int>(w_prefix);
     renderer->drawString("C", false, x, LOGO_Y, LOGO_SIZE, C_RED); x += static_cast<int>(wC);
     renderer->drawString("O", false, x, LOGO_Y, LOGO_SIZE, C_ORA); x += static_cast<int>(wO);
@@ -844,16 +843,12 @@ static inline void fill_letterbox_rect(uint16_t* __restrict__ fb,
 inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
     init_outer_lut();  // rebuilds row LUT whenever g_render_y_offset changes
 
-    // Get framebuffer pointer once — same pattern as render_gb_screen_chunk.
-    // PACKED_LB = 0xE111 (RGBA4444: r=1 g=1 b=1 a=0xE, nearly opaque dark grey).
-    // Written directly to the swizzled framebuffer; no per-pixel blend overhead.
-    // renderer->a(0xE111) at full overlay opacity == 0xE111 exactly, so the
-    // previous a() call was a no-op.  Dropping it and going direct-to-fb
-    // matches the approach already used by render_gb_screen_chunk.
     auto* fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
-    static constexpr uint16_t PACKED_LB = 0xE111u;
 
-    // 2× mode inner viewport relative to outer border frame
+    // Static default fill — theme-aware override is applied inline in
+    // gb_overlay.hpp after this call, where all globals are in scope.
+    static constexpr uint16_t PACKED_LB = 0xD000u;
+
     static constexpr int ix = 40;
     static constexpr int iy = 36;
     static constexpr int iw = 320;
@@ -866,13 +861,11 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
 }
 
 // -- Border around the viewport -----------------------------------------------
-// Always drawn at the fixed 2.5× outer frame (VP_X/Y/W/H) regardless of scale.
-// In 2× mode this creates the letterbox frame that encloses the game image,
-// fills, and logo as one cohesive unit.
+// Theme-aware version (using g_ovl_bdr_col) is inlined in gb_overlay.hpp.
 inline void render_gb_border(tsl::gfx::Renderer* renderer) {
     static constexpr tsl::Color BORDER{0x3, 0x3, 0x3, 0xF};
-    renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);  // top
-    renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);  // bottom
-    renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);  // left
-    renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);  // right
+    renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);
+    renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);
+    renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);
+    renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);
 }

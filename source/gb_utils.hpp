@@ -1572,6 +1572,106 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
     ult::inPlot.store(false, std::memory_order_release);
 }
 // =============================================================================
+// write_default_ovl_theme_if_missing
+//
+// Creates OVL_THEMES_DIR and writes canonical default values to OVL_THEME_FILE
+// if that file does not yet exist.  The active theme is always at OVL_THEME_FILE;
+// the display name is tracked separately in config.ini (key: ovl_theme).
+// =============================================================================
+static void write_default_ovl_theme_if_missing() {
+    ult::createDirectory(OVL_THEMES_DIR);
+    const std::string path(OVL_THEME_FILE);
+    if (ult::isFile(path)) return;
+    ult::setIniFileValue(path, "theme", "bg_color",      "000000",  "");
+    ult::setIniFileValue(path, "theme", "bg_alpha",      "13",      "");
+    ult::setIniFileValue(path, "theme", "button_color",  "333333",  "");
+    ult::setIniFileValue(path, "theme", "border_color",  "333333",  "");
+    ult::setIniFileValue(path, "theme", "backdrop_color","000000",  "");
+    ult::setIniFileValue(path, "theme", "frame_color",   "111111",  "");
+    ult::setIniFileValue(path, "theme", "frame_alpha",   "14",      "");
+    ult::setIniFileValue(path, "theme", "gb_text_color", "ffffff",  "");
+}
+
+// =============================================================================
+// load_ovl_theme
+//
+// Reads the selected theme name from config.ini (key: ovl_theme), constructs
+// the path OVL_THEMES_DIR/<name>.ini, and updates all overlay-color globals.
+// g_ovl_theme_name is populated from the config value (the filename stem) so
+// the settings UI can display it without touching the theme file itself.
+// Falls back to compile-time defaults for any malformed or absent key.
+// =============================================================================
+static void load_ovl_theme() {
+    static const std::string kDef000{"000000"};
+    static const std::string kDef333{"333333"};
+    static const std::string kDefFFF{"ffffff"};
+    static const std::string kDef111{"111111"};
+
+    // Determine which theme file to load from config.ini.
+    const std::string nm = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyOvlTheme);
+    const std::string theme_name = nm.empty() ? "default" : nm;
+
+    strncpy(g_ovl_theme_name, theme_name.c_str(), sizeof(g_ovl_theme_name) - 1);
+    g_ovl_theme_name[sizeof(g_ovl_theme_name) - 1] = '\0';
+
+    // Load colors from the single active theme file.
+    const std::string path(OVL_THEME_FILE);
+    if (!ult::isFile(path)) return;  // compile-time defaults remain in effect
+
+    // Helper: accept a 6-char hex string or return the default.
+    const auto valid_hex = [](const std::string& v, const std::string& def)
+        -> const std::string& { return (v.size() == 6) ? v : def; };
+
+    const std::string bg_hex  = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "bg_color"),      kDef000);
+    const std::string btn_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "button_color"),  kDef333);
+    const std::string bdr_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "border_color"),  kDef333);
+    const std::string bkd_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "backdrop_color"),kDef000);
+    const std::string frm_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "frame_color"),   kDef111);
+    const std::string txt_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "gb_text_color"), kDefFFF);
+
+    int alpha = 13;
+    {
+        const std::string av = ult::parseValueFromIniSection(path, "theme", "bg_alpha");
+        int v = 0;
+        if (!av.empty() && parse_uint(av, v) && v <= 15) alpha = v;
+    }
+
+    int frame_alpha = 14;
+    {
+        const std::string av = ult::parseValueFromIniSection(path, "theme", "frame_alpha");
+        int v = 0;
+        if (!av.empty() && parse_uint(av, v) && v <= 15) frame_alpha = v;
+    }
+
+    g_ovl_bg_col      = tsl::RGB888(bg_hex,  static_cast<size_t>(alpha));
+    g_ovl_btn_col     = tsl::RGB888(btn_hex, 15u);
+    g_ovl_bdr_col     = tsl::RGB888(bdr_hex, 15u);
+    g_ovl_backdrop_col= tsl::RGB888(bkd_hex, 15u);
+    g_ovl_frame_col   = tsl::RGB888(frm_hex, static_cast<size_t>(frame_alpha));
+    g_ovl_text_col    = tsl::RGB888(txt_hex, 15u);
+
+    // Recompute packed RGBA4444 for direct-fb writes.
+    // Layout: r nibble at bit 0, g at 4, b at 8, a at 12.
+    g_ovl_bg_packed = static_cast<uint16_t>(
+        static_cast<uint16_t>(g_ovl_bg_col.r)        |
+        (static_cast<uint16_t>(g_ovl_bg_col.g) <<  4) |
+        (static_cast<uint16_t>(g_ovl_bg_col.b) <<  8) |
+        (static_cast<uint16_t>(g_ovl_bg_col.a) << 12));
+
+    g_ovl_frame_packed = static_cast<uint16_t>(
+        static_cast<uint16_t>(g_ovl_frame_col.r)        |
+        (static_cast<uint16_t>(g_ovl_frame_col.g) <<  4) |
+        (static_cast<uint16_t>(g_ovl_frame_col.b) <<  8) |
+        (static_cast<uint16_t>(g_ovl_frame_col.a) << 12));
+}
+
+// =============================================================================
 // close_overlay_direct_mode
 //
 // KEY_B close handler shared by SettingsGui and RomSelectorGui.

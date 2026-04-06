@@ -89,7 +89,15 @@ public:
         ult::nextPageWidth.store(0.0f, std::memory_order_release);
         ult::halfGap.store(0.0f,       std::memory_order_release);
         ult::hasNextPageButton.store(false, std::memory_order_release);
-        renderer->fillScreen(renderer->a(tsl::defaultBackgroundColor));
+
+        // Background fill — use theme bg_color/bg_alpha.
+        // When wallpaper is active, force the default 000000/D so a custom bg
+        // colour does not bleed into exposed edges around the wallpaper image.
+        {
+            const tsl::Color effBg = (ult::expandedMemory && g_overlay_wallpaper)
+                ? tsl::Color{0x0, 0x0, 0x0, 0xD} : g_ovl_bg_col;
+            renderer->fillScreen(renderer->a(effBg));
+        }
 
         // Draw the wallpaper, skipping the GB viewport region that render_gb_screen
         // and render_gb_letterbox will fully overwrite with opaque pixels.
@@ -227,9 +235,26 @@ public:
             gb_tick_frame();
 
         render_gb_letterbox(renderer);
+        // Theme-aware letterbox override: always use g_ovl_frame_packed (frame_color +
+        // frame_alpha keys) — even when wallpaper is active the frame color applies.
+        {
+            static constexpr int ix = 40, iy = 36, iw = 320, ih = 288;
+            auto* fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+            fill_letterbox_rect(fb, 0,       ix,       0,       VP_H, g_ovl_frame_packed);
+            fill_letterbox_rect(fb, ix + iw, VP_W,     0,       VP_H, g_ovl_frame_packed);
+            fill_letterbox_rect(fb, ix,      ix + iw,  0,       iy,   g_ovl_frame_packed);
+            fill_letterbox_rect(fb, ix,      ix + iw,  iy + ih, VP_H, g_ovl_frame_packed);
+        }
         render_gb_screen(renderer);
-        render_gb_border(renderer);
-        render_gbc_logo(renderer);
+        // Theme-aware border.
+        {
+            const tsl::Color& BORDER = g_ovl_bdr_col;
+            renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);
+            renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);
+            renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);
+            renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);
+        }
+        render_gbc_logo(renderer, g_ovl_text_col);
 
         //const char* sl = strrchr(g_gb.romPath, '/');
         //renderer->drawString(sl ? sl+1 : g_gb.romPath, false,
@@ -288,7 +313,9 @@ public:
         }
 
         // ── Button backing shapes — drawn BEFORE glyphs so they sit underneath ──
-        static constexpr tsl::Color BK{0x0, 0x0, 0x0, 0xF};  // solid black
+        // Backdrop — opaque backing shapes drawn behind button glyphs.
+        // Driven by backdrop_color theme key (default black).
+        const tsl::Color& BK = g_ovl_backdrop_col;
 
         // D-pad backing: two rects forming a plus/cross shape.
         // All constants are directly tuneable — no getTextDimensions needed.

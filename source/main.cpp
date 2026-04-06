@@ -705,6 +705,7 @@ class SaveSlotsGui;          // forward declare  (merged SaveStatesGui + SaveDat
 class SlotActionGui;         // forward declare  (merged SlotActionGui + SaveDataSlotActionGui)
 class ConfirmGui;            // forward declare
 class QuickComboSelectorGui; // forward declare
+class OvlThemeSelectorGui;   // forward declare
 
 // Actions that flow through ConfirmGui.
 // The enum is plain so it costs nothing at runtime — a single int stored in
@@ -1290,6 +1291,148 @@ public:
 };
 
 // =============================================================================
+// =============================================================================
+// OvlThemeSelectorGui — overlay colour theme picker
+//
+// Lists all .ini files in OVL_THEMES_DIR (excluding any "default.ini") plus
+// a built-in "default" entry.  Selecting a theme:
+//   • copies the chosen .ini over OVL_THEME_FILE (or rewrites defaults for
+//     the built-in "default" entry)
+//   • calls load_ovl_theme() so colors take effect immediately
+//   • swaps back to SettingsGui (same as clicking A on a theme)
+// B also returns to SettingsGui without changing the theme.
+//
+// No heap is held between visits — the list is rebuilt on each createUI().
+// =============================================================================
+static int ovl_theme_filter(const struct dirent* e) {
+    const char* n = e->d_name;
+    const size_t len = strlen(n);
+    if (len < 5) return 0;                          // too short to end in ".ini"
+    if (strcmp(n, "default.ini") == 0) return 0;   // "default" is the built-in entry
+    return (strcmp(n + len - 4, ".ini") == 0) ? 1 : 0;
+}
+
+class OvlThemeSelectorGui : public tsl::Gui {
+    std::string m_rom_scroll;
+    std::string m_settings_scroll;
+    tsl::elm::ListItem* m_lastSelected = nullptr;
+
+    // Overwrite OVL_THEME_FILE with the chosen theme and reload all colors.
+    // Persist the display name to config.ini (ovl_theme) separately.
+    // srcPath == nullptr means "default" — write canonical default values.
+    void apply_theme(const char* name, const char* srcPath) {
+        if (srcPath) {
+            copy_file(srcPath, OVL_THEME_FILE);
+        } else {
+            // "default" — overwrite OVL_THEME_FILE with canonical values.
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_color",      "000000",  "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_alpha",      "13",      "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "button_color",  "333333",  "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "border_color",  "333333",  "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "backdrop_color","000000",  "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "frame_color",   "111111",  "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "frame_alpha",   "14",      "");
+            ult::setIniFileValue(OVL_THEME_FILE, "theme", "gb_text_color", "ffffff",  "");
+        }
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlTheme, name, "");
+        load_ovl_theme();
+    }
+
+public:
+    OvlThemeSelectorGui(std::string romScroll, std::string settingsScroll)
+        : m_rom_scroll(std::move(romScroll))
+        , m_settings_scroll(std::move(settingsScroll)) {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+        list->addItem(new tsl::elm::CategoryHeader("Overlay Theme"));
+
+        const std::string current(g_ovl_theme_name);
+        std::string jumpTarget;
+
+        // ── Built-in "default" entry ──────────────────────────────────────────
+        {
+            const bool isCurrent = (current == "default");
+            if (isCurrent) jumpTarget = "default";
+
+            auto* item = new tsl::elm::ListItem("default");
+            if (isCurrent) {
+                item->setValue(ult::CHECKMARK_SYMBOL);
+                m_lastSelected = item;
+            }
+            item->setClickListener([this, item](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                apply_theme("default", nullptr);
+                if (m_lastSelected && m_lastSelected != item)
+                    m_lastSelected->setValue("");
+                item->setValue(ult::CHECKMARK_SYMBOL);
+                m_lastSelected = item;
+                triggerEnterFeedback();
+                tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                return true;
+            });
+            list->addItem(item);
+        }
+
+        // ── Theme files from OVL_THEMES_DIR ───────────────────────────────────
+        // scandir returns alphabetically-sorted entries; each is freed immediately
+        // after the ListItem is built so peak allocation is one dirent at a time.
+        {
+            struct dirent** entries = nullptr;
+            const int n = scandir(OVL_THEMES_DIR, &entries, ovl_theme_filter, alphasort);
+            for (int i = 0; i < n; ++i) {
+                const std::string fname{entries[i]->d_name};
+                free(entries[i]);
+                entries[i] = nullptr;
+
+                // Strip ".ini" → display and key name
+                const std::string tname = fname.substr(0, fname.size() - 4);
+                const std::string tpath = std::string(OVL_THEMES_DIR) + fname;
+
+                const bool isCurrent = (current == tname);
+                if (isCurrent && jumpTarget.empty()) jumpTarget = tname;
+
+                auto* item = new tsl::elm::ListItem(tname);
+                if (isCurrent) {
+                    item->setValue(ult::CHECKMARK_SYMBOL);
+                    m_lastSelected = item;
+                }
+                item->setClickListener([this, item, tname, tpath](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    apply_theme(tname.c_str(), tpath.c_str());
+                    if (m_lastSelected && m_lastSelected != item)
+                        m_lastSelected->setValue("");
+                    item->setValue(ult::CHECKMARK_SYMBOL);
+                    m_lastSelected = item;
+                    triggerEnterFeedback();
+                    tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                    return true;
+                });
+                list->addItem(item);
+            }
+            free(entries);  // safe on nullptr (n <= 0 case)
+        }
+
+        if (!jumpTarget.empty())
+            list->jumpToItem(jumpTarget, "", true);
+
+        return make_bare_frame(list);
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            triggerExitFeedback();
+            tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+            return true;
+        }
+        return false;
+    }
+};
+
 // SettingsGui — right page (Volume / Settings)
 //
 // Lives only while the user is on the Settings page.  swapTo<RomSelectorGui>()
@@ -1308,6 +1451,7 @@ class SettingsGui : public tsl::Gui {
     // this Gui (the slider is destroyed together with the list).
     VolumeTrackBar*     m_vol_slider      = nullptr;
     tsl::elm::ListItem* m_scale_item      = nullptr;  ///< "Windowed Scale" — refreshed when Windowed Docked changes.
+    tsl::elm::ListItem* m_theme_item      = nullptr;  ///< "Overlay Theme"  — value refreshed on return from OvlThemeSelectorGui.
     tsl::elm::Element*  m_lastFocused     = nullptr;  ///< Tracks last-seen focus for update() change detection.
     u8                 m_vol             = 100;
     u8                 m_vol_backup      = 100;
@@ -1575,6 +1719,22 @@ public:
                 return true;
             });
             list->addItem(qc_item);
+        }
+
+        // ── Overlay Theme ─────────────────────────────────────────────────────
+        // Selects bg/border/button-glyph colours for overlay player modes only.
+        {
+            auto* th_item = new tsl::elm::ListItem("Overlay Theme",
+                                                    std::string(g_ovl_theme_name));
+            th_item->setClickListener([this](u64 keys) -> bool {
+                if (!(keys & KEY_A)) return false;
+                set_settings_scroll("Overlay Theme");
+                tsl::swapTo<OvlThemeSelectorGui>(m_rom_scroll,
+                                                  std::string("Overlay Theme"));
+                return true;
+            });
+            m_theme_item = th_item;
+            list->addItem(th_item);
         }
 
         auto* haptics_item = new tsl::elm::ToggleListItem(
@@ -2052,6 +2212,8 @@ public:
 
         load_config();                   // populates g_windowed_mode, g_last_rom_path, …
         write_default_config_if_missing();
+        write_default_ovl_theme_if_missing();
+        load_ovl_theme();
         ult::createDirectory(g_rom_dir);
         ult::createDirectory(g_save_dir);
 
