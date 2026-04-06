@@ -112,6 +112,12 @@ public:
         // a single pass.  Current approach: draw_wallpaper_direct with a skip
         // region splits into three branch-free bands and uses NEON 8-pixel
         // stores throughout.
+        //
+        // pre_wp_bg: background colour from fillScreen, captured from framebuffer[0]
+        // BEFORE wallpaper blends into it.  Used by fill_vp_corners_448 later so
+        // the corner blend matches draw_wallpaper_direct exactly.
+        const uint16_t pre_wp_bg =
+            static_cast<const uint16_t*>(renderer->getCurrentFramebuffer())[0];
         if (ult::expandedMemory && g_overlay_wallpaper) {
             if (g_overlay_free_mode) {
                 // Free mode: framebuffer is OVL_FREE_FB_H (720) rows tall.
@@ -237,22 +243,39 @@ public:
         render_gb_letterbox(renderer);
         // Theme-aware letterbox override: always use g_ovl_frame_packed (frame_color +
         // frame_alpha keys) — even when wallpaper is active the frame color applies.
+        // After filling, zero the R=10 outer corners of the 400×360 letterbox rectangle
+        // so the wallpaper/background shows through — same rounding style as the outer
+        // overlay window's top corners.  Inner corners (game screen edge) stay square.
         {
             static constexpr int ix = 40, iy = 36, iw = 320, ih = 288;
-            auto* fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+            auto* const fb = reinterpret_cast<uint16_t*>(renderer->getCurrentFramebuffer());
             fill_letterbox_rect(fb, 0,       ix,       0,       VP_H, g_ovl_frame_packed);
             fill_letterbox_rect(fb, ix + iw, VP_W,     0,       VP_H, g_ovl_frame_packed);
             fill_letterbox_rect(fb, ix,      ix + iw,  0,       iy,   g_ovl_frame_packed);
             fill_letterbox_rect(fb, ix,      ix + iw,  iy + ih, VP_H, g_ovl_frame_packed);
+            fill_vp_corners_448(fb, pre_wp_bg);
         }
         render_gb_screen(renderer);
-        // Theme-aware border.
+        // Theme-aware viewport border + arc border at the 4 outer letterbox corners.
+        // Corner arcs use kOvlR10Arc growing down from vp_top / up from vp_bot,
+        // mirrored left↔right.  14 arc drawRect calls × 2 (top+bottom) = 28 total.
         {
             const tsl::Color& BORDER = g_ovl_bdr_col;
-            renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);
-            renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);
-            renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);
-            renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);
+            // Straight edges shortened by R=10 on every end — same pattern as
+            // render_ovl_free_border — so they don't form square corners where
+            // the arc pixels leave transparent rounded cutouts.
+            static constexpr int R = 10;
+            renderer->drawRect(VP_X - 1 + R,  VP_Y - 1 + g_render_y_offset,    VP_W + 2 - 2*R, 1,          BORDER);
+            renderer->drawRect(VP_X - 1 + R,  VP_Y + VP_H + g_render_y_offset, VP_W + 2 - 2*R, 1,          BORDER);
+            renderer->drawRect(VP_X - 1,       VP_Y + g_render_y_offset + R,    1,              VP_H - 2*R, BORDER);
+            renderer->drawRect(VP_X + VP_W,    VP_Y + g_render_y_offset + R,    1,              VP_H - 2*R, BORDER);
+            // Arc border pixels — shared helper draws 2 mirrored corners per call.
+            // Called once for top (TL+TR, growing down) and once for bottom (BL+BR,
+            // growing up) — same loop body compiled once via [[gnu::noinline]].
+            const int vp_top = VP_Y + g_render_y_offset;
+            const int vp_bot = VP_Y + VP_H + g_render_y_offset;
+            draw_r10_2corners(renderer, VP_X, VP_X + VP_W, vp_top,     false, BORDER);
+            draw_r10_2corners(renderer, VP_X, VP_X + VP_W, vp_bot - 1, true,  BORDER);
         }
         render_gbc_logo(renderer, g_ovl_text_col);
 
@@ -332,10 +355,10 @@ public:
             static constexpr s32 LIP     = 4;   // uniform border, matches A/B circle thickness
             // Vertical bar — shifted 1px down, bottom extended 2px
             renderer->drawRect(DPAD_CX - (ARM_W + LIP*2)/2, DPAD_CY - (FULL + LIP*2)/2 + 4,
-                               ARM_W + LIP*2, FULL + LIP*2 + 2, BK);
+                               ARM_W + LIP*2, FULL + LIP*2 + 2-1, BK);
             // Horizontal bar — shifted 1px lower
             renderer->drawRect(DPAD_CX - (FULL + LIP*2)/2 -1, DPAD_CY - (ARM_H + LIP*2)/2 + 6,
-                               FULL + LIP*2 +1, ARM_H + LIP*2 -1, BK);
+                               FULL + LIP*2 +1, ARM_H + LIP*2 -2, BK);
         }
 
         // A button: filled black circle matching the hit-test radius.

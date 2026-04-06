@@ -62,7 +62,7 @@ static void load_config() {
         }
     }
 
-    // rom_dir
+    // save_dir
     const std::string save_dir_val = ult::parseValueFromIniSection(path, kConfigSection, kKeySaveDir);
     if (!save_dir_val.empty() && save_dir_val.size() < sizeof(g_save_dir) - 2) {
         strncpy(g_save_dir, save_dir_val.c_str(), sizeof(g_save_dir) - 2);
@@ -182,7 +182,6 @@ static void write_default_config_if_missing() {
     set_if_missing("save_dir",      g_save_dir);
     set_if_missing("volume",        "50");
     set_if_missing("vol_backup",    "50");
-    //set_if_missing("pixel_perfect", "0");
     set_if_missing("windowed",      "0");
     set_if_missing("lcd_grid",      "0");
     set_if_missing("ingame_haptics", "1");
@@ -701,11 +700,10 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
 class RomSelectorGui;       // forward declare
 class GameSettingsGui;      // forward declare
 class SettingsGui;          // forward declare
-class SaveSlotsGui;          // forward declare  (merged SaveStatesGui + SaveDataGui)
-class SlotActionGui;         // forward declare  (merged SlotActionGui + SaveDataSlotActionGui)
-class ConfirmGui;            // forward declare
-class QuickComboSelectorGui; // forward declare
-class OvlThemeSelectorGui;   // forward declare
+class SaveSlotsGui;         // forward declare  (merged SaveStatesGui + SaveDataGui)
+class SlotActionGui;        // forward declare  (merged SlotActionGui + SaveDataSlotActionGui)
+class ConfirmGui;           // forward declare
+class DropdownSelectorGui;  // forward declare  (merged QuickComboSelectorGui + OvlThemeSelectorGui)
 
 // Actions that flow through ConfirmGui.
 // The enum is plain so it costs nothing at runtime — a single int stored in
@@ -731,19 +729,6 @@ static constexpr const char* confirm_action_label(ConfirmAction a) {
         default:                         return "Confirm";
     }
 }
-
-// make_slot_detail_header — moved to gb_utils.hpp
-
-// Deferred normal ROM launch: relaunch this overlay with -overlay so GBOverlayGui
-// always starts in a fresh process (no residual menu heap / glyph state).
-// All three call sites (RomSelectorGui, SlotActionGui, GameSettingsGui) use this
-// single entry point — no swapTo<GBOverlayGui> anywhere in normal flow.
-//static void launch_emulator(const char* romPath) {
-//    // Do NOT clear g_settings_scroll here — the user expects to land back on the
-//    // same Settings item after X-ing out of the emulator and returning to Settings.
-//    launch_overlay_mode(romPath);
-//    // tsl::swapTo<GBOverlayGui>(); — replaced by overlay relaunch above.
-//}
 
 // =============================================================================
 // SlotActionGui — Save/Load/Delete (states) or Backup/Restore/Delete (save data)
@@ -875,6 +860,33 @@ class ConfirmGui : public tsl::Gui {
         tsl::swapTo<SlotActionGui>(m_rom_path, m_display_name, m_slot, isData, label);
     }
 
+    // Swap to the SaveSlotsGui for this slot; isData selects state vs data view.
+    void swap_to_slots(bool isData) {
+        tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), isData);
+    }
+
+    // Shared failure path: wall-feedback + notify + return to action Gui.
+    void do_fail(const char* msg) {
+        triggerWallFeedback();
+        show_notify(msg);
+        do_back();
+    }
+
+    // Shared delete path: erase main + timestamp files, swap to slots, notify.
+    // PathBuilder matches build_user_slot_path / build_save_backup_slot_path etc.
+    using PathBuilder = void(*)(const char*, int, char*, size_t);
+    void do_delete(PathBuilder buildMain, PathBuilder buildTs, bool isData) {
+        char path[PATH_BUFFER_SIZE] = {};
+        buildMain(m_rom_path.c_str(), m_slot, path, sizeof(path));
+        delete_file(path);
+        char tsPath[PATH_BUFFER_SIZE] = {};
+        buildTs(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
+        delete_file(tsPath);
+        swap_to_slots(isData);
+        triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+        show_notify("Slot deleted.");
+    }
+
     // Execute the confirmed action, then navigate onward.
     void do_yes() {
         switch (m_action) {
@@ -883,76 +895,49 @@ class ConfirmGui : public tsl::Gui {
                 if (save_user_slot(m_rom_path.c_str(), m_slot)) {
                     //triggerEnterFeedback();
                     //triggerRumbleClick.store(true, std::memory_order_release);
-                    tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), false);
+                    swap_to_slots(false);
                     show_notify("State saved.");
                 } else {
-                    triggerWallFeedback();
-                    show_notify("No state to save yet.");
-                    do_back();
+                    do_fail("No state to save yet.");
                 }
                 break;
 
-            case ConfirmAction::StateLoad: {
+            case ConfirmAction::StateLoad:
                 if (!load_user_slot(m_rom_path.c_str(), m_slot)) {
-                    triggerWallFeedback();
-                    show_notify("Load failed.");
-                    do_back();
+                    do_fail("Load failed.");
                     break;
                 }
                 // gb_load_rom will find the internal state and resume from it.
                 launch_game(m_rom_path.c_str());
                 break;
-            }
 
-            case ConfirmAction::StateDelete: {
-                char slotPath[PATH_BUFFER_SIZE] = {};
-                build_user_slot_path(m_rom_path.c_str(), m_slot, slotPath, sizeof(slotPath));
-                delete_file(slotPath);
-                char tsPath[PATH_BUFFER_SIZE] = {};
-                build_user_slot_ts_path(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
-                delete_file(tsPath);
-                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), false);
-                triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
-                show_notify("Slot deleted.");
+            case ConfirmAction::StateDelete:
+                do_delete(build_user_slot_path, build_user_slot_ts_path, false);
                 break;
-            }
 
             case ConfirmAction::DataBackup:
                 if (backup_save_data_slot(m_rom_path.c_str(), m_slot)) {
                     //triggerEnterFeedback();
                     show_notify("Save data backed up.");
-                    tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
+                    swap_to_slots(true);
                 } else {
-                    triggerWallFeedback();
-                    show_notify("No save data found.");
-                    do_back();
+                    do_fail("No save data found.");
                 }
                 break;
 
             case ConfirmAction::DataRestore:
                 if (!restore_save_data_slot(m_rom_path.c_str(), m_slot)) {
-                    triggerWallFeedback();
-                    show_notify("Restore failed.");
-                    do_back();
+                    do_fail("Restore failed.");
                     break;
                 }
-                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
+                swap_to_slots(true);
                 //triggerEnterFeedback();
                 show_notify("Save data restored.");
                 break;
 
-            case ConfirmAction::DataDelete: {
-                char slotPath[PATH_BUFFER_SIZE] = {};
-                build_save_backup_slot_path(m_rom_path.c_str(), m_slot, slotPath, sizeof(slotPath));
-                delete_file(slotPath);
-                char tsPath[PATH_BUFFER_SIZE] = {};
-                build_save_backup_slot_ts_path(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
-                delete_file(tsPath);
-                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
-                triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
-                show_notify("Slot deleted.");
+            case ConfirmAction::DataDelete:
+                do_delete(build_save_backup_slot_path, build_save_backup_slot_ts_path, true);
                 break;
-            }
         }
     }
 
@@ -1005,7 +990,6 @@ public:
         return false;
     }
 };
-
 
 // =============================================================================
 // SaveSlotsGui — 10-slot list for save states (isData=false) or save-data
@@ -1292,39 +1276,70 @@ public:
 
 // =============================================================================
 // =============================================================================
-// OvlThemeSelectorGui — overlay colour theme picker
+// DropdownSelectorGui — merged combo-picker and theme-picker
 //
-// Lists all .ini files in OVL_THEMES_DIR (excluding any "default.ini") plus
-// a built-in "default" entry.  Selecting a theme:
-//   • copies the chosen .ini over OVL_THEME_FILE (or rewrites defaults for
-//     the built-in "default" entry)
-//   • calls load_ovl_theme() so colors take effect immediately
-//   • swaps back to SettingsGui (same as clicking A on a theme)
-// B also returns to SettingsGui without changing the theme.
+// Replaces the former QuickComboSelectorGui and OvlThemeSelectorGui.
+// Both screens share identical state layout, construction, and B-handling;
+// only createUI() branches on m_mode.  Merging into one class eliminates:
+//   • one vtable (two per-type vtables → one)
+//   • one tsl::swapTo<T> template instantiation (each T generates a unique
+//     instantiation chain that LTO only partially folds)
 //
-// No heap is held between visits — the list is rebuilt on each createUI().
+// SelectorMode::QuickCombo — combo picker (stays on list after selection)
+// SelectorMode::OvlTheme   — theme picker (swaps back to SettingsGui on select)
 // =============================================================================
+enum class SelectorMode : uint8_t { QuickCombo, OvlTheme };
+
 static int ovl_theme_filter(const struct dirent* e) {
     const char* n = e->d_name;
     const size_t len = strlen(n);
-    if (len < 5) return 0;                          // too short to end in ".ini"
-    if (strcmp(n, "default.ini") == 0) return 0;   // "default" is the built-in entry
+    if (len < 5) return 0;
+    if (strcmp(n, "default.ini") == 0) return 0;
     return (strcmp(n + len - 4, ".ini") == 0) ? 1 : 0;
 }
 
-class OvlThemeSelectorGui : public tsl::Gui {
-    std::string m_rom_scroll;
-    std::string m_settings_scroll;
-    tsl::elm::ListItem* m_lastSelected = nullptr;
+class DropdownSelectorGui : public tsl::Gui {
+    std::string          m_rom_scroll;
+    std::string          m_settings_scroll;
+    tsl::elm::ListItem*  m_lastSelected = nullptr;
+    SelectorMode         m_mode;
 
+    // Transfer the checkmark from the previously selected item to `item`.
+    void select_item(tsl::elm::ListItem* item) {
+        if (m_lastSelected && m_lastSelected != item)
+            m_lastSelected->setValue("");
+        item->setValue(ult::CHECKMARK_SYMBOL);
+        m_lastSelected = item;
+    }
+
+    // ── QuickCombo helpers ────────────────────────────────────────────────────
+    // Write combo (or "" to clear) into our overlays.ini mode_combos[0].
+    // Also updates g_quick_combo for the Settings display.
+    void save_combo(const std::string& combo) {
+        const char* fn = ovl_filename();
+        if (!fn || !fn[0]) return;
+
+        auto iniData = ult::getParsedDataFromIniFile(ult::OVERLAYS_INI_FILEPATH);
+        auto& section = iniData[fn];
+        auto comboList = splitIniList(section["mode_combos"]);
+        if (comboList.empty()) comboList.emplace_back();
+        comboList[0] = combo;
+        section["mode_combos"] = "(" + joinIniList(comboList) + ")";
+        ult::saveIniFileData(ult::OVERLAYS_INI_FILEPATH, iniData);
+        tsl::hlp::loadEntryKeyCombos();
+
+        g_quick_combo[0] = '\0';
+        if (!combo.empty())
+            strncpy(g_quick_combo, combo.c_str(), sizeof(g_quick_combo) - 1);
+    }
+
+    // ── OvlTheme helpers ──────────────────────────────────────────────────────
     // Overwrite OVL_THEME_FILE with the chosen theme and reload all colors.
-    // Persist the display name to config.ini (ovl_theme) separately.
     // srcPath == nullptr means "default" — write canonical default values.
     void apply_theme(const char* name, const char* srcPath) {
         if (srcPath) {
             copy_file(srcPath, OVL_THEME_FILE);
         } else {
-            // "default" — overwrite OVL_THEME_FILE with canonical values.
             ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_color",      "000000",  "");
             ult::setIniFileValue(OVL_THEME_FILE, "theme", "bg_alpha",      "13",      "");
             ult::setIniFileValue(OVL_THEME_FILE, "theme", "button_color",  "333333",  "");
@@ -1339,82 +1354,140 @@ class OvlThemeSelectorGui : public tsl::Gui {
     }
 
 public:
-    OvlThemeSelectorGui(std::string romScroll, std::string settingsScroll)
+    DropdownSelectorGui(std::string romScroll, std::string settingsScroll, SelectorMode mode)
         : m_rom_scroll(std::move(romScroll))
-        , m_settings_scroll(std::move(settingsScroll)) {}
+        , m_settings_scroll(std::move(settingsScroll))
+        , m_mode(mode) {}
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader("Overlay Theme"));
 
-        const std::string current(g_ovl_theme_name);
-        std::string jumpTarget;
+        if (m_mode == SelectorMode::QuickCombo) {
+            // ── Quick Combo ───────────────────────────────────────────────────
+            list->addItem(new tsl::elm::CategoryHeader("Quick Combo"));
 
-        // ── Built-in "default" entry ──────────────────────────────────────────
-        {
-            const bool isCurrent = (current == "default");
-            if (isCurrent) jumpTarget = "default";
-
-            auto* item = new tsl::elm::ListItem("default");
-            if (isCurrent) {
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-            }
-            item->setClickListener([this, item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                apply_theme("default", nullptr);
-                if (m_lastSelected && m_lastSelected != item)
-                    m_lastSelected->setValue("");
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-                triggerEnterFeedback();
-                tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
-                return true;
-            });
-            list->addItem(item);
-        }
-
-        // ── Theme files from OVL_THEMES_DIR ───────────────────────────────────
-        // scandir returns alphabetically-sorted entries; each is freed immediately
-        // after the ListItem is built so peak allocation is one dirent at a time.
-        {
-            struct dirent** entries = nullptr;
-            const int n = scandir(OVL_THEMES_DIR, &entries, ovl_theme_filter, alphasort);
-            for (int i = 0; i < n; ++i) {
-                const std::string fname{entries[i]->d_name};
-                free(entries[i]);
-                entries[i] = nullptr;
-
-                // Strip ".ini" → display and key name
-                const std::string tname = fname.substr(0, fname.size() - 4);
-                const std::string tpath = std::string(OVL_THEMES_DIR) + fname;
-
-                const bool isCurrent = (current == tname);
-                if (isCurrent && jumpTarget.empty()) jumpTarget = tname;
-
-                auto* item = new tsl::elm::ListItem(tname);
-                if (isCurrent) {
-                    item->setValue(ult::CHECKMARK_SYMBOL);
-                    m_lastSelected = item;
+            // Read the current combo fresh from overlays.ini (g_quick_combo may lag
+            // if the user picked a combo and immediately re-entered this screen).
+            std::string currentCombo;
+            {
+                const char* fn = ovl_filename();
+                if (fn && fn[0] && ult::isFile(ult::OVERLAYS_INI_FILEPATH)) {
+                    const std::string mc = ult::parseValueFromIniSection(
+                        ult::OVERLAYS_INI_FILEPATH, fn, "mode_combos");
+                    const auto cl = splitIniList(mc);
+                    if (!cl.empty()) currentCombo = cl[0];
                 }
-                item->setClickListener([this, item, tname, tpath](u64 keys) -> bool {
+            }
+
+            // None (clear)
+            {
+                auto* item = new tsl::elm::ListItem(ult::OPTION_SYMBOL);
+                if (currentCombo.empty())
+                    select_item(item);
+                item->setClickListener([this, item](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
-                    apply_theme(tname.c_str(), tpath.c_str());
-                    if (m_lastSelected && m_lastSelected != item)
-                        m_lastSelected->setValue("");
-                    item->setValue(ult::CHECKMARK_SYMBOL);
-                    m_lastSelected = item;
+                    save_combo("");
+                    select_item(item);
+                    return true;
+                });
+                list->addItem(item);
+            }
+
+            // Predefined combos
+            std::string jumpTarget = currentCombo.empty() ? ult::OPTION_SYMBOL : "";
+
+            for (const auto& combo : g_defaultCombos) {
+                // Skip Tesla's show/hide combo — reassigning it would make the
+                // overlay unreachable.
+                const u64 comboKeys = tsl::hlp::comboStringToKeys(combo);
+                if (comboKeys == tsl::cfg::launchCombo)
+                    continue;
+                std::string display = combo;
+                ult::convertComboToUnicode(display);
+
+                const bool isCurrent = !currentCombo.empty() &&
+                    tsl::hlp::comboStringToKeys(combo) ==
+                    tsl::hlp::comboStringToKeys(currentCombo);
+
+                if (isCurrent && jumpTarget.empty())
+                    jumpTarget = display;
+
+                auto* item = new tsl::elm::ListItem(display);
+                if (isCurrent)
+                    select_item(item);
+                item->setClickListener([this, item, combo](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    remove_quick_combo_from_others(combo);
+                    save_combo(combo);
+                    select_item(item);
+                    return true;
+                });
+                list->addItem(item);
+            }
+
+            if (!jumpTarget.empty())
+                list->jumpToItem(jumpTarget, "", true);
+
+        } else {
+            // ── Overlay Theme ─────────────────────────────────────────────────
+            list->addItem(new tsl::elm::CategoryHeader("Overlay Theme"));
+
+            const std::string current(g_ovl_theme_name);
+            std::string jumpTarget;
+
+            // Built-in "default" entry
+            {
+                const bool isCurrent = (current == "default");
+                if (isCurrent) jumpTarget = "default";
+
+                auto* item = new tsl::elm::SilentListItem("default");
+                if (isCurrent)
+                    select_item(item);
+                item->setClickListener([this, item](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    apply_theme("default", nullptr);
+                    select_item(item);
                     triggerEnterFeedback();
                     tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
                     return true;
                 });
                 list->addItem(item);
             }
-            free(entries);  // safe on nullptr (n <= 0 case)
-        }
 
-        if (!jumpTarget.empty())
-            list->jumpToItem(jumpTarget, "", true);
+            // Theme files from OVL_THEMES_DIR
+            {
+                struct dirent** entries = nullptr;
+                const int n = scandir(OVL_THEMES_DIR, &entries, ovl_theme_filter, alphasort);
+                for (int i = 0; i < n; ++i) {
+                    const std::string fname{entries[i]->d_name};
+                    free(entries[i]);
+                    entries[i] = nullptr;
+
+                    const std::string tname = fname.substr(0, fname.size() - 4);
+                    const std::string tpath = std::string(OVL_THEMES_DIR) + fname;
+
+                    const bool isCurrent = (current == tname);
+                    if (isCurrent && jumpTarget.empty()) jumpTarget = tname;
+
+                    auto* item = new tsl::elm::SilentListItem(tname);
+                    if (isCurrent)
+                        select_item(item);
+                    item->setClickListener([this, item, tname, tpath](u64 keys) -> bool {
+                        if (!(keys & KEY_A)) return false;
+                        apply_theme(tname.c_str(), tpath.c_str());
+                        select_item(item);
+                        triggerEnterFeedback();
+                        tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+                        return true;
+                    });
+                    list->addItem(item);
+                }
+                free(entries);
+            }
+
+            if (!jumpTarget.empty())
+                list->jumpToItem(jumpTarget, "", true);
+        }
 
         return make_bare_frame(list);
     }
@@ -1715,7 +1788,7 @@ public:
                 // Persist the current scroll target before leaving so SettingsGui
                 // can restore it when the user presses B inside QuickComboSelectorGui.
                 set_settings_scroll("Quick Combo");
-                tsl::swapTo<QuickComboSelectorGui>(m_rom_scroll, std::string("Quick Combo"));
+                tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string("Quick Combo"), SelectorMode::QuickCombo);
                 return true;
             });
             list->addItem(qc_item);
@@ -1729,8 +1802,7 @@ public:
             th_item->setClickListener([this](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
                 set_settings_scroll("Overlay Theme");
-                tsl::swapTo<OvlThemeSelectorGui>(m_rom_scroll,
-                                                  std::string("Overlay Theme"));
+                tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string("Overlay Theme"), SelectorMode::OvlTheme);
                 return true;
             });
             m_theme_item = th_item;
@@ -1807,147 +1879,6 @@ public:
             return true;
         }
 
-        return false;
-    }
-};
-
-// =============================================================================
-// QuickComboSelectorGui — combo picker for the Quick Launch feature
-//
-// Swapped to from SettingsGui when the user presses A on "Quick Combo".
-// Shows OPTION_SYMBOL (none) then every entry in g_defaultCombos.
-// On selection:
-//   1. Removes the chosen combo from all other overlays/packages (deconflict).
-//   2. Writes the combo to overlays.ini mode_combos[0] under our own filename.
-//   3. Calls tsl::hlp::loadEntryKeyCombos() so Tesla picks up the new binding.
-//   4. Updates g_quick_combo so SettingsGui displays the new value on return.
-// B returns to SettingsGui, scrolling back to the "Quick Combo" item.
-// =============================================================================
-class QuickComboSelectorGui : public tsl::Gui {
-    std::string m_rom_scroll;
-    std::string m_settings_scroll;
-    tsl::elm::ListItem* m_lastSelected = nullptr;
-
-    // Write combo (or "" to clear) into our overlays.ini mode_combos[0].
-    // Also updates g_quick_combo for the Settings display.
-    void save_combo(const std::string& combo) {
-        const char* fn = ovl_filename();
-        if (!fn || !fn[0]) return;
-
-        auto iniData = ult::getParsedDataFromIniFile(ult::OVERLAYS_INI_FILEPATH);
-        auto& section = iniData[fn];
-        auto comboList = splitIniList(section["mode_combos"]);
-        if (comboList.empty()) comboList.emplace_back();
-        comboList[0] = combo;
-        section["mode_combos"] = "(" + joinIniList(comboList) + ")";
-        ult::saveIniFileData(ult::OVERLAYS_INI_FILEPATH, iniData);
-        tsl::hlp::loadEntryKeyCombos();
-
-        g_quick_combo[0] = '\0';
-        if (!combo.empty())
-            strncpy(g_quick_combo, combo.c_str(), sizeof(g_quick_combo) - 1);
-    }
-
-public:
-    QuickComboSelectorGui(std::string romScroll, std::string settingsScroll)
-        : m_rom_scroll(std::move(romScroll))
-        , m_settings_scroll(std::move(settingsScroll)) {}
-
-    virtual tsl::elm::Element* createUI() override {
-        auto* list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader("Quick Combo"));
-
-        // Read the current combo fresh from overlays.ini (g_quick_combo may lag
-        // if the user picked a combo and immediately re-entered this screen).
-        std::string currentCombo;
-        {
-            const char* fn = ovl_filename();
-            if (fn && fn[0] && ult::isFile(ult::OVERLAYS_INI_FILEPATH)) {
-                const std::string mc = ult::parseValueFromIniSection(
-                    ult::OVERLAYS_INI_FILEPATH, fn, "mode_combos");
-                const auto cl = splitIniList(mc);
-                if (!cl.empty()) currentCombo = cl[0];
-            }
-        }
-
-        // ── None (clear) ──────────────────────────────────────────────────────
-        {
-            auto* item = new tsl::elm::ListItem(ult::OPTION_SYMBOL);
-            if (currentCombo.empty()) {
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-            }
-            item->setClickListener([this, item](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                save_combo("");
-                if (m_lastSelected && m_lastSelected != item)
-                    m_lastSelected->setValue("");
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-                //triggerNavigationFeedback();
-                return true;
-            });
-            list->addItem(item);
-        }
-
-        // ── Predefined combos ─────────────────────────────────────────────────
-        std::string jumpTarget = currentCombo.empty() ? ult::OPTION_SYMBOL : "";
-
-        for (const auto& combo : g_defaultCombos) {
-            // Skip any combo that matches Tesla's current show/hide combo so the
-            // user cannot accidentally reassign the overlay open trigger to Quick
-            // Launch — that would make the overlay unreachable.
-            const u64 comboKeys = tsl::hlp::comboStringToKeys(combo);
-            if (comboKeys == tsl::cfg::launchCombo)
-                continue;
-            std::string display = combo;
-            ult::convertComboToUnicode(display);
-
-            const bool isCurrent = !currentCombo.empty() &&
-                tsl::hlp::comboStringToKeys(combo) ==
-                tsl::hlp::comboStringToKeys(currentCombo);
-
-            if (isCurrent && jumpTarget.empty())
-                jumpTarget = display;
-
-            auto* item = new tsl::elm::ListItem(display);
-            if (isCurrent) {
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-            }
-            item->setClickListener([this, item, combo](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                // 1. Deconflict: remove this combo from every other overlay/package.
-                remove_quick_combo_from_others(combo);
-                // 2. Persist and reload.
-                save_combo(combo);
-                if (m_lastSelected && m_lastSelected != item)
-                    m_lastSelected->setValue("");
-                item->setValue(ult::CHECKMARK_SYMBOL);
-                m_lastSelected = item;
-                //triggerNavigationFeedback();
-                return true;
-            });
-            list->addItem(item);
-        }
-
-        // Scroll to the currently selected item when the page opens.
-        if (!jumpTarget.empty())
-            list->jumpToItem(jumpTarget, "", true);
-
-        return make_bare_frame(list);
-    }
-
-    virtual bool handleInput(u64 keysDown, u64 keysHeld,
-                             const HidTouchState& touchPos,
-                             HidAnalogStickState leftJoy,
-                             HidAnalogStickState rightJoy) override {
-        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
-        if (keysDown & KEY_B) {
-            triggerExitFeedback();
-            tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
-            return true;
-        }
         return false;
     }
 };
@@ -2197,6 +2128,64 @@ class Overlay : public tsl::Overlay {
     // Guards all game-specific teardown and audio handling in the other virtuals.
     bool m_game_session = false;
 
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    // Safely copy src into a fixed-size char array, always null-terminated.
+    template<size_t N>
+    static void safe_copy(char (&dst)[N], const char* src) {
+        strncpy(dst, src, N - 1);
+        dst[N - 1] = '\0';
+    }
+
+    // Erase a single key from the config INI.
+    // Accepts const std::string& so kKey* string constants bind without .c_str().
+    static void erase_ini(const std::string& key) {
+        ult::setIniFileValue(kConfigFile, kConfigSection, key, "", "");
+    }
+
+    // Read an INI key; copy into buf if non-empty and fits within N;
+    // erase the key if non-empty (or unconditionally when always_erase is true).
+    // Accepts const std::string& so kKey* string constants bind without .c_str().
+    template<size_t N>
+    static void consume_ini_into(const std::string& key, char (&buf)[N], bool always_erase = false) {
+        const std::string val = ult::parseValueFromIniSection(kConfigFile, kConfigSection, key);
+        if (!val.empty() && val.size() < N - 1)
+            safe_copy(buf, val.c_str());
+        if (always_erase || !val.empty())
+            erase_ini(key);
+    }
+
+    // Persist the settings scroll position to the config INI if non-empty.
+    static void persist_scroll() {
+        if (g_settings_scroll[0])
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
+                                 g_settings_scroll, "");
+    }
+
+    // Request a self-relaunch via tsl::setNextOverlay; pass nullptr or "" to
+    // omit args.  No-ops silently when g_self_path is unset.
+    static void relaunch_self(const char* args = nullptr) {
+        if (!g_self_path[0]) return;
+        if (args && args[0])
+            tsl::setNextOverlay(g_self_path, args);
+        else
+            tsl::setNextOverlay(g_self_path);
+        tsl::Overlay::get()->close();
+    }
+
+    // Populate g_pending_rom_path, optionally clear a consumed source buffer,
+    // trigger wallpaper load if expanded memory is available, and return
+    // GBOverlayGui as the initial GUI.
+    // Non-static: initially<T>() is an inherited non-static member of tsl::Overlay.
+    std::unique_ptr<tsl::Gui> launch_overlay_gui(const char* rom_path,
+                                                  char*       clear_src = nullptr) {
+        if (ult::expandedMemory)
+            ult::loadWallpaperFileWhenSafe();
+        safe_copy(g_pending_rom_path, rom_path);
+        if (clear_src) clear_src[0] = '\0';
+        return initially<GBOverlayGui>();
+    }
+
 public:
     void initServices() override {
         tsl::overrideBackButton = true;
@@ -2205,7 +2194,6 @@ public:
         // ── Common init (every session type) ─────────────────────────────────
         ult::createDirectory(CONFIG_DIR);
         ult::createDirectory(SAVE_BASE_DIR);
-        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
         ult::createDirectory(STATE_DIR);
         ult::createDirectory(CONFIGURE_DIR);
@@ -2240,31 +2228,18 @@ public:
                     kConfigFile, kConfigSection, kKeyWinQuickExit);
                 g_win_quick_exit = (qe == "1");
                 if (g_win_quick_exit)
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "", "");
+                    erase_ini(kKeyWinQuickExit);
             }
-            {
-                const std::string wrom = ult::parseValueFromIniSection(
-                    kConfigFile, kConfigSection, kKeyWindowedRom);
-                if (!wrom.empty() && wrom.size() < sizeof(g_win_rom_path) - 1) {
-                    strncpy(g_win_rom_path, wrom.c_str(), sizeof(g_win_rom_path) - 1);
-                    g_win_rom_path[sizeof(g_win_rom_path) - 1] = '\0';
-                }
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, "", "");
-            }
+            // always_erase=true: key must be cleared even when no path was stored,
+            // so a stale entry can never survive across unrelated launches.
+            consume_ini_into(kKeyWindowedRom, g_win_rom_path, /*always_erase=*/true);
         } else {
             // All non-windowed sessions (game or UI):
 
             if (g_overlay_mode) {
                 // Player overlay: read the ROM path written by launch_overlay_mode().
                 // Erase immediately so it never persists across unrelated launches.
-                const std::string pr = ult::parseValueFromIniSection(
-                    kConfigFile, kConfigSection, kKeyPlayerRom);
-                if (!pr.empty() && pr.size() < sizeof(g_overlay_rom_path) - 1) {
-                    strncpy(g_overlay_rom_path, pr.c_str(), sizeof(g_overlay_rom_path) - 1);
-                    g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
-                }
-                if (!pr.empty())
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyPlayerRom, "", "");
+                consume_ini_into(kKeyPlayerRom, g_overlay_rom_path);
             }
 
             // Free-overlay quicklaunch: g_overlay_rom_path wasn't written to
@@ -2273,8 +2248,7 @@ public:
             if (g_overlay_free_mode && !g_overlay_rom_path[0] && g_quick_launch && g_last_rom_path[0]) {
                 char full[PATH_BUFFER_SIZE];
                 snprintf(full, sizeof(full), "%s%s", g_rom_dir, g_last_rom_path);
-                strncpy(g_overlay_rom_path, full, sizeof(g_overlay_rom_path) - 1);
-                g_overlay_rom_path[sizeof(g_overlay_rom_path) - 1] = '\0';
+                safe_copy(g_overlay_rom_path, full);
             }
 
             if (!m_game_session) {
@@ -2302,7 +2276,7 @@ public:
                     set_settings_scroll(ss.c_str());
                 g_returning_from_windowed = false;   // consumed; clear for safety
                 if (!ss.empty())
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
+                    erase_ini(kKeySettingsScroll);
             }
         }
     }
@@ -2325,9 +2299,7 @@ public:
             } else {
                 // ── Overlay teardown ──────────────────────────────────────────
                 // Persist scroll — catches Tesla mode-combo relaunch mid-game.
-                if (g_settings_scroll[0])
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
-                                         g_settings_scroll, "");
+                persist_scroll();
                 gb_audio_pause();
             }
             // Common game teardown — runs for both windowed and overlay sessions.
@@ -2337,9 +2309,7 @@ public:
         } else {
             // ── UI session teardown ───────────────────────────────────────────
             // Persist scroll — catches Tesla mode-combo close while browsing settings.
-            if (g_settings_scroll[0])
-                ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
-                                     g_settings_scroll, "");
+            persist_scroll();
         }
     }
 
@@ -2381,8 +2351,7 @@ public:
                 // Pre-loop check was overly conservative — attempt recovery.
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, romPathBuf, "");
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
-                tsl::setNextOverlay(g_self_path, "-windowed");
-                tsl::Overlay::get()->close();
+                relaunch_self("-windowed");
             }
             return initially<RomSelectorGui>();
         }
@@ -2396,26 +2365,18 @@ public:
                 show_notify(msg);
                 g_overlay_mode      = false;
                 g_overlay_free_mode = false;
-                if (g_self_path[0]) {
-                    tsl::setNextOverlay(g_self_path);
-                    tsl::Overlay::get()->close();
-                }
+                relaunch_self();
                 return initially<RomSelectorGui>();
             }
-            if (ult::expandedMemory)
-                ult::loadWallpaperFileWhenSafe();
-            strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
-            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            g_overlay_rom_path[0] = '\0';
-            return initially<GBOverlayGui>();
+
+            // UltraGBOverlayFrame bypassed — trigger wallpaper load manually.
+            return launch_overlay_gui(g_overlay_rom_path, g_overlay_rom_path);
         }
 
         // ── Windowed session ─────────────────────────────────────────────────────
         if (g_win_scale_locked) {
-            if (g_win_rom_path[0]) {
-                strncpy(g_pending_rom_path, g_win_rom_path, sizeof(g_pending_rom_path) - 1);
-                g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            }
+            if (g_win_rom_path[0])
+                safe_copy(g_pending_rom_path, g_win_rom_path);
             return initially<GBWindowedGui>();
         }
 
@@ -2424,19 +2385,12 @@ public:
             if (const char* msg = rom_playability_message(g_overlay_rom_path)) {
                 show_notify(msg);
                 g_overlay_mode = false;
-                if (g_self_path[0]) {
-                    tsl::setNextOverlay(g_self_path);
-                    tsl::Overlay::get()->close();
-                }
+                relaunch_self();
                 return initially<RomSelectorGui>();
             }
+
             // UltraGBOverlayFrame bypassed — trigger wallpaper load manually.
-            if (ult::expandedMemory)
-                ult::loadWallpaperFileWhenSafe();
-            strncpy(g_pending_rom_path, g_overlay_rom_path, sizeof(g_pending_rom_path) - 1);
-            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            g_overlay_rom_path[0] = '\0';  // consumed
-            return initially<GBOverlayGui>();
+            return launch_overlay_gui(g_overlay_rom_path, g_overlay_rom_path);
         }
 
         // ── Quick-launch (non-windowed) ──────────────────────────────────────────
@@ -2445,25 +2399,18 @@ public:
             snprintf(romPathBuf, sizeof(romPathBuf), "%s%s", g_rom_dir, g_last_rom_path);
             if (const char* msg = rom_playability_message(romPathBuf)) {
                 show_notify(msg);
-                if (g_self_path[0]) {
-                    tsl::setNextOverlay(g_self_path);
-                    tsl::Overlay::get()->close();
-                }
+                relaunch_self();
                 return initially<RomSelectorGui>();
             }
+
             // UltraGBOverlayFrame bypassed — trigger wallpaper load manually.
-            ult::loadWallpaperFileWhenSafe();
-            strncpy(g_pending_rom_path, romPathBuf, sizeof(g_pending_rom_path) - 1);
-            g_pending_rom_path[sizeof(g_pending_rom_path) - 1] = '\0';
-            return initially<GBOverlayGui>();
+            return launch_overlay_gui(romPathBuf);
         }
 
         // ── Default — cold start, -returning, unexpected edge cases ──────────────
         return initially<RomSelectorGui>();
     }
 };
-
-
 
 
 // Clamp g_win_scale to the maximum the current heap tier can support.

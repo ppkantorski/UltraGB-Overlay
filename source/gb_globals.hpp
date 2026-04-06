@@ -37,7 +37,6 @@ static constexpr const char* CONFIG_FILE       = "sdmc:/config/ultragb/config.in
 static constexpr const char* SAVE_BASE_DIR     = "sdmc:/config/ultragb/saves/";
 static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
-//static constexpr const char* INTERNAL_SAVE_BASE_DIR  = "sdmc:/config/ultragb/saves/internal/";
 static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
 static constexpr const char* OVL_THEMES_DIR    = "sdmc:/config/ultragb/ovl_themes/";
 static constexpr const char* OVL_THEME_FILE    = "sdmc:/config/ultragb/ovl_theme.ini";

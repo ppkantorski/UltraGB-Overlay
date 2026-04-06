@@ -34,6 +34,7 @@
 #pragma once
 
 #include <tesla.hpp>
+#include "gb_audio.h"   // gb_audio_mark_frame_start and friends — required by gb_core.h
 #include "gb_core.h"
 
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
@@ -859,13 +860,505 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer) {
     fill_letterbox_rect(fb, ix,      ix + iw,  0,       iy,   PACKED_LB); // top
     fill_letterbox_rect(fb, ix,      ix + iw,  iy + ih, VP_H, PACKED_LB); // bottom
 }
+// =============================================================================
+// ── Wallpaper / transparent-row swizzle tables for the fixed 448×720 FB ──────
+// Shared between draw_wallpaper_direct (wallpaper blending) and
+// clear_fb_rows_transparent_448 (direct zero-write for transparent rows).
+//
+// Pre-computed once on first use; total static storage: 720×4 + 56×4 = 3,104 B.
+// OWV = ((448/2) >> 4) << 3 = 112 — same constant as in gb_renderer.h.
+static constexpr u32 kWP_W  = 448u;
+static constexpr u32 kWP_H  = 720u;
+static constexpr u32 kWP_GW = kWP_W / 8u;   // 56 groups of 8 pixels per row
 
-// -- Border around the viewport -----------------------------------------------
-// Theme-aware version (using g_ovl_bdr_col) is inlined in gb_overlay.hpp.
-inline void render_gb_border(tsl::gfx::Renderer* renderer) {
-    static constexpr tsl::Color BORDER{0x3, 0x3, 0x3, 0xF};
-    renderer->drawRect(VP_X - 1, VP_Y - 1 + g_render_y_offset,    VP_W + 2, 1,    BORDER);
-    renderer->drawRect(VP_X - 1, VP_Y + VP_H + g_render_y_offset, VP_W + 2, 1,    BORDER);
-    renderer->drawRect(VP_X - 1, VP_Y + g_render_y_offset,        1,        VP_H, BORDER);
-    renderer->drawRect(VP_X + VP_W, VP_Y + g_render_y_offset,     1,        VP_H, BORDER);
+static u32  s_wp_yParts[kWP_H];             // y-contribution to block-linear offset
+static u32  s_wp_xGroupParts[kWP_GW];       // x-contribution for start of each group
+static bool s_wp_tables_ready = false;
+
+static void init_wallpaper_swizzle_tables() {
+    if (__builtin_expect(s_wp_tables_ready, 1)) return;
+    static constexpr u32 kOWV = 112u;       // ((448/2)>>4)<<3 — constant for 448-wide FB
+    for (u32 y = 0u; y < kWP_H; ++y) {
+        s_wp_yParts[y] = ((((y & 127u) >> 4u) + ((y >> 7u) * kOWV)) << 9u)
+                       + ((y & 8u) << 5u) + ((y & 6u) << 4u) + ((y & 1u) << 3u);
+    }
+    for (u32 g = 0u; g < kWP_GW; ++g) {
+        const u32 x     = g * 8u;
+        // (x & 7) == 0 always (x is a multiple of 8) → last term is 0.
+        s_wp_xGroupParts[g] = ((x >> 5u) << 12u) + ((x & 16u) << 3u) + ((x & 8u) << 1u);
+    }
+    s_wp_tables_ready = true;
+}
+
+// clear_fb_rows_transparent_448
+//
+// Write RGBA4444 = 0x0000 (fully transparent) to every pixel in rows
+// [y_start, y_end) of the 448-wide overlay framebuffer, bypassing Tesla's
+// blend formula (which cannot produce alpha = 0 via drawRect — a colour with
+// a=0 blends as: out = dst × 1 + src × 0 = dst unchanged).
+//
+// Uses 8-pixel NEON stores into the block-linear swizzle addresses —
+// identical pattern to draw_wallpaper_direct.  For the worst-case 84 rows:
+//   84 × 56 groups × 1 vst1q_u16 = 4,704 stores ≈ < 5 µs on Cortex-A57.
+[[gnu::noinline]]
+static void clear_fb_rows_transparent_448(tsl::gfx::Renderer* renderer,
+                                           u32 y_start, u32 y_end) {
+    if (y_start >= y_end) return;
+    init_wallpaper_swizzle_tables();
+    auto* const      fb    = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+    const uint16x8_t vzero = vdupq_n_u16(0u);
+    for (u32 y = y_start; y < y_end; ++y) {
+        const u32 yp = s_wp_yParts[y];
+        for (u32 g = 0u; g < kWP_GW; ++g)
+            vst1q_u16(fb + yp + s_wp_xGroupParts[g], vzero);
+    }
+}
+
+// =============================================================================
+// kCornerCnts — R=10 quarter-circle corner pixel counts, one per row (10 rows).
+//
+// For a corner at (corner_x, corner_y) with arc centre at (R,R)=(10,10),
+// a pixel at (dx, dy) is OUTSIDE the arc when (R−dx)²+(R−dy)² > R²=100.
+// kCornerCnts[dy] = number of dx values in [0, R-1] that satisfy this for
+// that row.  Total = 10+6+4+3+2+2+1+1+1+1 = 31 pixels per corner.
+//
+// Replaces the flat kOvlCorner[31] (dx,dy) table (62 bytes) with 10 bytes.
+// Callers use a two-level loop (outer on dy, inner on dx in [0,cnt)) so that
+// all dy-dependent address computations are hoisted to the outer iteration.
+// =============================================================================
+static constexpr uint8_t kCornerCnts[10] = {10, 6, 4, 3, 2, 2, 1, 1, 1, 1};
+
+// =============================================================================
+// OvlArcRow — compact arc descriptor used by render_ovl_free_border and the
+// game-screen corner arc draws in gb_overlay.hpp.
+//
+// dy  : offset of the FARTHEST row in this group from the reference edge.
+//       • top arcs:    dy measured downward  from fb_top   → y = fb_top + dy
+//       • bottom arcs: dy measured upward    from fb_bot-1 → y = fb_bot-1-dy
+//       • game BL/BR arcs: dy measured upward from sy      → ry = sy-dy-h+1
+// dx  : x offset from the corner for the leftmost pixel of the rect.
+// cnt : horizontal pixel count (width of the rect).
+// h   : vertical pixel count  (height of the rect, ≥1).
+//
+// kOvlR10Arc — R=10 border arc, 7 rects per corner (top corners of frame and
+//              bottom corners of game-screen viewport).
+// kOvlR20Arc — R=20 border arc, 13 rects per corner (bottom corners of frame).
+// kOvlCornerR20Widths — per-row outside-pixel counts for the R=20 clear loop.
+// =============================================================================
+struct OvlArcRow { int8_t dy, dx, cnt, h; };
+
+static constexpr OvlArcRow kOvlR10Arc[7] = {
+    {0,7,3,1}, {1,5,2,1}, {2,4,1,1}, {3,3,1,1}, {4,2,1,1}, {5,1,1,2}, {7,0,1,3}
+};
+static constexpr OvlArcRow kOvlR20Arc[13] = {
+    { 0,16,4,1},{ 1,13,3,1},{ 2,11,2,1},{ 3, 9,2,1},{ 4,8,1,1},{ 5,7,1,1},{ 6,6,1,1},
+    { 7, 5,1,1},{ 8, 4,1,1},{10, 3,1,2},{12, 2,1,2},{15,1,1,3},{19,0,1,4}
+};
+// draw_r10_2corners
+//
+// Draws the R=10 arc border at two mirrored corners (left + right) on one
+// horizontal edge — one [[gnu::noinline]] copy shared by render_ovl_free_border
+// (outer window top corners) and the viewport border (top OR bottom corners).
+//
+//   left_x   — leftmost x of the region (inclusive).
+//   right_x  — exclusive right boundary (left_x + width), so the right arc
+//               pixel column is right_x − a.dx − a.cnt.
+//   y_base   — apex row of the arc edge.
+//   up=false — arc grows downward  (top corners): row = y_base + a.dy
+//   up=true  — arc grows upward (bottom corners): row = y_base − a.dy − a.h + 1
+[[gnu::noinline]]
+static void draw_r10_2corners(tsl::gfx::Renderer* r, int left_x, int right_x,
+                               int y_base, bool up, tsl::Color col) {
+    for (const auto& a : kOvlR10Arc) {
+        const int row = up ? (y_base - a.dy - a.h + 1) : (y_base + a.dy);
+        r->drawRect(left_x  + a.dx,         row, a.cnt, a.h, col);
+        r->drawRect(right_x - a.dx - a.cnt, row, a.cnt, a.h, col);
+    }
+}
+
+// Per-row outside-pixel widths for the R=20 bottom-corner clear pass.
+static constexpr uint8_t kOvlCornerR20Widths[20] = {
+    20, 14, 12, 10, 8, 7, 6, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1
+};
+
+// =============================================================================
+// clear_ovl_corners_448
+//
+// Zeroes the corner pixels that lie outside each rounded arc, making them
+// fully transparent so the compositor shows the game behind.
+// Operates directly on the block-linear framebuffer via the swizzle LUTs.
+//
+// Top corners:    R=10  — 31 pixels per corner, 62 writes total.
+// Bottom corners: R=20  — 106 pixels per corner via kOvlCornerR20Widths,
+//                         212 writes total.
+// Grand total: 274 scalar 16-bit stores — ~275 ns on Cortex-A57.
+//
+// Must be called AFTER fillScreen / wallpaper so those writes don't undo it.
+// render_ovl_free_border() draws arc border pixels on top immediately after.
+// =============================================================================
+[[gnu::noinline]]
+static void clear_ovl_corners_448(uint16_t* const fb, int fb_top, int fb_bot) {
+    init_wallpaper_swizzle_tables();
+    static constexpr int fbW = static_cast<int>(kWP_W);  // 448
+    // Top corners: R=10 — two-level loop hoists yp_t (row address) to outer dy pass,
+    // saving 21 redundant s_wp_yParts lookups vs a flat 31-entry iteration.
+    for (int dy = 0; dy < 10; ++dy) {
+        const u32 yp_t = s_wp_yParts[static_cast<u32>(fb_top + dy)];
+        for (int dx = 0; dx < kCornerCnts[dy]; ++dx) {
+            const int rx = fbW - 1 - dx;
+            const u32 xp_l = s_wp_xGroupParts[dx >> 3] + static_cast<u32>(dx & 7);
+            const u32 xp_r = s_wp_xGroupParts[rx >> 3] + static_cast<u32>(rx & 7);
+            fb[yp_t + xp_l] = 0u;
+            fb[yp_t + xp_r] = 0u;
+        }
+    }
+    // Bottom corners: R=20
+    for (int dy = 0; dy < 20; ++dy) {
+        const int w  = static_cast<int>(kOvlCornerR20Widths[dy]);
+        const u32 yp = s_wp_yParts[static_cast<u32>(fb_bot - 1 - dy)];
+        for (int dx = 0; dx < w; ++dx) {
+            const int rx = fbW - 1 - dx;
+            const u32 xp_l = s_wp_xGroupParts[dx >> 3] + static_cast<u32>(dx & 7);
+            const u32 xp_r = s_wp_xGroupParts[rx >> 3] + static_cast<u32>(rx & 7);
+            fb[yp + xp_l] = 0u;
+            fb[yp + xp_r] = 0u;
+        }
+    }
+}
+
+// =============================================================================
+// render_ovl_free_border
+//
+// Rounded-corner 1-pixel border for the free-overlay content region.
+// Top corners R=10, bottom corners R=20 (2× radius).
+// Arc geometry is driven by kOvlR10Arc / kOvlR20Arc tables (7 and 13 rects
+// per corner) — loop-driven so the call sites compile to table+loop rather
+// than 44 separate drawRect call sites.
+//
+// Straight edges: top/bottom shortened by their respective radii; left/right
+// by R_T at the top end and R_B at the bottom end → height = cnt − 30.
+// =============================================================================
+[[gnu::noinline]]
+static void render_ovl_free_border(tsl::gfx::Renderer* renderer,
+                                    int fb_top, int fb_bot, tsl::Color col) {
+    static constexpr int R_T = 10, R_B = 20;
+    const int fbw = static_cast<int>(tsl::cfg::FramebufferWidth);
+    const int cnt = fb_bot - fb_top;
+
+    renderer->drawRect(R_T,     fb_top,       fbw - 2*R_T,      1,            col);
+    renderer->drawRect(R_B,     fb_bot - 1,   fbw - 2*R_B,      1,            col);
+    renderer->drawRect(0,       fb_top + R_T, 1,                 cnt-R_T-R_B, col);
+    renderer->drawRect(fbw - 1, fb_top + R_T, 1,                 cnt-R_T-R_B, col);
+
+    draw_r10_2corners(renderer, 0, fbw, fb_top, false, col); // top-left + top-right
+    for (const auto& a : kOvlR20Arc) {          // bottom-left + bottom-right arcs
+        const int y = fb_bot - 1 - a.dy;
+        renderer->drawRect(a.dx,           y, a.cnt, a.h, col);
+        renderer->drawRect(fbw-a.dx-a.cnt, y, a.cnt, a.h, col);
+    }
+}
+
+// =============================================================================
+// draw_wallpaper_direct
+//
+// Drop-in replacement for renderer->drawWallpaper() with the same guards and
+// identical visual output, optimised for this project's fixed call contract:
+//   • always 448×720 full-screen (correctFrameSize guaranteed)
+//   • always opacity 1.0 (Renderer::s_opacity == 1.0 in normal operation)
+//   • always preserveAlpha == true
+//   • always called immediately after fillScreen (no scissoring active)
+//
+// Improvements over the generic processBMPChunk path:
+//
+//  1. Static precomputed offset tables (yParts[720] + xGroupParts[56]).
+//     processBMPChunk heap-allocates std::vector<u32>(chunkHeight) per thread
+//     per call.  Here those values are computed once (≈ 3 KB static) and
+//     reused every frame.
+//
+//  2. NEON 8-pixel contiguous stores.
+//     The block-linear swizzle maps each run of 8 consecutive pixels to 8
+//     consecutive framebuffer slots (offsets +0..+7).  The generic path NEON-
+//     extracts 16 channels then scalar-scatters them individually back out.
+//     Here vld2_u8 loads 8 pixels, all channel work stays in NEON, and a
+//     single vst2_u8 (16 bytes) writes the whole group.
+//
+//  3. Background color read once, not per pixel.
+//     fillScreen writes one constant Color to every slot, so dst.a (preserved
+//     by preserveAlpha==true) is the same everywhere.  Read framebuffer[0]
+//     once and broadcast into NEON lanes.
+//
+//  4. No scissoring checks anywhere in the hot loop.
+//
+//  5. Optional opaque-region skip (overlay player mode).
+//     The GB screen renderer overwrites rows [skip_row_start, skip_row_end)
+//     columns [skip_grp_start*8, skip_grp_end*8) with fully-opaque pixels,
+//     making wallpaper work there invisible.  When those parameters are
+//     supplied the loop is split into three branch-free bands:
+//
+//       Top    (rows 0 .. skip_row_start-1)          all 56 groups
+//       Middle (rows skip_row_start .. skip_row_end-1) left + right strips
+//       Bottom (rows skip_row_end .. 719)             all 56 groups
+//
+//     In overlay mode this skips VP_W×VP_H = 400×360 = 144,000 pixels
+//     (44.6% of the frame) with zero per-pixel branching.
+//     VP_X=24 and VP_X+VP_W=424 are both exact multiples of 8, so the
+//     group boundaries fall cleanly at groups 3 and 53 — no partial groups.
+//
+//     Default parameter values (skip_row_start = skip_row_end = kH) produce
+//     a degenerate "no skip" schedule: only the top band runs (all rows),
+//     the middle and bottom bands have zero iterations.
+//
+// Byte-layout contract (verified against processBMPChunk):
+//   wallpaper:  byte0 = R<<4|G   byte1 = B<<4|A
+//   Color (LE): byte0 = G<<4|R   byte1 = A<<4|B
+//
+// Threading: identical to drawBitmapRGBA4444 — ult::numThreads threads,
+// each calling ult::inPlotBarrier.arrive_and_wait() before joining.
+
+[[gnu::noinline]]
+static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
+                                   u32 skip_row_start = kWP_H,
+                                   u32 skip_row_end   = kWP_H,
+                                   u32 skip_grp_start = 0u,
+                                   u32 skip_grp_end   = 0u,
+                                   u32 src_row_offset = 0u,
+                                   u32 fb_height      = kWP_H,
+                                   u32 fb_y_start     = 0u) {
+    // ── Same entry guards as Renderer::drawWallpaper() ──────────────────────
+    if (!ult::expandedMemory || ult::refreshWallpaper.load(std::memory_order_acquire)) return;
+
+    ult::inPlot.store(true, std::memory_order_release);
+
+    if (!ult::wallpaperData.empty() &&
+        !ult::refreshWallpaper.load(std::memory_order_acquire) &&
+        // correctFrameSize is false for the 448×613 free-overlay framebuffer;
+        // bypass the check when src_row_offset > 0 (free-overlay call site).
+        (ult::correctFrameSize || src_row_offset > 0u))
+    {
+        // ── Use pre-computed file-scope swizzle tables ────────────────────────
+        // s_wp_yParts / s_wp_xGroupParts / s_wp_tables_ready are now at file
+        // scope and shared with clear_fb_rows_transparent_448.  Both functions
+        // are always used together in the same TU, so the one-time init cost is
+        // shared regardless of which is called first.
+        init_wallpaper_swizzle_tables();
+
+        // ── Background color — read once from framebuffer[0] ─────────────────
+        // fillScreen wrote a(defaultBackgroundColor) uniformly to every pixel;
+        // the first slot is representative.  r/g/b feed the blend formula;
+        // a is written back unchanged (preserveAlpha == true).
+        tsl::Color* const framebuffer =
+            static_cast<tsl::Color*>(renderer->getCurrentFramebuffer());
+
+        const u8 bg_r = framebuffer[0].r;
+        const u8 bg_g = framebuffer[0].g;
+        const u8 bg_b = framebuffer[0].b;
+        const u8 bg_a = framebuffer[0].a;
+
+        // globalAlphaLimit mirrors the drawBitmapRGBA4444 parameter.
+        const u8 globalAlphaLimit =
+            static_cast<u8>(0xF * tsl::gfx::Renderer::s_opacity);
+
+        const u8* const src_base = ult::wallpaperData.data();
+
+        const u32 numThreads = ult::numThreads;
+
+        // ── Work-weighted thread chunk distribution ───────────────────────────
+        // Equal-row splitting produces severe imbalance when a skip region is
+        // active: with skip_row_start=108 / skip_row_end=468 / 4 threads,
+        // Thread 1 gets 1,080 groups (all middle) while Thread 3 gets 10,080
+        // (all bottom) — a 9:1 ratio. Thread 3 is the wall-clock bottleneck.
+        //
+        // Instead, distribute rows by work units:
+        //   full row   = kWP_GW groups (56)
+        //   middle row = skip_grp_start + (kWP_GW - skip_grp_end) groups (= 6)
+        //
+        // This balances all four threads to ~5,580 groups each, giving ~1.8×
+        // speedup over the equal-row approach for the overlay case.
+        //
+        // For the no-skip default (skip_row_start == skip_row_end == kWP_H), every
+        // row weighs kWP_GW and the split degenerates to equal rows — identical
+        // behaviour to the old chunkSize formula. No regression.
+        const u32 mid_row_work = skip_grp_start + (kWP_GW - skip_grp_end);
+        // Compute work only for rows [fb_y_start, fb_height) — rows before
+        // fb_y_start are transparent padding that will be zeroed separately,
+        // so blending wallpaper into them is wasted work.
+        const u32 eff_top_end  = (skip_row_start > fb_y_start) ? std::min(skip_row_start, fb_height) : fb_y_start;
+        const u32 eff_mid_end  = std::min(skip_row_end, fb_height);
+        const u32 eff_bot_rows = (fb_height > eff_mid_end) ? (fb_height - eff_mid_end) : 0u;
+        // Named per-band work totals — used both for total_work and for the
+        // analytical thread-boundary formula below.
+        const u32 top_band_work = (eff_top_end > fb_y_start)
+            ? (eff_top_end - fb_y_start) * kWP_GW : 0u;
+        const u32 mid_band_work = (eff_mid_end > skip_row_start)
+            ? (eff_mid_end - skip_row_start) * mid_row_work : 0u;
+        const u32 total_work    = top_band_work + mid_band_work + eff_bot_rows * kWP_GW;
+        const u32 target        = (total_work + numThreads - 1u) / numThreads;
+
+        // thread_starts[t] / thread_starts[t+1] are the row range for thread t.
+        // Stack array — numThreads is always small (≤ 4 on Switch).
+        u32 thread_starts[9] = {};  // [0..numThreads], max 8 threads + sentinel
+        thread_starts[0] = fb_y_start;
+        {
+            // Analytical O(numThreads) boundary computation.
+            //
+            // The three-band work model is piecewise-linear in row number:
+            //   top band [fb_y_start, skip_row_start): W(y) = (y − fb_y_start) × kWP_GW
+            //   mid band [skip_row_start, eff_mid_end): W += mid_row_work per row
+            //   bot band [eff_mid_end, fb_height):     W += kWP_GW per row
+            //
+            // Solving W(y) = ti × target in closed form eliminates the O(fb_height)
+            // row-scan loop — replaced by at most 3 integer divisions per boundary.
+            // Verified against the equivalent scan loop for all Switch use-cases:
+            //   fixed overlay: fb_y_start=0,  skip 108–468, 720 rows → saves 720 iters
+            //   free  overlay: fb_y_start=84, skip 108–468, 720 rows → saves 636 iters
+            for (u32 ti = 1u; ti < numThreads; ++ti) {
+                const u32 W = ti * target;
+                u32 row;
+                if (W <= top_band_work) {
+                    // Boundary is in the top (full-row) band.
+                    // (y − fb_y_start + 1) × kWP_GW ≥ W  →  y = fb_y_start + ⌈W / kWP_GW⌉ − 1
+                    // thread_starts = y + 1 = fb_y_start + ⌈W / kWP_GW⌉
+                    row = fb_y_start + (W + kWP_GW - 1u) / kWP_GW;
+                } else if (mid_band_work > 0u && W <= top_band_work + mid_band_work) {
+                    // Boundary is in the mid (skip-stripped) band.
+                    const u32 rem = W - top_band_work;
+                    row = skip_row_start + (rem + mid_row_work - 1u) / mid_row_work;
+                } else {
+                    // Boundary is in the bot (full-row) band.
+                    const u32 rem = W - top_band_work - mid_band_work;
+                    row = eff_mid_end + (rem + kWP_GW - 1u) / kWP_GW;
+                }
+                thread_starts[ti] = std::min(row, fb_height);
+            }
+            thread_starts[numThreads] = fb_height;
+        }
+
+        for (u32 t = 0u; t < numThreads; ++t) {
+            const u32 rowStart = thread_starts[t];
+            const u32 rowEnd   = thread_starts[t + 1u];
+
+            ult::renderThreads[t] = std::thread([=]() {
+                // ── NEON constants — hoisted above all loops ──────────────────
+                // Shared by both kernels; compiler dead-code-eliminates the
+                // unused ones inside each run_bands instantiation.
+                //
+                // Byte-layout cross-format swap (verified against processBMPChunk):
+                //   wallpaper: byte0 = R<<4|G   byte1 = B<<4|A
+                //   Color(LE): byte0 = G<<4|R   byte1 = A<<4|B
+                const uint8x8_t  v_mask4     = vdup_n_u8(0x0Fu);
+                const uint8x8_t  v_alpha_lim = vdup_n_u8(globalAlphaLimit);
+                const uint8x8_t  v_bg_a4     = vdup_n_u8(static_cast<u8>(bg_a << 4));
+                // Full-kernel only (dead in fast path):
+                const uint8x8_t  v15         = vdup_n_u8(15u);
+                const uint16x8_t v_bg_r16    = vdupq_n_u16(bg_r);
+                const uint16x8_t v_bg_g16    = vdupq_n_u16(bg_g);
+                const uint16x8_t v_bg_b16    = vdupq_n_u16(bg_b);
+
+                // ── Dark-background fast kernel ───────────────────────────────
+                // When bg_r == bg_g == bg_b == 0, the bg_ch * inv_a term is
+                // always zero for every channel.  The blend formula:
+                //   out_ch = (bg_ch * (15-a) + src_ch * a) >> 4
+                // reduces to:
+                //   out_ch = (src_ch * a) >> 4
+                // dropping vsub, vmovl, 3×vmulq_u16, 3×vaddq_u16 — 8 fewer ops
+                // per group (33%).  vmin_u8 is kept for non-1.0 opacity support.
+                const auto do_group_fast = [&](const u32 yPart, const u8* rs, const u32 g) {
+                    const uint8x8x2_t raw = vld2_u8(rs + (g << 4u));
+
+                    const uint8x8_t src_r = vshr_n_u8(raw.val[0], 4);
+                    const uint8x8_t src_g = vand_u8(raw.val[0], v_mask4);
+                    const uint8x8_t src_b = vshr_n_u8(raw.val[1], 4);
+                    const uint8x8_t src_a = vmin_u8(vand_u8(raw.val[1], v_mask4), v_alpha_lim);
+
+                    const uint8x8_t out_r = vshrn_n_u16(vmull_u8(src_r, src_a), 4);
+                    const uint8x8_t out_g = vshrn_n_u16(vmull_u8(src_g, src_a), 4);
+                    const uint8x8_t out_b = vshrn_n_u16(vmull_u8(src_b, src_a), 4);
+
+                    const uint8x8_t byte0_out = vorr_u8(vshl_n_u8(out_g, 4), out_r);
+                    const uint8x8_t byte1_out = vorr_u8(v_bg_a4, out_b);
+                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_wp_xGroupParts[g]),
+                            uint8x8x2_t{{byte0_out, byte1_out}});
+                };
+
+                // ── General kernel ────────────────────────────────────────────
+                // Full blend for non-black backgrounds.
+                // Blend: out_ch = (bg_ch * (15-a) + src_ch * a) >> 4
+                //   = blendColor(bg_ch, src_ch, a) — matches scalar path exactly.
+                //   u16 intermediates prevent overflow (max = 15*15 + 15*15 = 450).
+                const auto do_group_full = [&](const u32 yPart, const u8* rs, const u32 g) {
+                    const uint8x8x2_t raw = vld2_u8(rs + (g << 4u));
+
+                    const uint8x8_t src_r = vshr_n_u8(raw.val[0], 4);
+                    const uint8x8_t src_g = vand_u8(raw.val[0], v_mask4);
+                    const uint8x8_t src_b = vshr_n_u8(raw.val[1], 4);
+                    const uint8x8_t src_a = vmin_u8(vand_u8(raw.val[1], v_mask4), v_alpha_lim);
+
+                    const uint8x8_t  inv_a = vsub_u8(v15, src_a);
+                    const uint16x8_t ia16  = vmovl_u8(inv_a);
+
+                    const uint8x8_t out_r = vshrn_n_u16(
+                        vaddq_u16(vmulq_u16(ia16, v_bg_r16), vmull_u8(src_r, src_a)), 4);
+                    const uint8x8_t out_g = vshrn_n_u16(
+                        vaddq_u16(vmulq_u16(ia16, v_bg_g16), vmull_u8(src_g, src_a)), 4);
+                    const uint8x8_t out_b = vshrn_n_u16(
+                        vaddq_u16(vmulq_u16(ia16, v_bg_b16), vmull_u8(src_b, src_a)), 4);
+
+                    const uint8x8_t byte0_out = vorr_u8(vshl_n_u8(out_g, 4), out_r);
+                    const uint8x8_t byte1_out = vorr_u8(v_bg_a4, out_b);
+                    vst2_u8(reinterpret_cast<u8*>(framebuffer + yPart + s_wp_xGroupParts[g]),
+                            uint8x8x2_t{{byte0_out, byte1_out}});
+                };
+
+                // ── Three-band scheduler (generic over kernel) ────────────────
+                // 'auto&&' creates a distinct template instantiation per kernel,
+                // so the compiler generates two fully-specialised code paths with
+                // no dead NEON ops and no inner-loop branching.
+                //
+                // Band schedule (each range clamped to this thread's chunk):
+                //   Top    (rows < skip_row_start):           all kGW groups
+                //   Middle (skip_row_start ≤ row < skip_row_end): left + right strips
+                //   Bottom (rows ≥ skip_row_end):             all kGW groups
+                //
+                // Default (skip_row_start == skip_row_end == kH): middle and bottom
+                // bands have zero iterations — only top runs, identical to the
+                // original single-band loop.
+                const auto run_bands = [&](auto&& do_group) {
+                    const u32 top_end   = std::min(rowEnd, skip_row_start);
+                    for (u32 y = rowStart; y < top_end; ++y) {
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
+                    }
+
+                    const u32 mid_start = std::max(rowStart, skip_row_start);
+                    const u32 mid_end   = std::min(rowEnd,   skip_row_end);
+                    for (u32 y = mid_start; y < mid_end; ++y) {
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        for (u32 g = 0u;           g < skip_grp_start; ++g) do_group(yPart, rs, g);
+                        for (u32 g = skip_grp_end; g < kWP_GW;         ++g) do_group(yPart, rs, g);
+                    }
+
+                    const u32 bot_start = std::max(rowStart, skip_row_end);
+                    for (u32 y = bot_start; y < rowEnd; ++y) {
+                        const u32       yPart = s_wp_yParts[y];
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
+                    }
+
+                    ult::inPlotBarrier.arrive_and_wait();
+                };
+
+                // Dispatch once at thread-start — zero inner-loop overhead.
+                if (bg_r == 0u && bg_g == 0u && bg_b == 0u)
+                    run_bands(do_group_fast);
+                else
+                    run_bands(do_group_full);
+            });
+        }
+
+        for (auto& th : ult::renderThreads) th.join();
+    }
+
+    ult::inPlot.store(false, std::memory_order_release);
 }

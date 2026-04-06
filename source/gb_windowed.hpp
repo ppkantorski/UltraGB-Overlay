@@ -1382,7 +1382,6 @@ public:
 //
 //        ult::createDirectory(CONFIG_DIR);
 //        ult::createDirectory(SAVE_BASE_DIR);
-//        //ult::createDirectory(INTERNAL_SAVE_BASE_DIR);
 //        ult::createDirectory(STATE_BASE_DIR);
 //        ult::createDirectory(STATE_DIR);
 //        ult::createDirectory(CONFIGURE_DIR);

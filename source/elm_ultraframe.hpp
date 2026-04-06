@@ -39,21 +39,12 @@
 
 #include <tesla.hpp>
 #include <string>
+#include "gb_renderer.h"   // draw_wallpaper_direct + all rendering primitives
 
 // draw_ultragb_title is defined in main.cpp (static, visible here because
 // this header is included after the definition).
 // Forward-declare the signature so the compiler is happy if included earlier.
 static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
-
-// draw_wallpaper_direct is defined in gb_utils.hpp, which is included after
-// this header in main.cpp.  Forward-declare for the same reason.
-// Default arguments are specified here (on the declaration) per C++ rules —
-// the definition in gb_utils.hpp must NOT repeat them.
-static void draw_wallpaper_direct(tsl::gfx::Renderer*,
-                                   u32 = 720u, u32 = 720u,
-                                   u32 = 0u,   u32 = 0u,
-                                   u32 = 0u,   u32 = 720u,
-                                   u32 = 0u);
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
