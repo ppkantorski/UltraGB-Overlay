@@ -339,6 +339,17 @@ static int  g_focus_flash     = 0;
 static bool g_focus_flash_red = false;
 
 // =============================================================================
+// Shared drag/reposition constants
+// Used by both GBOverlayGui and GBWindowedGui for touch hold-to-drag and
+// joystick reposition.  Defined once here so the two classes stay in sync.
+// =============================================================================
+static constexpr int      kHoldFrames   = 60;               // frames before drag activates (~1 s at 60 fps)
+static constexpr uint64_t kPlusHoldNs   = 1'000'000'000ULL; // ns KEY_PLUS must be held alone before joystick drag
+static constexpr int      kJoyDeadzone  = 20;               // HID stick dead-zone (range –32767..32767)
+static constexpr float    kJoyBaseSens  = 0.00008f;         // x^8 curve minimum sensitivity
+static constexpr float    kJoyMaxSens   = 0.0005f;          // x^8 curve maximum sensitivity
+
+// =============================================================================
 // Debounced dock-state cache
 //
 // ult::consoleIsDocked() is a system service call — calling it every display

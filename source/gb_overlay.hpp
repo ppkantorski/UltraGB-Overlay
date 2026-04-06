@@ -400,25 +400,10 @@ public:
             ? g_ovl_free_pos_y + OVL_FREE_CONTENT_H
             : static_cast<int>(tsl::cfg::FramebufferHeight);
 
-        // Capture before decrement — used below to decide whether to re-zero
-        // corners and whether the flash was active this frame.
-        const bool flash_was_active = (g_focus_flash > 0);
-
-        if (flash_was_active) {
-            const u8 al = g_focus_flash > 15
-                ? static_cast<u8>(0xF)
-                : static_cast<u8>(g_focus_flash * 0xF / 15);
-            const tsl::Color fc = g_focus_flash_red
-                ? tsl::Color{0xF, 0x0, 0x0, al}
-                : tsl::Color{0x0, 0xF, 0x0, al};
-            static constexpr int B = 4;
-            const int fbH = fb_bot - fb_top;
-            renderer->drawRect(0,        fb_top,         FB_W, B,           fc);
-            renderer->drawRect(0,        fb_bot - B,     FB_W, B,           fc);
-            renderer->drawRect(0,        fb_top + B,     B,    fbH - B * 2, fc);
-            renderer->drawRect(FB_W - B, fb_top + B,     B,    fbH - B * 2, fc);
-            --g_focus_flash;
-        }
+        // draw_focus_flash returns true when the border was drawn this frame.
+        // Used below to decide whether to re-zero rounded corners.
+        const bool flash_was_active = draw_focus_flash(
+            renderer, 0, fb_top, static_cast<s32>(FB_W), fb_bot - fb_top);
 
         if (!g_overlay_free_mode) {
             if (!ult::useRightAlignment)
@@ -516,31 +501,16 @@ class GBOverlayGui : public tsl::Gui {
     uint64_t m_joy_last_ns        = 0;
 
     // 60 frames ≈ 1 s at ~60 fps.
-    static constexpr int      HOLD_FRAMES  = 60;
-    static constexpr uint64_t PLUS_HOLD_NS = 1'000'000'000ULL;  // 1 s
-    static constexpr int      JOY_DEADZONE = 20;
+    static constexpr int      HOLD_FRAMES  = kHoldFrames;
+    static constexpr uint64_t PLUS_HOLD_NS = kPlusHoldNs;
+    static constexpr int      JOY_DEADZONE = kJoyDeadzone;
 
-    // Poll raw HID touch — bypasses Tesla's per-frame coordinate clamping.
-    // Identical to GBWindowedGui::poll_touch.
-    static bool poll_touch(int& out_x, int& out_y) {
-        HidTouchScreenState ts = {};
-        hidGetTouchScreenStates(&ts, 1);
-        if (ts.count > 0) {
-            out_x = static_cast<int>(ts.touches[0].x);
-            out_y = static_cast<int>(ts.touches[0].y);
-            return true;
-        }
-        out_x = out_y = 0;
-        return false;
-    }
-
-    // VI bounds helpers — derived from the layer size Tesla set.
-    // Mirrors GBWindowedGui::vi_max_x/y exactly.
+    // VI bounds — derived from the layer size Tesla set.
     static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
-    static int vi_max_y() { return 1080 - static_cast<int>(tsl::cfg::LayerHeight); }
+    // vi_max_y() intentionally omitted: overlay Y repositioning is bounded by
+    // OVL_FREE_TOP_TRIM, not by LayerHeight.  vi_max_y() was never called.
 
-    // Layer footprint in HID touch space (0-1279 × 0-719).
-    // touch = VI × 2/3.  Identical to GBWindowedGui::touch_win_w/h.
+    // Layer footprint in HID touch space. W shared with windowed; H has no pixel-perfect branch here.
     static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
     static int touch_win_h() { return static_cast<int>(tsl::cfg::LayerHeight) * 2 / 3; }
 
@@ -855,14 +825,7 @@ public:
                             const float fy = static_cast<float>(leftJoy.y);
 
                             // x^8 sensitivity curve — same as windowed mode.
-                            const float mag2   = fx*fx + fy*fy;
-                            const float norm   = mag2 / (32767.f * 32767.f);
-                            const float curve2 = norm  * norm;
-                            const float curve4 = curve2 * curve2;
-                            const float curve8 = curve4 * curve4;
-                            static constexpr float BASE_SENS = 0.00008f;
-                            static constexpr float MAX_SENS  = 0.0005f;
-                            const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve8;
+                            const float sens = joy_sens(fx, fy);
 
                             const uint64_t now_ns = ult::nowNs();
                             if (m_joy_last_ns == 0) m_joy_last_ns = now_ns;

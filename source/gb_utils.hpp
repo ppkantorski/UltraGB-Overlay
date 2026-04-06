@@ -275,6 +275,81 @@ static bool poll_console_docked() {
 }
 
 // =============================================================================
+// poll_touch
+//
+// Direct HID touch poll shared by GBOverlayGui and GBWindowedGui.
+// Bypasses Tesla's per-frame coordinate clamping, which corrupts tracking when
+// touch.x exceeds cfg::FramebufferWidth (common in windowed / free-overlay mode).
+// Returns true if at least one finger is down; writes the position to out_x/out_y.
+// noinline: single copy in .text instead of one inlined copy per call site.
+// =============================================================================
+[[gnu::noinline]]
+static bool poll_touch(int& out_x, int& out_y) {
+    HidTouchScreenState ts = {};
+    hidGetTouchScreenStates(&ts, 1);
+    if (ts.count > 0) {
+        out_x = static_cast<int>(ts.touches[0].x);
+        out_y = static_cast<int>(ts.touches[0].y);
+        return true;
+    }
+    out_x = out_y = 0;
+    return false;
+}
+
+// =============================================================================
+// joy_sens
+//
+// x^8 joystick sensitivity curve shared by the joystick-reposition logic in
+// GBOverlayGui and GBWindowedGui.  Fine at low deflection, accelerates sharply
+// near full throw.  Return value is multiplied by a dt_factor at the call site.
+// noinline: single copy in .text instead of one inlined copy per call site.
+// =============================================================================
+[[gnu::noinline]]
+static float joy_sens(float fx, float fy) {
+    const float norm   = (fx*fx + fy*fy) / (32767.f * 32767.f);
+    const float curve2 = norm   * norm;
+    const float curve4 = curve2 * curve2;
+    const float curve8 = curve4 * curve4;
+    return kJoyBaseSens + (kJoyMaxSens - kJoyBaseSens) * curve8;
+}
+
+// =============================================================================
+// draw_focus_flash
+//
+// Draws the ZL pass-through focus-flash border that appears in both
+// GBOverlayElement and GBWindowedElement.  Shared logic: same 4-px border
+// width, same alpha-fade formula, same color choice, same decrement.
+//
+// Parameters are the content region the border should surround:
+//   x0, y0 — top-left corner (framebuffer pixels)
+//   w, h   — width and height of the region
+//
+// Returns true if the flash was active this frame (the overlay uses this to
+// decide whether to re-zero rounded corners after drawing the border).
+//
+// noinline: with two call sites in separate virtual functions the compiler
+// would otherwise inline the body twice — one copy per element class.
+// =============================================================================
+[[gnu::noinline]]
+static bool draw_focus_flash(tsl::gfx::Renderer* renderer,
+                              s32 x0, s32 y0, s32 w, s32 h) {
+    if (g_focus_flash <= 0) return false;
+    const u8 al = g_focus_flash > 15
+        ? static_cast<u8>(0xF)
+        : static_cast<u8>(g_focus_flash * 0xF / 15);
+    const tsl::Color fc = g_focus_flash_red
+        ? tsl::Color{0xF, 0x0, 0x0, al}
+        : tsl::Color{0x0, 0xF, 0x0, al};
+    static constexpr int B = 4;
+    renderer->drawRect(x0,         y0,          w, B,        fc);
+    renderer->drawRect(x0,         y0 + h - B,  w, B,        fc);
+    renderer->drawRect(x0,         y0 + B,      B, h - B*2,  fc);
+    renderer->drawRect(x0 + w - B, y0 + B,      B, h - B*2,  fc);
+    --g_focus_flash;
+    return true;
+}
+
+// =============================================================================
 // Config persist helpers
 //
 // One-liner wrappers around setIniFileValue.  Moved from main.cpp so any GUI
@@ -1495,4 +1570,41 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
     }
 
     ult::inPlot.store(false, std::memory_order_release);
+}
+// =============================================================================
+// close_overlay_direct_mode
+//
+// KEY_B close handler shared by SettingsGui and RomSelectorGui.
+//
+// Both GUIs do the same thing on B: clear the saved settings-scroll position,
+// optionally fire the envSetNextLoad dance to return to Ultrahand when running
+// under --direct --comboReturn, then close the overlay.
+//
+// Without ICF (--icf is not in the Makefile), these virtual handleInput bodies
+// stay as two separate copies in the binary.  Extracting here with noinline
+// gives one canonical copy that both call sites jump to.
+// =============================================================================
+[[gnu::noinline]]
+static void close_overlay_direct_mode() {
+    g_settings_scroll[0] = '\0';
+    if (g_directMode && g_comboReturn) {
+        ult::launchingOverlay.store(true, std::memory_order_release);
+        ult::setIniFileValue(
+            ult::ULTRAHAND_CONFIG_INI_PATH,
+            ult::ULTRAHAND_PROJECT_NAME,
+            ult::IN_OVERLAY_STR,
+            ult::TRUE_STR
+        );
+        disableSound.store(true, std::memory_order_release);
+        skipRumbleDoubleClick = true;
+
+        const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
+        const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||
+                                ult::lastTitleID != ult::getTitleIdAsString();
+        std::string argvStr = selfFilename + " --skipCombo"
+                            + " --foregroundFix " + (needsFgFix ? '1' : '0')
+                            + " --lastTitleID " + ult::lastTitleID;
+        envSetNextLoad(returnOverlayPath.c_str(), argvStr.c_str());
+    }
+    tsl::Overlay::get()->close();
 }

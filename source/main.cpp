@@ -1643,40 +1643,7 @@ public:
         // B — close the overlay entirely.  Clear the saved scroll so a future
         // cold open of Settings starts at the top rather than mid-list.
         if (keysDown & KEY_B) {
-            g_settings_scroll[0] = '\0';
-            if (g_directMode && g_comboReturn) {
-                //directMode = false;
-                ult::launchingOverlay.store(true, std::memory_order_release);
-                ult::setIniFileValue(
-                    ult::ULTRAHAND_CONFIG_INI_PATH,
-                    ult::ULTRAHAND_PROJECT_NAME,
-                    ult::IN_OVERLAY_STR,
-                    ult::TRUE_STR
-                );
-                disableSound.store(true, std::memory_order_release);
-                skipRumbleDoubleClick = true;
-            
-                // setNextOverlay always puts getNameFromPath(returnOverlayPath) = "ovlmenu.ovl"
-                // as argv[0], so Ultrahand always sees lastOverlayFilename = "ovlmenu.ovl",
-                // which never matches any overlay in the list — scroll restore silently fails.
-                //
-                // The ovlloader, by contrast, passes argv[0] = "ultragb.ovl" when an overlay
-                // exits naturally, which is why the no-setNextOverlay path scrolls correctly.
-                //
-                // Solution: call envSetNextLoad directly, putting the self filename as argv[0],
-                // exactly replicating what the ovlloader does on a natural exit.
-                const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
-            
-                // Replicate the extra args setNextOverlay appends automatically.
-                const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||
-                                        ult::lastTitleID != ult::getTitleIdAsString();
-                std::string argvStr = selfFilename + " --skipCombo"
-                                    + " --foregroundFix " + (needsFgFix ? '1' : '0')
-                                    + " --lastTitleID " + ult::lastTitleID;
-            
-                envSetNextLoad(returnOverlayPath.c_str(), argvStr.c_str());
-            }
-            tsl::Overlay::get()->close();
+            close_overlay_direct_mode();
             return true;
         }
 
@@ -2024,40 +1991,7 @@ public:
 
         // B — close the overlay (full exit: clear saved settings scroll position)
         if (keysDown & KEY_B) {
-            g_settings_scroll[0] = '\0';
-            if (g_directMode && g_comboReturn) {
-                //directMode = false;
-                ult::launchingOverlay.store(true, std::memory_order_release);
-                ult::setIniFileValue(
-                    ult::ULTRAHAND_CONFIG_INI_PATH,
-                    ult::ULTRAHAND_PROJECT_NAME,
-                    ult::IN_OVERLAY_STR,
-                    ult::TRUE_STR
-                );
-                disableSound.store(true, std::memory_order_release);
-                skipRumbleDoubleClick = true;
-            
-                // setNextOverlay always puts getNameFromPath(returnOverlayPath) = "ovlmenu.ovl"
-                // as argv[0], so Ultrahand always sees lastOverlayFilename = "ovlmenu.ovl",
-                // which never matches any overlay in the list — scroll restore silently fails.
-                //
-                // The ovlloader, by contrast, passes argv[0] = "ultragb.ovl" when an overlay
-                // exits naturally, which is why the no-setNextOverlay path scrolls correctly.
-                //
-                // Solution: call envSetNextLoad directly, putting the self filename as argv[0],
-                // exactly replicating what the ovlloader does on a natural exit.
-                const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
-            
-                // Replicate the extra args setNextOverlay appends automatically.
-                const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||
-                                        ult::lastTitleID != ult::getTitleIdAsString();
-                std::string argvStr = selfFilename + " --skipCombo"
-                                    + " --foregroundFix " + (needsFgFix ? '1' : '0')
-                                    + " --lastTitleID " + ult::lastTitleID;
-            
-                envSetNextLoad(returnOverlayPath.c_str(), argvStr.c_str());
-            }
-            tsl::Overlay::get()->close();
+            close_overlay_direct_mode();
             return true;
         }
 

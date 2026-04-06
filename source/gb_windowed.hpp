@@ -682,17 +682,28 @@ public:
         const bool prpk    = g_fb_is_prepacked;
         const bool do_grid = g_lcd_grid && scale >= 2;
 
+        // Scale 1: LCD grid has no visible effect at 1× (do_grid is always false
+        // because do_grid = g_lcd_grid && scale >= 2).  Handle it directly here
+        // so the compiler never needs to instantiate launch_win_blit<true,1> /
+        // win_blit_rows<true,1> — those are dead code at scale 1.
+        // Automatically has no visible effect at windowed 1× scale.
+        if (scale == 1) {
+            launch_win_blit<false, 1>(fb, g_gb_fb, is565, prpk);
+            return;
+        }
+
         // Resolve SCALE at compile time so inner loops are fully unrolled.
         // LCD_GRID branches are compile-time eliminated in each instantiation.
+        // case 1 is gone — handled above, so the GRID=true lambda never
+        // references launch_win_blit<true,1>.
         const auto dispatch = [&]<bool GRID>() __attribute__((always_inline)) {
             switch (scale) {
-                case 1: launch_win_blit<GRID, 1>(fb, g_gb_fb, is565, prpk); break;
                 case 2: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
                 case 3: launch_win_blit<GRID, 3>(fb, g_gb_fb, is565, prpk); break;
                 case 4: launch_win_blit<GRID, 4>(fb, g_gb_fb, is565, prpk); break;
                 case 5: launch_win_blit<GRID, 5>(fb, g_gb_fb, is565, prpk); break;
                 case 6: launch_win_blit<GRID, 6>(fb, g_gb_fb, is565, prpk); break;
-                default: launch_win_blit<GRID, 1>(fb, g_gb_fb, is565, prpk); break;
+                default: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
             }
         };
         if (do_grid) dispatch.operator()<true>();
@@ -707,20 +718,7 @@ public:
         const s32 fw = static_cast<s32>(GB_W * g_win_scale);
         const s32 fh = static_cast<s32>(GB_H * g_win_scale);
 
-        if (g_focus_flash > 0) {
-            const u8  al = g_focus_flash > 15
-                ? static_cast<u8>(0xF)
-                : static_cast<u8>(g_focus_flash * 0xF / 15);
-            const tsl::Color fc = g_focus_flash_red
-                ? tsl::Color{0xF, 0x0, 0x0, al}
-                : tsl::Color{0x0, 0xF, 0x0, al};
-            static constexpr int B = 4;
-            renderer->drawRect(0,      y_ofs,              fw, B,           fc);
-            renderer->drawRect(0,      y_ofs + fh - B,     fw, B,           fc);
-            renderer->drawRect(0,      y_ofs + B,           B,  fh - B * 2,  fc);
-            renderer->drawRect(fw - B, y_ofs + B,           B,  fh - B * 2,  fc);
-            --g_focus_flash;
-        }
+        draw_focus_flash(renderer, 0, y_ofs, fw, fh);
 
         // ── Reposition overlay ────────────────────────────────────────────────
         // While dragging: dim the frozen frame and show "Paused" centred.
@@ -846,11 +844,11 @@ class GBWindowedGui : public tsl::Gui {
     uint64_t m_joy_last_ns        = 0;      // timestamp of previous joystick-active frame (for dt scaling)
 
     // 60 frames ≈ 1 second at the GB's 59.73 Hz render rate.
-    static constexpr int      HOLD_FRAMES      = 60;
+    static constexpr int      HOLD_FRAMES  = kHoldFrames;
     // KEY_PLUS must be held alone for this long before joystick drag activates.
-    static constexpr uint64_t PLUS_HOLD_NS     = 1'000'000'000ULL;  // 1 second — matches HOLD_FRAMES (~60 frames at 60 fps)
+    static constexpr uint64_t PLUS_HOLD_NS = kPlusHoldNs;
     // Joystick deadzone (HidAnalogStickState range: –32767..32767).
-    static constexpr int      JOY_DEADZONE     = 20;
+    static constexpr int      JOY_DEADZONE = kJoyDeadzone;
     // Mask of all physical buttons — used to confirm KEY_PLUS is held *alone*.
     
     bool     m_zr_first_seen  = false;
@@ -866,56 +864,16 @@ class GBWindowedGui : public tsl::Gui {
 
     bool m_load_failed = false;
 
-    // Poll the HID touch screen.  Returns true if at least one finger is down.
-    // We bypass the touchPos parameter from Tesla because Tesla clears its own
-    // internal oldTouchPos/initialTouchPos every frame when touchPos.x exceeds
-    // cfg::FramebufferWidth, corrupting its tracking.  The real state is
-    // always available directly from HID.
-    static bool poll_touch(int& out_x, int& out_y) {
-        HidTouchScreenState ts = {};
-        hidGetTouchScreenStates(&ts, 1);
-        if (ts.count > 0) {
-            out_x = static_cast<int>(ts.touches[0].x);
-            out_y = static_cast<int>(ts.touches[0].y);
-            return true;
-        }
-        out_x = 0;
-        out_y = 0;
-        return false;
-    }
-
-    // ── VI bounds helpers (scale-dependent) ───────────────────────────────────
-    // VI space is 1920×1080.  The layer must fit entirely on screen.
-    //
-    // Maximum safe VI-space position so the layer never crosses a screen edge.
-    //
-    // Derived from cfg::LayerWidth/Height (the actual dimensions Tesla set on
-    // the VI layer) rather than recomputing from scale + magic factors.  This
-    // is correct for both output modes and handles underscan automatically:
-    //
-    //   720p mode  – layer = FB * 1.5  [+ optional underscan correction]
-    //   1080p mode – layer = FB * 1.0  (pixel-perfect; no underscan needed)
-    //
-    // Using the live cfg values means a switch between modes simply re-clamps
-    // the saved position to the new valid range in createUI().
+    // VI bounds (scale-dependent) — derived from cfg::LayerWidth/Height.
     static int vi_max_x() { return 1920 - static_cast<int>(tsl::cfg::LayerWidth);  }
-    static int vi_max_y() { return 1080 - static_cast<int>(tsl::cfg::LayerHeight); }
+    // vi_max_y() intentionally omitted: windowed Y repositioning uses vi_max_y_content().
 
     // Window footprint in HID touch space (0–1279 × 0–719).
-    //
-    // HID touch is always delivered in 1280×720 regardless of output mode.
-    // The VI layer lives in 1920×1080 space, so the touch→VI ratio is always
-    // ×3/2.  The touch footprint of the layer is therefore LayerSize × 2/3.
-    //
-    //   720p mode  – LayerWidth = GB_W*scale*3/2  → touch_w = GB_W*scale
-    //   1080p mode – LayerWidth = GB_W*scale       → touch_w = GB_W*scale*2/3
-    //
-    // Using the live cfg value keeps hit-testing correct in both modes and
-    // automatically reflects any underscan correction applied to the layer.
+    // W body is identical to GBOverlayGui.
+    // H body differs (pixel-perfect branch) so it stays per-class.
     static int touch_win_w() { return static_cast<int>(tsl::cfg::LayerWidth)  * 2 / 3; }
-    // Game content height in HID touch space — not the full (anchored) layer height.
-    //   720p:  touch = GB_H*scale (FB height maps 1:1 to touch space)
-    //   1080p: touch = GB_H*scale * 2/3
+    // Game content height in HID touch space.
+    //   720p:  touch = GB_H*scale   1080p: touch = GB_H*scale * 2/3
     static int touch_win_h() {
         return ult::windowedLayerPixelPerfect
             ? (GB_H * g_win_scale * 2 / 3)
@@ -1334,18 +1292,8 @@ public:
                         const float fx = static_cast<float>(leftJoy.x);
                         const float fy = static_cast<float>(leftJoy.y);
                 
-                        // magnitude without sqrtf
-                        const float mag2 = fx*fx + fy*fy; // squared magnitude
-                        const float norm = mag2 / (32767.f*32767.f); // normalized squared
-                
-                        // x^8 curve without powf
-                        const float curve2 = norm * norm;      // ^2
-                        const float curve4 = curve2 * curve2;  // ^4
-                        const float curve8 = curve4 * curve4;  // ^8
-                
-                        static constexpr float BASE_SENS = 0.00008f;
-                        static constexpr float MAX_SENS  = 0.0005f;
-                        const float sens = BASE_SENS + (MAX_SENS - BASE_SENS) * curve8;
+                        // x^8 sensitivity curve — same as overlay mode.
+                        const float sens = joy_sens(fx, fy);
                 
                         // Delta-time scaling: sens values are tuned for 60 fps.
                         // Multiply by (actual_dt * 60) so the real-world velocity

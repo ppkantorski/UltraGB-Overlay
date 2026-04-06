@@ -130,11 +130,10 @@ public:
         m_iconTapCallback = std::move(cb);
     }
 
-    // -----------------------------------------------------------------------
     // setLabel — lets update() relabel the slider live when the running
     // title ID changes without rebuilding the whole settings list.
-    // -----------------------------------------------------------------------
-    void setLabel(const std::string& label) { m_label = label; }
+    // Takes by value so callers passing a temporary get a move, not a copy.
+    void setLabel(std::string label) { m_label = std::move(label); }
 
 private:
     std::function<void()> m_iconTapCallback;
