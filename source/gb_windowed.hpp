@@ -56,6 +56,11 @@
 
 #pragma once
 
+// Windowed pixel blit — per-frame, same hot path as GBOverlayElement::draw().
+// O3: critical for the scale×scale inner write loop and LUT address arithmetic.
+// Explicit so it is immune to include order.
+#pragma GCC optimize("O3")
+
 #include <cstring>
 #include <algorithm>
 

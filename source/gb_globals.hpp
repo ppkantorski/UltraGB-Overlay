@@ -29,6 +29,8 @@
 #include "gb_core.h"
 #include "gb_renderer.h"
 
+#pragma GCC optimize("O3")
+
 // =============================================================================
 // Paths / config
 // =============================================================================
@@ -231,6 +233,9 @@ static void set_settings_scroll(const char* label) {
 
 // Digit-safe unsigned integer parser (exceptions disabled on NX).
 // Returns true and writes out on success; false if s is empty or non-digit.
+// [[gnu::noinline]] — called ~13+ times across load_config and main();
+// LTO would otherwise inline all 13 copies (each ~20 instructions).
+[[gnu::noinline]]
 static bool parse_uint(const std::string& s, int& out) {
     if (s.empty()) return false;
     int v = 0;

@@ -24,6 +24,25 @@
 #pragma once
 
 #include <cstdint>
+
+// Forward-declare the audio callbacks before the optimize pragma so these
+// declarations carry no optimization attribute.  The definitions live in
+// gb_audio.h (compiled under its own O3 pragma); mismatched attributes on a
+// declaration that follows a definition trigger -Wattributes even when both
+// sides are "O3" because GCC treats them as distinct attribute objects.
+// Placing the declarations here — before any pragma GCC optimize — keeps them
+// attribute-free and silences the warning without changing codegen.
+extern "C" {
+    uint8_t audio_read(uint8_t addr);
+    void    audio_write(uint8_t addr, uint8_t val);
+}
+
+// GB CPU emulation — hottest code in the binary.
+// 70,224 T-cycles per frame through the Peanut-GB opcode decoder.
+// O3: full loop unrolling, aggressive inlining, NEON auto-vectorisation.
+// Explicit so correctness does not rely on include-chain pragma inheritance.
+#pragma GCC optimize("O3")
+
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -51,11 +70,6 @@
 // Safe dual-fetch flags (MBC/DMA/opcodes) are set to 1 directly in
 // walnut_cgb.h — they are unconditional #defines so #ifndef guards here
 // have no effect.  Edit walnut_cgb.h lines 62-64 to change them.
-
-extern "C" {
-    uint8_t audio_read(uint8_t addr);
-    void    audio_write(uint8_t addr, uint8_t val);
-}
 
 extern "C" {
 #include "walnut_cgb.h"

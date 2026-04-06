@@ -37,6 +37,10 @@
 
 #pragma once
 
+// UI frame element — cold path, never called during gameplay.
+// Os: string ops and footer layout math do not benefit from O3 unrolling.
+#pragma GCC optimize("O3")
+
 #include <tesla.hpp>
 #include <string>
 #include "gb_renderer.h"   // draw_wallpaper_direct + all rendering primitives

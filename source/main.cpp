@@ -35,6 +35,13 @@
 
 using namespace ult;
 
+// ── Optimization boundary ─────────────────────────────────────────────────────
+// Cold paths: config load/save, ROM load/unload, state/save-slot I/O.
+// These run at most once per ROM change — binary size matters, not speed.
+// Hot paths (gb_audio.h, gb_core.h, gb_renderer.h, gb_overlay.hpp,
+// gb_windowed.hpp) carry their own O3 pragmas and are unaffected.
+#pragma GCC optimize("O3")
+
 // =============================================================================
 // Paths, globals, and data-coupled helpers → gb_globals.hpp (via gb_utils.hpp)
 // Config persist helpers, per-game config, save/state/slot helpers, ROM
@@ -610,6 +617,12 @@ void gb_unload_rom() {
     maybe_reload_wallpaper();
 }
 
+// ── Optimization boundary ─────────────────────────────────────────────────────
+// Hot paths: gb_set_input and draw_ultragb_title are called every display
+// frame (59.73 fps).  O3 enables register pressure reduction and full
+// inlining of the joypad bit-mask chain and per-letter wave math.
+#pragma GCC optimize("O3")
+
 // =============================================================================
 // gb_set_input — KEY_* macros (old libnx style used by this libtesla fork)
 // GB joypad active-low: 0 = pressed
@@ -697,6 +710,12 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
 // helpers defined above.  Must come before class Overlay below.
 // =============================================================================
 #include "gb_overlay.hpp"
+
+// ── Optimization boundary ─────────────────────────────────────────────────────
+// Cold paths: all GUI classes below fire on menu open/navigation, never
+// during gameplay.  Os shrinks createUI(), handleInput(), and constructors
+// which account for the bulk of non-emulation .text in this file.
+#pragma GCC optimize("Os")
 
 class RomSelectorGui;       // forward declare
 class GameSettingsGui;      // forward declare
@@ -2115,7 +2134,17 @@ public:
 // The commented-out WindowedOverlay class at the bottom of gb_windowed.hpp
 // is kept for reference only — it is never dispatched.
 // =============================================================================
+// ── Optimization boundary ─────────────────────────────────────────────────────
+// gb_windowed.hpp carries its own O3 pragma — this boundary is here so the
+// pragma is visible in main.cpp's include list and cannot be missed in review.
+#pragma GCC optimize("O3")
 #include "gb_windowed.hpp"
+
+// ── Optimization boundary ─────────────────────────────────────────────────────
+// Cold paths: class Overlay (initServices, onShow, onHide, onRequestFocus —
+// all one-shot lifecycle calls), clamp_win_scale, setup_windowed_framebuffer,
+// and main() itself.  Os keeps these lean.
+#pragma GCC optimize("Os")
 
 // =============================================================================
 // Overlay — single unified overlay class for every launch path:
@@ -2206,7 +2235,7 @@ class Overlay : public tsl::Overlay {
 public:
     void initServices() override {
         tsl::overrideBackButton = true;
-        ult::COPY_BUFFER_SIZE   = 1024;
+        ult::COPY_BUFFER_SIZE   = 1024*2;
 
         // ── Common init (every session type) ─────────────────────────────────
         ult::createDirectory(CONFIG_DIR);

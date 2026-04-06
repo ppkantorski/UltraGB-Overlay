@@ -31,6 +31,13 @@
 #include "gb_globals.hpp"       // all global variables + gb_audio.h/gb_core.h/gb_renderer.h
 #include "elm_ultraframe.hpp"   // UltraGBOverlayFrame — needed by make_bare_frame
 
+// All helpers in this file are cold paths: save/load/config/ROM scanning/slot
+// management.  They fire at most once per user action, never during gameplay.
+// The hot emulation code (gb_audio.h, gb_core.h, gb_renderer.h) carries its
+// own O3 pragmas and is unaffected.  Os here prevents INI-parsing and
+// save-file I/O loops from being unrolled into bloated .text at O3.
+#pragma GCC optimize("O2")
+
 // =============================================================================
 // make_bare_frame
 //
@@ -421,6 +428,8 @@ static void save_ovl_free_pos() {
 
 // Shared fopen/fseek/ftell/fclose sequence — avoids duplicating the 4-line
 // block in both rom_is_playable() and rom_playability_message().
+// [[gnu::noinline]] — called from 8+ sites; one copy is always smaller.
+[[gnu::noinline]]
 static size_t get_rom_size(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -433,6 +442,8 @@ static size_t get_rom_size(const char* path) {
 // Returns true when the ROM at |path| can be loaded on the current memory tier.
 // Mirrors the rejection conditions in gb_load_rom() so the selector can dim
 // unplayable entries before the user tries to launch them.
+// [[gnu::noinline]] — called per-ROM in RomSelectorGui list + other UI sites.
+[[gnu::noinline]]
 static bool rom_is_playable(const char* path) {
     const size_t sz = get_rom_size(path);
     if (!sz) return false;
@@ -444,6 +455,8 @@ static bool rom_is_playable(const char* path) {
 
 // Returns the actionable error string if the ROM at path cannot be loaded on
 // the current heap tier, or nullptr if it is playable.
+// [[gnu::noinline]] — called 4+ times (loadInitialGui, gb_load_rom, ...).
+[[gnu::noinline]]
 static const char* rom_playability_message(const char* path) {
     const size_t sz = get_rom_size(path);
     if (!sz) return nullptr;
@@ -671,6 +684,9 @@ static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
 // =============================================================================
 
 // Derives a per-ROM path of the form <dir><basename_no_ext><ext>.
+// [[gnu::noinline]] — 9+ call sites (save_state, load_state, backup/restore/save/load
+// slot helpers, build_game_slot_dir, SlotActionGui, gb_load_rom…); one copy in .text.
+[[gnu::noinline]]
 static void build_rom_data_path(const char* romPath, char* out, size_t outSz,
                                 const char* dir, const char* ext) {
     const char* slash = strrchr(romPath, '/');
@@ -822,6 +838,10 @@ static void build_game_slot_dir(const char* romPath, char* out, size_t outSz,
 }
 
 // Shared slot-file path builder.
+// [[gnu::noinline]] — four thin wrappers (build_user_slot_path, _ts_path,
+// build_save_backup_slot_path, _ts_path) each get inlined at their call sites,
+// exposing this body at ~8 compile-time sites; noinline keeps one copy.
+[[gnu::noinline]]
 static void build_slot_file_path(const char* romPath, int slot, char* out, size_t outSz,
                                   const char* baseDir, const char* ext) {
     char dir[PATH_BUFFER_SIZE] = {};
@@ -876,6 +896,10 @@ static void read_slot_timestamp(const char* romPath, int slot, char* out, size_t
     read_timestamp_from(tsPath, out, outSz);
 }
 
+// [[gnu::noinline]] — called 13+ times (10-item loop in SaveSlotsGui +
+// SlotActionGui header + swap_to_slots); one snprintf+std::string per call,
+// one copy in .text beats 13 inline copies.
+[[gnu::noinline]]
 static std::string make_slot_label(int slot) {
     char buf[16];
     snprintf(buf, sizeof(buf), "Slot %d", slot);
@@ -884,6 +908,10 @@ static std::string make_slot_label(int slot) {
 
 static void build_save_backup_slot_ts_path(const char* romPath, int slot, char* out, size_t outSz);
 
+// [[gnu::noinline]] — body loops 10 slots (stat calls); inlined into each of
+// the two wrapper functions (newest_state_slot_label, newest_save_backup_slot_label)
+// would duplicate the loop body twice.
+[[gnu::noinline]]
 static std::string newest_slot_label(const char* romPath,
     void(*buildTs)(const char*, int, char*, size_t)) {
     time_t best = -1;
@@ -1232,10 +1260,14 @@ static void write_default_ovl_theme_if_missing() {
 // Falls back to compile-time defaults for any malformed or absent key.
 // =============================================================================
 static void load_ovl_theme() {
-    static const std::string kDef000{"000000"};
-    static const std::string kDef333{"333333"};
-    static const std::string kDefFFF{"ffffff"};
-    static const std::string kDef111{"111111"};
+    // Default hex strings as plain literals — avoids four function-local
+    // static const std::string objects, each of which needs a __cxa_guard
+    // acquire/release pair (~32 bytes overhead) on every call to load_ovl_theme.
+    // valid_hex returns by value; std::move for the 6-char hit path, a cheap
+    // SSO construction for the default path — net cost is identical to before.
+    const auto valid_hex = [](std::string v, const char* def) -> std::string {
+        return v.size() == 6 ? std::move(v) : def;
+    };
 
     // Determine which theme file to load from config.ini.
     const std::string nm = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyOvlTheme);
@@ -1248,22 +1280,18 @@ static void load_ovl_theme() {
     const std::string path(OVL_THEME_FILE);
     if (!ult::isFile(path)) return;  // compile-time defaults remain in effect
 
-    // Helper: accept a 6-char hex string or return the default.
-    const auto valid_hex = [](const std::string& v, const std::string& def)
-        -> const std::string& { return (v.size() == 6) ? v : def; };
-
     const std::string bg_hex  = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "bg_color"),      kDef000);
+        ult::parseValueFromIniSection(path, "theme", "bg_color"),      "000000");
     const std::string btn_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "button_color"),  kDef333);
+        ult::parseValueFromIniSection(path, "theme", "button_color"),  "333333");
     const std::string bdr_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "border_color"),  kDef333);
+        ult::parseValueFromIniSection(path, "theme", "border_color"),  "333333");
     const std::string bkd_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "backdrop_color"),kDef000);
+        ult::parseValueFromIniSection(path, "theme", "backdrop_color"),"000000");
     const std::string frm_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "frame_color"),   kDef111);
+        ult::parseValueFromIniSection(path, "theme", "frame_color"),   "111111");
     const std::string txt_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "gb_text_color"), kDefFFF);
+        ult::parseValueFromIniSection(path, "theme", "gb_text_color"), "ffffff");
 
     int alpha = 13;
     {

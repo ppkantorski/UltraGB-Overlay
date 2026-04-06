@@ -69,7 +69,9 @@
 #include <atomic>
 #include <mutex>
 #include <switch.h>
-#include "audio.hpp"   // ult::Audio::m_audioMutex, m_initialized
+#include "tesla.hpp"   // ult::Audio::m_audioMutex, m_initialized
+
+#pragma GCC optimize("O3")
 
 // Forward-declare the APU callbacks that walnut_cgb.h calls.
 // gb_audio.h must be self-contained so it can be included before gb_core.h.

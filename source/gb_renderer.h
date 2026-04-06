@@ -37,6 +37,8 @@
 #include "gb_audio.h"   // gb_audio_mark_frame_start and friends — required by gb_core.h
 #include "gb_core.h"
 
+#pragma GCC optimize("O3")
+
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
 extern bool g_fb_is_rgb565;
 // true when g_gb_fb stores pre-packed RGBA4444 values (DMG games only).

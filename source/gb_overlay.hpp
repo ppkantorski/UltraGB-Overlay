@@ -24,6 +24,11 @@
 
 #pragma once
 
+// Per-frame rendering and emulation tick — called at 59.73 fps.
+// O3: enables full unrolling of gb_tick_frame(), GBOverlayElement::draw(),
+// and the fast-forward loop.  Explicit so it is immune to include order.
+#pragma GCC optimize("O3")
+
 // GBOverlayGui never calls swapTo — all navigation is done via
 // setNextOverlay + close(), exactly as GBWindowedGui does.
 // No forward declarations needed here.

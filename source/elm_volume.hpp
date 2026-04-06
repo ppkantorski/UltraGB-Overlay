@@ -22,6 +22,10 @@
 
 #pragma once
 
+// UI element — cold path, never called during gameplay.
+// Os: keeps binary lean; draw() fires only on menu navigation, not per game-frame.
+#pragma GCC optimize("Os")
+
 #include <tesla.hpp>
 #include <functional>
 #include <algorithm>
@@ -51,10 +55,17 @@ public:
         const s32 iconX    = this->getX() + kIconX;
         const s32 iconBase = this->getY() + kIconBaseY;
 
-        // Measure glyph once.
-        static const auto [gw, gh] = renderer->getTextDimensions("\uE13C", false, kIconSize);
-        const s32 glyphW   = static_cast<s32>(gw);
-        const s32 glyphH   = static_cast<s32>(gh);
+        // Cache speaker-glyph dimensions in plain static floats.
+        // Avoids the __cxa_guard_acquire/release overhead that static const auto
+        // structured bindings require.  Single-threaded UI path — no races.
+        static float s_glyphW = 0.f, s_glyphH = 0.f;
+        if (s_glyphW == 0.f) {
+            const auto d = renderer->getTextDimensions("\uE13C", false, kIconSize);
+            s_glyphW = d.first;
+            s_glyphH = d.second;
+        }
+        const s32 glyphW   = static_cast<s32>(s_glyphW);
+        const s32 glyphH   = static_cast<s32>(s_glyphH);
         const s32 glyphTop = iconBase - glyphH;
 
         // 1. Draw everything EXCEPT the icon by temporarily clearing m_icon.
@@ -83,9 +94,16 @@ public:
         const s32 rightX    = iconX + glyphW / 2;
         const s32 rightW    = glyphW - glyphW / 2;
         const s32 crossSize = std::max(8, glyphH * 45 / 100);
-        static const auto [cw, ch] = renderer->getTextDimensions("\uE14C", false, crossSize);
-        const s32 crossX    = rightX + (rightW - static_cast<s32>(cw)) / 2;
-        const s32 crossY    = (iconBase - glyphH / 2) + static_cast<s32>(ch) / 2 + 2;
+        // Cache cross-glyph dimensions. crossSize is derived from glyphH which
+        // is itself constant, so this is safe to cache with a plain static float.
+        static float s_crossW = 0.f, s_crossH = 0.f;
+        if (s_crossW == 0.f) {
+            const auto cd = renderer->getTextDimensions("\uE14C", false, crossSize);
+            s_crossW = cd.first;
+            s_crossH = cd.second;
+        }
+        const s32 crossX    = rightX + (rightW - static_cast<s32>(s_crossW)) / 2;
+        const s32 crossY    = (iconBase - glyphH / 2) + static_cast<s32>(s_crossH) / 2 + 2;
 
         renderer->drawString("\uE14C", false, crossX, crossY, crossSize,
                              ((!this->m_focused || !ult::useSelectionText) ? tsl::defaultTextColor : tsl::selectedTextColor));
