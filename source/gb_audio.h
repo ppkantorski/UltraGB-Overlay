@@ -198,6 +198,67 @@ struct GBAPU {
 // is imperceptible.
 static std::atomic<float> s_master_gain{1.0f};
 
+// ── Background-title (Switch game) volume ─────────────────────────────────────
+// g_game_volume      : stored preference (0–100); persisted to config.ini.
+//                      Applied via aud:a / audout:a on player-mode entry.
+// s_pre_game_proc_vol: the per-process master volume captured at entry so we can
+//                      restore it exactly when the player session ends.
+// s_pre_game_pid     : PID of the title whose volume was saved at entry.
+//
+// Uses audWrapperSetProcessMasterVolume (same API as sys-tune) which targets the
+// running title's audio process directly — not a system-wide DSP level.
+// The service is opened on demand and exited immediately after each call.
+// ── Inline audio-service helpers (no external aud_wrapper dependency) ─────────
+// Mirrors the version-branching logic from aud_wrapper.c but embedded directly
+// so gb_audio.h remains self-contained.  Uses audout:a on < 11.0.0 and aud:a
+// on >= 11.0.0 — the same services sys-tune uses for per-process volume control.
+static Result s_audproc_init() {
+    return hosversionBefore(11,0,0) ? audoutaInitialize() : audaInitialize();
+}
+static void s_audproc_exit() {
+    if (hosversionBefore(11,0,0)) audoutaExit(); else audaExit();
+}
+static Result s_audproc_get_vol(u64 pid, float* vol_out) {
+    return hosversionBefore(11,0,0)
+        ? audoutaGetProcessMasterVolume(pid, vol_out)
+        : audaGetAudioOutputProcessMasterVolume(pid, vol_out);
+}
+static Result s_audproc_set_vol(u64 pid, float vol) {
+    if (hosversionBefore(11,0,0))
+        return audoutaSetProcessMasterVolume(pid, 0, vol);
+    Result rc = audaSetAudioOutputProcessMasterVolume(pid, 0, vol);
+    if (R_SUCCEEDED(rc)) audaSetAudioInputProcessMasterVolume(pid, 0, vol);
+    return rc;
+}
+
+static u8    g_game_volume       = 100;
+static float s_pre_game_proc_vol = 1.0f;
+static u64   s_pre_game_pid      = 0;
+
+// Apply g_game_volume to the running background title and save its previous level.
+// Called once from gb_audio_init() after the audio thread is live.
+static void gb_game_vol_apply() {
+    if (R_FAILED(pmdmntGetApplicationProcessId(&s_pre_game_pid))) {
+        s_pre_game_pid = 0;
+        return;
+    }
+    if (R_FAILED(s_audproc_init())) return;
+    if (R_FAILED(s_audproc_get_vol(s_pre_game_pid, &s_pre_game_proc_vol)))
+        s_pre_game_proc_vol = 1.0f;
+    s_audproc_set_vol(s_pre_game_pid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
+    s_audproc_exit();
+}
+
+// Restore the per-process volume that was active before the player session.
+// Called once from gb_audio_shutdown() before relinquishing the stream.
+static void gb_game_vol_restore() {
+    if (s_pre_game_pid == 0) return;
+    if (R_FAILED(s_audproc_init())) return;
+    s_audproc_set_vol(s_pre_game_pid, s_pre_game_proc_vol);
+    s_audproc_exit();
+    s_pre_game_pid = 0;
+}
+
 static inline int ch1_p(const GBAPU& a){return (2048-a.ch1.period)*4;}
 static inline int ch2_p(const GBAPU& a){return (2048-a.ch2.period)*4;}
 static inline int ch3_p(const GBAPU& a){return (2048-a.ch3.period)*2;}
@@ -999,6 +1060,7 @@ static bool gb_audio_init(gb_s*) {
     }
     threadStart(&s_ctrl.thread_handle);
     s_ctrl.ready=true;
+    gb_game_vol_apply();   // set background-title DSP volume for this player session
     return true;
 }
 
@@ -1047,6 +1109,8 @@ static void gb_audio_shutdown() {
     s_ctrl.thread_run.store(false,std::memory_order_release);
     threadWaitForExit(&s_ctrl.thread_handle);
     threadClose(&s_ctrl.thread_handle);
+
+    gb_game_vol_restore();   // restore background-title DSP volume before releasing the stream
 
     // Under m_audioMutex so no concurrent playSound() can interfere.
     //

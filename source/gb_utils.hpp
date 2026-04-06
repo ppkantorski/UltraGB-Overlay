@@ -431,12 +431,8 @@ static void save_ovl_free_pos() {
 // [[gnu::noinline]] — called from 8+ sites; one copy is always smaller.
 [[gnu::noinline]]
 static size_t get_rom_size(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    const size_t sz = static_cast<size_t>(ftell(f));
-    fclose(f);
-    return sz;
+    struct stat st;
+    return (stat(path, &st) == 0) ? static_cast<size_t>(st.st_size) : 0;
 }
 
 // Returns true when the ROM at |path| can be loaded on the current memory tier.
@@ -445,11 +441,12 @@ static size_t get_rom_size(const char* path) {
 // [[gnu::noinline]] — called per-ROM in RomSelectorGui list + other UI sites.
 [[gnu::noinline]]
 static bool rom_is_playable(const char* path) {
+    if (ult::expandedMemory) return true;
     const size_t sz = get_rom_size(path);
     if (!sz) return false;
     if (ult::limitedMemory          && sz >= kROM_2MB) return false;
-    if (!ult::expandedMemory        && sz >= kROM_4MB) return false;
-    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return false;
+    //if (!ult::expandedMemory        && sz >= kROM_4MB) return false;
+    //if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return false;
     return true;
 }
 
@@ -458,11 +455,12 @@ static bool rom_is_playable(const char* path) {
 // [[gnu::noinline]] — called 4+ times (loadInitialGui, gb_load_rom, ...).
 [[gnu::noinline]]
 static const char* rom_playability_message(const char* path) {
+    if (ult::expandedMemory) return nullptr;
     const size_t sz = get_rom_size(path);
     if (!sz) return nullptr;
     if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return REQUIRES_AT_LEAST_6MB;
-    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
-    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
+    //if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
+    //if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
     return nullptr;
 }
 

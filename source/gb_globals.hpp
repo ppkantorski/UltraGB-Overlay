@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <algorithm>
+#include <sys/stat.h> 
 
 #include "gb_audio.h"
 #include "gb_core.h"
@@ -76,6 +77,7 @@ static const std::string kKeySaveDir       {"save_dir"};
 static const std::string kKeyLastRom       {"last_rom"};
 static const std::string kKeyVolume        {"volume"};
 static const std::string kKeyVolBackup     {"vol_backup"};
+static const std::string kKeyGameVolume    {"game_volume"};
 static const std::string kKeyLcdGrid       {"lcd_grid"};
 static const std::string kKeyWindowed      {"windowed"};
 static const std::string kKeyIngameHaptics {"ingame_haptics"};

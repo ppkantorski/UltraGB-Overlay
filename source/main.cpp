@@ -96,6 +96,10 @@ static void load_config() {
     { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolBackup), v))
         g_vol_backup = static_cast<u8>(std::clamp(v, 1, 100)); }
 
+    // game_volume — per-process master volume for background title on player-mode entry (0–100), default 100
+    { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyGameVolume), v))
+        g_game_volume = static_cast<u8>(std::clamp(v, 0, 100)); }
+
     // lcd_grid — 0 = off (default), 1 = LCD grid effect enabled
     const std::string grid_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyLcdGrid);
     if (!grid_val.empty())
@@ -189,6 +193,7 @@ static void write_default_config_if_missing() {
     set_if_missing("save_dir",      g_save_dir);
     set_if_missing("volume",        "50");
     set_if_missing("vol_backup",    "50");
+    set_if_missing("game_volume",   "100");
     set_if_missing("windowed",      "0");
     set_if_missing("lcd_grid",      "0");
     set_if_missing("ingame_haptics", "1");
@@ -1637,9 +1642,12 @@ class SettingsGui : public tsl::Gui {
     // Raw pointer into the list owned by the frame; valid for the lifetime of
     // this Gui (the slider is destroyed together with the list).
     VolumeTrackBar*     m_vol_slider      = nullptr;
+    VolumeTrackBar*     m_game_vol_slider = nullptr;
     tsl::elm::Element*  m_lastFocused     = nullptr;  ///< Tracks last-seen focus for update() change detection.
     u8                 m_vol             = 100;
     u8                 m_vol_backup      = 100;
+    u8                 m_game_vol        = 100;
+    u8                 m_game_vol_backup = 100;
     std::string        m_rom_scroll;       // ROM name to scroll to when returning to RomSelectorGui
     std::string        m_settings_scroll; // scroll target passed in at construction; forwarded to QuickComboSelectorGui so it can restore position on return
 
@@ -1649,9 +1657,9 @@ class SettingsGui : public tsl::Gui {
     std::string focused_label() {
         auto* f = getFocusedElement();
         if (!f) return {};
-        return (f == m_vol_slider)
-            ? std::string("Game Boy")
-            : static_cast<tsl::elm::ListItem*>(f)->getText();
+        if (f == m_vol_slider)      return std::string("GB Player");
+        if (f == m_game_vol_slider) return std::string("Active Title");
+        return static_cast<tsl::elm::ListItem*>(f)->getText();
     }
 
     // Toggle mute on/off and persist both volume and backup.
@@ -1672,6 +1680,29 @@ class SettingsGui : public tsl::Gui {
         char vbuf[4];
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeyVolume,
                              vol_to_str(m_vol, vbuf), "");
+        triggerNavigationFeedback();
+    }
+
+    // Toggle mute on/off for the background Switch title DSP volume.
+    // Also applies the change live via aud:a / audout:a so it takes effect immediately
+    // (useful for silencing the background game while in the settings menu).
+    void do_game_vol_toggle() {
+        if (m_game_vol > 0) {
+            m_game_vol_backup = m_game_vol;
+            m_game_vol = 0;
+        } else {
+            m_game_vol = (m_game_vol_backup > 0) ? m_game_vol_backup : 100;
+        }
+        m_game_vol_slider->setProgress(m_game_vol);
+        g_game_volume = m_game_vol;
+        char vbuf[4];
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyGameVolume,
+                             vol_to_str(m_game_vol, vbuf), "");
+        // Apply immediately so the running background title responds right away.
+        if (s_pre_game_pid != 0 && R_SUCCEEDED(s_audproc_init())) {
+            s_audproc_set_vol(s_pre_game_pid, std::clamp(m_game_vol / 100.f, 0.f, 1.f));
+            s_audproc_exit();
+        }
         triggerNavigationFeedback();
     }
 
@@ -1719,7 +1750,7 @@ public:
         m_vol_backup = g_vol_backup;  // load persisted backup; never 0
 
         auto* vol_slider = new VolumeTrackBar(
-            "\uE13C", false, false, true, "Game Boy", "%", false);
+            "\uE13C", false, false, true, "GB Player", "%", false);
         vol_slider->setProgress(m_vol);
         vol_slider->setValueChangedListener([this](u8 value) {
             m_vol = value;
@@ -1741,6 +1772,36 @@ public:
         m_vol_slider = vol_slider;
         vol_slider->setIconTapCallback([this]() { do_vol_toggle(); });
         list->addItem(vol_slider);
+
+        // ── Game (background Switch title) volume ──────────────────────────────
+        // Controls the per-process master volume of the running background title.
+        // Reverts to the pre-game level automatically on player-mode exit.
+        // Changes take effect immediately via aud:a / audout:a so the running title
+        // responds live while the settings menu is open.
+        m_game_vol = g_game_volume;
+        m_game_vol_backup = (m_game_vol > 0) ? m_game_vol : 100;
+        auto* game_vol_slider = new VolumeTrackBar(
+            "\uE13C", false, false, true, "Active Title", "%", false);
+        game_vol_slider->setProgress(m_game_vol);
+        game_vol_slider->setValueChangedListener([this](u8 value) {
+            m_game_vol = value;
+            g_game_volume = value;
+            char vbuf[4];
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyGameVolume,
+                                 vol_to_str(value, vbuf), "");
+            // Keep the unmute backup up to date (mirror the GB slider logic).
+            const u8 newBackup = (value > 0) ? value : static_cast<u8>(100);
+            if (newBackup != m_game_vol_backup)
+                m_game_vol_backup = newBackup;
+            // Apply immediately to the running background title.
+            if (s_pre_game_pid != 0 && R_SUCCEEDED(s_audproc_init())) {
+                s_audproc_set_vol(s_pre_game_pid, std::clamp(value / 100.f, 0.f, 1.f));
+                s_audproc_exit();
+            }
+        });
+        m_game_vol_slider = game_vol_slider;
+        game_vol_slider->setIconTapCallback([this]() { do_game_vol_toggle(); });
+        list->addItem(game_vol_slider);
 
         // ── Display ───────────────────────────────────────────────────────────
         list->addItem(new tsl::elm::CategoryHeader("Display"));
@@ -1877,8 +1938,9 @@ public:
         // Only block page navigation if the volume slider itself is focused AND unlocked.
         // If focus has moved to another item, allowSlide being true
         // is irrelevant and should not prevent page changes.
-        const bool sliderActive = m_vol_slider && m_vol_slider->hasFocus()
-                                  && ult::allowSlide.load(std::memory_order_acquire);
+        const bool sliderActive = ((m_vol_slider      && m_vol_slider->hasFocus())
+                                || (m_game_vol_slider && m_game_vol_slider->hasFocus()))
+                                && ult::allowSlide.load(std::memory_order_acquire);
         const bool wantLeft = !sliderActive && (simulatedNext || ((keysDown & KEY_LEFT) && !(keysHeld & ~KEY_LEFT & ALL_KEYS_MASK)));
 
         if (wantLeft) {
@@ -1898,6 +1960,10 @@ public:
         // Y — mute/unmute toggle when the volume slider is focused
         if ((keysDown & KEY_Y) && m_vol_slider && m_vol_slider->hasFocus()) {
             do_vol_toggle();
+            return true;
+        }
+        if ((keysDown & KEY_Y) && m_game_vol_slider && m_game_vol_slider->hasFocus()) {
+            do_game_vol_toggle();
             return true;
         }
 
@@ -2039,16 +2105,18 @@ public:
                 // Capture the basename WITH extension for path reconstruction, and
                 // the stripped display string for UI labels and scroll restoration.
                 const std::string romNameStr(name);
-                
-                item->setClickListener([romNameStr, displayStr, playable](u64 keys) -> bool {
+                item->setClickListener([romNameStr, playable](u64 keys) -> bool {
                     char p[PATH_BUFFER_SIZE];
                     snprintf(p, sizeof(p), "%s%s", g_rom_dir, romNameStr.c_str());
-                    strncpy(g_rom_selector_scroll, displayStr.c_str(), sizeof(g_rom_selector_scroll) - 1);
+                    // Recompute on click — cheap, happens at most once per user tap.
+                    const std::string displayStr_ = strip_rom_extension(romNameStr.c_str());
+                    strncpy(g_rom_selector_scroll, displayStr_.c_str(),
+                            sizeof(g_rom_selector_scroll) - 1);
                     g_rom_selector_scroll[sizeof(g_rom_selector_scroll) - 1] = '\0';
                     if (keys & KEY_Y) {
                         triggerRumbleClick.store(true, std::memory_order_release);
                         triggerSettingsSound.store(true, std::memory_order_release);
-                        tsl::swapTo<GameSettingsGui>(p, displayStr);
+                        tsl::swapTo<GameSettingsGui>(p, displayStr_);
                         return true;
                     }
                     if (!(keys & KEY_A)) return false;
