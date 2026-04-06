@@ -701,11 +701,35 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
 class RomSelectorGui;       // forward declare
 class GameSettingsGui;      // forward declare
 class SettingsGui;          // forward declare
-class SaveStatesGui;        // forward declare
-class SlotActionGui;        // forward declare
-class SaveDataGui;          // forward declare
-class SaveDataSlotActionGui; // forward declare
+class SaveSlotsGui;          // forward declare  (merged SaveStatesGui + SaveDataGui)
+class SlotActionGui;         // forward declare  (merged SlotActionGui + SaveDataSlotActionGui)
+class ConfirmGui;            // forward declare
 class QuickComboSelectorGui; // forward declare
+
+// Actions that flow through ConfirmGui.
+// The enum is plain so it costs nothing at runtime — a single int stored in
+// ConfirmGui's members, dispatched with a switch in do_yes() / do_back().
+enum class ConfirmAction : uint8_t {
+    StateSave,    // SlotActionGui   → save state to slot
+    StateLoad,    // SlotActionGui   → load state from slot
+    StateDelete,  // SlotActionGui   → delete slot file
+    DataBackup,   // SaveDataSlotActionGui → backup live .sav to slot
+    DataRestore,  // SaveDataSlotActionGui → restore slot .sav to live
+    DataDelete,   // SaveDataSlotActionGui → delete slot .sav
+};
+
+// Returns the UI label string for a ConfirmAction.
+static constexpr const char* confirm_action_label(ConfirmAction a) {
+    switch (a) {
+        case ConfirmAction::StateSave:   return "Save";
+        case ConfirmAction::StateLoad:   return "Load";
+        case ConfirmAction::StateDelete: return "Delete";
+        case ConfirmAction::DataBackup:  return "Backup";
+        case ConfirmAction::DataRestore: return "Restore";
+        case ConfirmAction::DataDelete:  return "Delete";
+        default:                         return "Confirm";
+    }
+}
 
 // make_slot_detail_header — moved to gb_utils.hpp
 
@@ -721,217 +745,87 @@ class QuickComboSelectorGui; // forward declare
 //}
 
 // =============================================================================
-// SlotActionGui — Save / Load for a single user save-state slot
+// SlotActionGui — Save/Load/Delete (states) or Backup/Restore/Delete (save data)
 //
-// Opened by clicking a slot in SaveStatesGui.
-// Save  — copies internal quick-resume state → slot file + writes timestamp.
-// Load  — copies slot file → internal state, then cold-boots into the game
-//         (gb_load_rom will find the state and resume from it).
-// B     — returns to SaveStatesGui, jumping back to the clicked slot item.
+// m_is_data=false → state slots (Save / Load / Delete)
+// m_is_data=true  → save-data slots (Backup / Restore / Delete)
+//
+// Both modes share the same structure: a slot header, three action items with
+// pre-flight empty-slot checks where appropriate, and B → parent slot list.
+// Merging eliminates a full duplicate vtable + createUI + handleInput body.
 // =============================================================================
 class SlotActionGui : public tsl::Gui {
     std::string m_rom_path;
     std::string m_display_name;
+    std::string m_jump_to;
     int         m_slot;
+    bool        m_is_data;
 public:
-    SlotActionGui(std::string romPath, std::string displayName, int slot)
+    SlotActionGui(std::string romPath, std::string displayName,
+                  int slot, bool isData, std::string jumpTo = "")
         : m_rom_path(std::move(romPath))
         , m_display_name(std::move(displayName))
+        , m_jump_to(std::move(jumpTo))
         , m_slot(slot)
+        , m_is_data(isData)
     {}
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
-
-        // Slot sub-header
         list->addItem(new tsl::elm::CategoryHeader(make_slot_detail_header(m_slot, m_display_name)));
 
-        const std::string& romPath = m_rom_path;
+        const std::string& romPath    = m_rom_path;
         const std::string& displayName = m_display_name;
-        const int slot = m_slot;
+        const int  slot   = m_slot;
+        const bool isData = m_is_data;
 
-        // ── Save ──────────────────────────────────────────────────────────────
-        auto* saveItem = new tsl::elm::SilentListItem("Save");
-        saveItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+        // ── Item 1: Save / Backup ─────────────────────────────────────────────
+        // No pre-flight — ConfirmGui::do_yes handles the empty-source case.
+        const ConfirmAction act1 = isData ? ConfirmAction::DataBackup : ConfirmAction::StateSave;
+        auto* item1 = new tsl::elm::SilentListItem(isData ? "Backup" : "Save");
+        item1->setClickListener([romPath, displayName, slot, act1](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
-            
-            if (save_user_slot(romPath.c_str(), slot)) {
-                triggerEnterFeedback();
-                // Return to SaveStatesGui, jumping back to the correct slot item
-                //triggerEnterFeedback();
-                triggerRumbleClick.store(true, std::memory_order_release);
-                tsl::swapTo<SaveStatesGui>(romPath, displayName, make_slot_label(slot));
-                show_notify("State saved.");
-            } else {
-                triggerWallFeedback();
-                show_notify("No state to save yet.");
-            }
-            return true;
-        });
-        list->addItem(saveItem);
-
-        // ── Load ──────────────────────────────────────────────────────────────
-        auto* loadItem = new tsl::elm::SilentListItem("Load");
-        loadItem->setClickListener([romPath, slot](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            
-            // Check if slot file exists first
-            char slotPath[PATH_BUFFER_SIZE] = {};
-            build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)) {
-                triggerWallFeedback();
-                show_notify(SLOT_IS_EMPTY_WARNING);
-                return true;
-            }
-            // Copy slot → internal state
-            if (!load_user_slot(romPath.c_str(), slot)) {
-                triggerWallFeedback();
-                show_notify("Load failed.");
-                return true;
-            }
-            // Launch the game — gb_load_rom will find the internal state and resume
-            return launch_game(romPath.c_str());
-        });
-        list->addItem(loadItem);
-
-        // ── Delete ────────────────────────────────────────────────────────────
-        auto* deleteItem = new tsl::elm::SilentListItem("Delete");
-        deleteItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            
-            // Check if the slot file exists first
-            char slotPath[PATH_BUFFER_SIZE] = {};
-            build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)) {
-                triggerWallFeedback();
-                show_notify(SLOT_IS_EMPTY_WARNING);
-                return true;
-            }
-            // Delete the state file and its timestamp
-            delete_file(slotPath);
-            char tsPath[PATH_BUFFER_SIZE] = {};
-            build_user_slot_ts_path(romPath.c_str(), slot, tsPath, sizeof(tsPath));
-            delete_file(tsPath);
-            
-            // Return to SaveStatesGui, scrolling back to this slot
-            tsl::swapTo<SaveStatesGui>(romPath, displayName, make_slot_label(slot));
-            triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
-            show_notify("Slot deleted.");
-            return true;
-        });
-        list->addItem(deleteItem);
-
-        return make_bare_frame(list);
-    }
-
-    virtual bool handleInput(u64 keysDown, u64 keysHeld,
-                             const HidTouchState& touchPos,
-                             HidAnalogStickState leftJoy,
-                             HidAnalogStickState rightJoy) override {
-        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
-        if (keysDown & KEY_B) {
-            triggerExitFeedback();
-            tsl::swapTo<SaveStatesGui>(m_rom_path, m_display_name, make_slot_label(m_slot));
-            return true;
-        }
-        return false;
-    }
-};
-
-// =============================================================================
-// SaveDataSlotActionGui — Backup / Restore / Delete for one save-data slot
-//
-// Mirrors SlotActionGui exactly but operates on .sav files instead of .state
-// files.  "Backup" copies the live internal .sav to the slot; "Restore" does
-// the reverse (and live-patches g_gb.cartRam if the game is running);
-// "Delete" removes the slot .sav and its .ts.
-// =============================================================================
-class SaveDataSlotActionGui : public tsl::Gui {
-    std::string m_rom_path;
-    std::string m_display_name;
-    int         m_slot;
-public:
-    SaveDataSlotActionGui(std::string romPath, std::string displayName, int slot)
-        : m_rom_path(std::move(romPath))
-        , m_display_name(std::move(displayName))
-        , m_slot(slot)
-    {}
-
-    virtual tsl::elm::Element* createUI() override {
-        auto* list = new tsl::elm::List();
-
-        list->addItem(new tsl::elm::CategoryHeader(make_slot_detail_header(m_slot, m_display_name)));
-
-        const std::string& romPath     = m_rom_path;
-        const std::string& displayName = m_display_name;
-        const int slot = m_slot;
-
-        // ── Backup ────────────────────────────────────────────────────────────
-        auto* backupItem = new tsl::elm::SilentListItem("Backup");
-        backupItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            
-            if (backup_save_data_slot(romPath.c_str(), slot)) {
-                triggerEnterFeedback();
-                show_notify("Save data backed up.");
-                tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
-            } else {
-                triggerWallFeedback();
-                show_notify("No save data found.");
-            }
-            return true;
-        });
-        list->addItem(backupItem);
-
-        // ── Restore ───────────────────────────────────────────────────────────
-        auto* restoreItem = new tsl::elm::SilentListItem("Restore");
-        restoreItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
-            if (!(keys & KEY_A)) return false;
-            
-            // Verify the slot exists first.
-            char slotPath[PATH_BUFFER_SIZE] = {};
-            build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)) {
-                triggerWallFeedback();
-                show_notify(SLOT_IS_EMPTY_WARNING);
-                return true;
-            }
-            if (!restore_save_data_slot(romPath.c_str(), slot)) {
-                triggerWallFeedback();
-                show_notify("Restore failed.");
-                return true;
-            }
-            
-            tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
             triggerEnterFeedback();
-            show_notify("Save data restored.");
+            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act1);
             return true;
         });
-        list->addItem(restoreItem);
+        list->addItem(item1);
 
-        // ── Delete ────────────────────────────────────────────────────────────
-        auto* deleteItem = new tsl::elm::SilentListItem("Delete");
-        deleteItem->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+        // ── Item 2: Load / Restore ────────────────────────────────────────────
+        // Pre-flight: bail early if the slot file doesn't exist yet.
+        const ConfirmAction act2 = isData ? ConfirmAction::DataRestore : ConfirmAction::StateLoad;
+        auto* item2 = new tsl::elm::SilentListItem(isData ? "Restore" : "Load");
+        item2->setClickListener([romPath, displayName, slot, isData, act2](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
-            
             char slotPath[PATH_BUFFER_SIZE] = {};
-            build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
-            if (!file_exists(slotPath)){
-                show_notify(SLOT_IS_EMPTY_WARNING);
-                triggerWallFeedback();
-                return true;
-            }
-            delete_file(slotPath);
-            char tsPath[PATH_BUFFER_SIZE] = {};
-            build_save_backup_slot_ts_path(romPath.c_str(), slot, tsPath, sizeof(tsPath));
-            delete_file(tsPath);
-            
-            tsl::swapTo<SaveDataGui>(romPath, displayName, make_slot_label(slot));
-            triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
-            show_notify("Slot deleted.");
+            if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
+            triggerEnterFeedback();
+            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act2);
             return true;
         });
-        list->addItem(deleteItem);
+        list->addItem(item2);
+
+        // ── Item 3: Delete ────────────────────────────────────────────────────
+        // Same path builder as item 2.
+        const ConfirmAction act3 = isData ? ConfirmAction::DataDelete : ConfirmAction::StateDelete;
+        auto* item3 = new tsl::elm::SilentListItem("Delete");
+        item3->setClickListener([romPath, displayName, slot, isData, act3](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            char slotPath[PATH_BUFFER_SIZE] = {};
+            if (isData) build_save_backup_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            else        build_user_slot_path(romPath.c_str(), slot, slotPath, sizeof(slotPath));
+            if (!file_exists(slotPath)) { triggerWallFeedback(); show_notify(SLOT_IS_EMPTY_WARNING); return true; }
+            triggerEnterFeedback();
+            tsl::swapTo<ConfirmGui>(romPath, displayName, slot, act3);
+            return true;
+        });
+        list->addItem(item3);
+
+        // Restore focus to the item clicked before entering ConfirmGui.
+        if (!m_jump_to.empty())
+            list->jumpToItem(m_jump_to, "", true);
 
         return make_bare_frame(list);
     }
@@ -943,7 +837,8 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            tsl::swapTo<SaveDataGui>(m_rom_path, m_display_name, make_slot_label(m_slot));
+            tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name,
+                                      make_slot_label(m_slot), m_is_data);
             return true;
         }
         return false;
@@ -951,50 +846,219 @@ public:
 };
 
 // =============================================================================
-// SaveDataGui — 10 save-data backup slots
+// ConfirmGui — single-purpose "Yes / No" confirmation screen
 //
-// Each slot shows a timestamp footer (ult::OPTION_SYMBOL if empty).
-// Clicking a slot opens SaveDataSlotActionGui.
-// B returns to GameSettingsGui, jumping to "Save Data".
+// Sits between SlotActionGui / SaveDataSlotActionGui and the actual action.
+// The CategoryHeader shows the action name (e.g. "Save", "Delete").
+//
+//   Yes — executes the action via do_yes(), then navigates onward exactly as
+//         the old direct-click code did.
+//   No  — calls do_back(), returning to the originating action Gui with focus
+//         restored to the item that was just clicked.
+//   B   — identical to No.
+//
+// Memory: one enum byte + three strings + one int — no std::function, no heap
+// closures beyond what tsl::elm already allocates for its list items.
 // =============================================================================
-class SaveDataGui : public tsl::Gui {
+class ConfirmGui : public tsl::Gui {
+    std::string  m_rom_path;
+    std::string  m_display_name;
+    int          m_slot;
+    ConfirmAction m_action;
+
+    // Navigate back to the originating action Gui, restoring focus.
+    void do_back() {
+        triggerExitFeedback();
+        const char* label  = confirm_action_label(m_action);
+        const bool  isData = (m_action >= ConfirmAction::DataBackup);
+        tsl::swapTo<SlotActionGui>(m_rom_path, m_display_name, m_slot, isData, label);
+    }
+
+    // Execute the confirmed action, then navigate onward.
+    void do_yes() {
+        switch (m_action) {
+
+            case ConfirmAction::StateSave:
+                if (save_user_slot(m_rom_path.c_str(), m_slot)) {
+                    //triggerEnterFeedback();
+                    //triggerRumbleClick.store(true, std::memory_order_release);
+                    tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), false);
+                    show_notify("State saved.");
+                } else {
+                    triggerWallFeedback();
+                    show_notify("No state to save yet.");
+                    do_back();
+                }
+                break;
+
+            case ConfirmAction::StateLoad: {
+                if (!load_user_slot(m_rom_path.c_str(), m_slot)) {
+                    triggerWallFeedback();
+                    show_notify("Load failed.");
+                    do_back();
+                    break;
+                }
+                // gb_load_rom will find the internal state and resume from it.
+                launch_game(m_rom_path.c_str());
+                break;
+            }
+
+            case ConfirmAction::StateDelete: {
+                char slotPath[PATH_BUFFER_SIZE] = {};
+                build_user_slot_path(m_rom_path.c_str(), m_slot, slotPath, sizeof(slotPath));
+                delete_file(slotPath);
+                char tsPath[PATH_BUFFER_SIZE] = {};
+                build_user_slot_ts_path(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
+                delete_file(tsPath);
+                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), false);
+                triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+                show_notify("Slot deleted.");
+                break;
+            }
+
+            case ConfirmAction::DataBackup:
+                if (backup_save_data_slot(m_rom_path.c_str(), m_slot)) {
+                    //triggerEnterFeedback();
+                    show_notify("Save data backed up.");
+                    tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
+                } else {
+                    triggerWallFeedback();
+                    show_notify("No save data found.");
+                    do_back();
+                }
+                break;
+
+            case ConfirmAction::DataRestore:
+                if (!restore_save_data_slot(m_rom_path.c_str(), m_slot)) {
+                    triggerWallFeedback();
+                    show_notify("Restore failed.");
+                    do_back();
+                    break;
+                }
+                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
+                //triggerEnterFeedback();
+                show_notify("Save data restored.");
+                break;
+
+            case ConfirmAction::DataDelete: {
+                char slotPath[PATH_BUFFER_SIZE] = {};
+                build_save_backup_slot_path(m_rom_path.c_str(), m_slot, slotPath, sizeof(slotPath));
+                delete_file(slotPath);
+                char tsPath[PATH_BUFFER_SIZE] = {};
+                build_save_backup_slot_ts_path(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
+                delete_file(tsPath);
+                tsl::swapTo<SaveSlotsGui>(m_rom_path, m_display_name, make_slot_label(m_slot), true);
+                triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+                show_notify("Slot deleted.");
+                break;
+            }
+        }
+    }
+
+public:
+    ConfirmGui(std::string romPath, std::string displayName, int slot, ConfirmAction action)
+        : m_rom_path(std::move(romPath))
+        , m_display_name(std::move(displayName))
+        , m_slot(slot)
+        , m_action(action)
+    {}
+
+    virtual tsl::elm::Element* createUI() override {
+        auto* list = new tsl::elm::List();
+
+        // Header names the action — "Save", "Load", "Delete", "Backup", etc.
+        list->addItem(new tsl::elm::CategoryHeader(
+            std::string(make_slot_label(m_slot)) +
+            " " + ult::DIVIDER_SYMBOL + " " + confirm_action_label(m_action)));
+
+        auto* yesItem = new tsl::elm::SilentListItem("Yes");
+        yesItem->setClickListener([this](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            if (m_action != ConfirmAction::DataDelete)
+                triggerEnterFeedback();
+            do_yes();
+            return true;
+        });
+        list->addItem(yesItem);
+
+        auto* noItem = new tsl::elm::SilentListItem("No");
+        noItem->setClickListener([this](u64 keys) -> bool {
+            if (!(keys & KEY_A)) return false;
+            do_back();
+            return true;
+        });
+        list->addItem(noItem);
+
+        return make_bare_frame(list);
+    }
+
+    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+                             const HidTouchState& touchPos,
+                             HidAnalogStickState leftJoy,
+                             HidAnalogStickState rightJoy) override {
+        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
+        if (keysDown & KEY_B) {
+            do_back();
+            return true;
+        }
+        return false;
+    }
+};
+
+
+// =============================================================================
+// SaveSlotsGui — 10-slot list for save states (isData=false) or save-data
+//               backups (isData=true).
+//
+// Merges the former SaveStatesGui and SaveDataGui — only three runtime values
+// differ between the two modes: the header prefix, the timestamp reader, and
+// the B-handler jump label.  A single vtable + createUI + handleInput covers
+// both, saving two full class definitions and their swapTo instantiations.
+// =============================================================================
+class SaveSlotsGui : public tsl::Gui {
     std::string m_rom_path;
     std::string m_display_name;
     std::string m_jump_to;
+    bool        m_is_data;
 public:
-    SaveDataGui(std::string romPath, std::string displayName, std::string jumpTo = "")
+    SaveSlotsGui(std::string romPath, std::string displayName,
+                 std::string jumpTo, bool isData)
         : m_rom_path(std::move(romPath))
         , m_display_name(std::move(displayName))
         , m_jump_to(std::move(jumpTo))
+        , m_is_data(isData)
     {}
 
     virtual tsl::elm::Element* createUI() override {
         auto* list = new tsl::elm::List();
 
-        list->addItem(new tsl::elm::CategoryHeader("Save Data " + ult::DIVIDER_SYMBOL + " " + m_display_name));
+        list->addItem(new tsl::elm::CategoryHeader(
+            (m_is_data ? "Save Data" : "Save States") +
+            (" " + ult::DIVIDER_SYMBOL + " " + m_display_name)));
 
-        const std::string romPath     = m_rom_path;
+        const std::string romPath    = m_rom_path;
         const std::string displayName = m_display_name;
+        const bool isData = m_is_data;
 
         for (int i = 0; i < 10; ++i) {
             char ts[48] = {};
-            read_save_backup_timestamp(romPath.c_str(), i, ts, sizeof(ts));
+            if (isData) read_save_backup_timestamp(romPath.c_str(), i, ts, sizeof(ts));
+            else        read_slot_timestamp(romPath.c_str(), i, ts, sizeof(ts));
 
             const int slot = i;
             auto* item = new tsl::elm::MiniListItem(make_slot_label(i), ts);
-            item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
+            item->setClickListener([romPath, displayName, slot, isData](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                tsl::swapTo<SaveDataSlotActionGui>(romPath, displayName, slot);
+                tsl::swapTo<SlotActionGui>(romPath, displayName, slot, isData);
                 return true;
             });
             list->addItem(item);
         }
 
-        // Jump to explicit target (returning from SaveDataSlotActionGui) or,
-        // on first entry, to the most recently written backup slot.
         const std::string jumpTarget = !m_jump_to.empty()
             ? m_jump_to
-            : newest_save_backup_slot_label(m_rom_path.c_str());
+            : (isData ? newest_save_backup_slot_label(m_rom_path.c_str())
+                      : newest_state_slot_label(m_rom_path.c_str()));
         if (!jumpTarget.empty())
             list->jumpToItem(jumpTarget, "", true);
 
@@ -1008,72 +1072,8 @@ public:
         (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
         if (keysDown & KEY_B) {
             triggerExitFeedback();
-            tsl::swapTo<GameSettingsGui>(m_rom_path, m_display_name, "Save Data");
-            return true;
-        }
-        return false;
-    }
-};
-
-// =============================================================================
-// SaveStatesGui — 10 user save-state slots
-//
-// Each slot shows a timestamp footer (ult::OPTION_SYMBOL.c_str() if empty).
-// Clicking a slot opens SlotActionGui.
-// B returns to GameSettingsGui, jumping to "Save States".
-// =============================================================================
-class SaveStatesGui : public tsl::Gui {
-    std::string m_rom_path;
-    std::string m_display_name;
-    std::string m_jump_to;   // item label to restore scroll position on re-entry
-public:
-    SaveStatesGui(std::string romPath, std::string displayName, std::string jumpTo = "")
-        : m_rom_path(std::move(romPath))
-        , m_display_name(std::move(displayName))
-        , m_jump_to(std::move(jumpTo))
-    {}
-
-    virtual tsl::elm::Element* createUI() override {
-        auto* list = new tsl::elm::List();
-
-        list->addItem(new tsl::elm::CategoryHeader("Save States "+ ult::DIVIDER_SYMBOL + " " + m_display_name));
-
-        const std::string romPath      = m_rom_path;
-        const std::string displayName  = m_display_name;
-
-        for (int i = 0; i < 10; ++i) {
-            char ts[48] = {};
-            read_slot_timestamp(romPath.c_str(), i, ts, sizeof(ts));
-
-            const int slot = i;
-            auto* item = new tsl::elm::MiniListItem(make_slot_label(i), ts);
-            item->setClickListener([romPath, displayName, slot](u64 keys) -> bool {
-                if (!(keys & KEY_A)) return false;
-                tsl::swapTo<SlotActionGui>(romPath, displayName, slot);
-                return true;
-            });
-            list->addItem(item);
-        }
-
-        // Jump to explicit target (returning from SlotActionGui) or, on first
-        // entry, to the most recently written slot so focus lands there.
-        const std::string jumpTarget = !m_jump_to.empty()
-            ? m_jump_to
-            : newest_state_slot_label(m_rom_path.c_str());
-        if (!jumpTarget.empty())
-            list->jumpToItem(jumpTarget, "", true);
-
-        return make_bare_frame(list);
-    }
-
-    virtual bool handleInput(u64 keysDown, u64 keysHeld,
-                             const HidTouchState& touchPos,
-                             HidAnalogStickState leftJoy,
-                             HidAnalogStickState rightJoy) override {
-        (void)keysHeld; (void)touchPos; (void)leftJoy; (void)rightJoy;
-        if (keysDown & KEY_B) {
-            triggerExitFeedback();
-            tsl::swapTo<GameSettingsGui>(m_rom_path, m_display_name, "Save States");
+            tsl::swapTo<GameSettingsGui>(m_rom_path, m_display_name,
+                m_is_data ? "Save Data" : "Save States");
             return true;
         }
         return false;
@@ -1120,7 +1120,7 @@ public:
         statesItem->setClickListener([romPath, displayName](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
             triggerEnterFeedback();
-            tsl::swapTo<SaveStatesGui>(romPath, displayName);
+            tsl::swapTo<SaveSlotsGui>(romPath, displayName, "", false);
             return true;
         });
         list->addItem(statesItem);
@@ -1131,7 +1131,7 @@ public:
         saveDataItem->setClickListener([romPath, displayName](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
             triggerEnterFeedback();
-            tsl::swapTo<SaveDataGui>(romPath, displayName);
+            tsl::swapTo<SaveSlotsGui>(romPath, displayName, "", true);
             return true;
         });
         list->addItem(saveDataItem);
