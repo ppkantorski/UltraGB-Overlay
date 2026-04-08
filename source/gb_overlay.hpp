@@ -421,8 +421,8 @@ public:
             g_select_hx = SELECT_DRAW_X + selw / 2;
             g_select_hy = SELECT_DRAW_Y + g_render_y_offset - selh / 2;
 
-            const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
-            g_div_half_w = static_cast<int>(divw) / 2;
+            //const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
+            //g_div_half_w = static_cast<int>(divw) / 2;
 
             g_btns_measured = true;
         }
@@ -459,21 +459,12 @@ public:
         // B button: filled black circle matching the hit-test radius.
         renderer->drawCircle(g_bbtn_hx, g_bbtn_hy + 6, BBTN_R, true, BK);
 
-        // Plus/Minus: pill-shaped rounded rect spanning both glyphs (and the
-        // divider between them) with even padding.  Width is computed at runtime
-        // so it automatically expands if the divider symbol is wider than the gap.
-        {
-            static constexpr int PAD_X = 6, PAD_Y = 4, Y_SHIFT = 1;
-            // Left edge: leftmost of (select glyph, divider left half)
-            const int left_edge  = std::min(SELECT_DRAW_X,      FB_W / 2 - g_div_half_w);
-            // Right edge: rightmost of (start glyph right, divider right half)
-            const int right_edge = std::max(START_DRAW_X + START_SIZE, FB_W / 2 + g_div_half_w);
-            const int rx = left_edge  - PAD_X;
-            const int ry = (START_DRAW_Y + g_render_y_offset - START_SIZE) - PAD_Y + Y_SHIFT + 4;
-            const int rw = (right_edge - left_edge) + PAD_X * 2;
-            const int rh = START_SIZE + PAD_Y * 2;
-            renderer->drawUniformRoundedRect(rx, ry, rw, rh, BK);
-        }
+        // Plus (+) / Minus (−): individual filled circles behind each glyph,
+        // matching the A/B button style.  g_start/select_hx/hy are the measured
+        // visual centres from the g_btns_measured block above; START_R/SELECT_R
+        // are the intended radii (both 24), defined in gb_globals.hpp.
+        renderer->drawCircle(g_select_hx-3, g_select_hy+4, SELECT_R-6, true, BK);
+        renderer->drawCircle(g_start_hx+3,  g_start_hy+4,  START_R-6,  true, BK);
 
         // ── D-pad composite — all four arrow directions ───────────────────────
         // Each glyph is treated as a 3×3 grid; we scissor to the center strip.
@@ -502,7 +493,7 @@ public:
             // are never clipped regardless of font ascender/descender metrics.
             renderer->enableScissoring(left + (static_cast<s32>(dw) - stripW) / 2, 0,
                                        stripW, fbH);
-            renderer->drawString("\uE115", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
+            renderer->drawString("\uE115", false, left, baseline, DPAD_SIZE, g_ovl_dpad_col);
             renderer->disableScissoring();
 
             // E116 (←→): narrow strip vertically (stripH), but fully unbounded
@@ -511,7 +502,7 @@ public:
             const s32 rowNudge = thirdH / 4;
             renderer->enableScissoring(0, top + (static_cast<s32>(dh) - stripH) / 2 + rowNudge +4,
                                        fbW, stripH);
-            renderer->drawString("\uE116", false, left, baseline, DPAD_SIZE, VBTN_COLOR);
+            renderer->drawString("\uE116", false, left, baseline, DPAD_SIZE, g_ovl_dpad_col);
             renderer->disableScissoring();
 
             // Centre circle — drawn last so it sits on top of both arrow glyphs
@@ -519,12 +510,12 @@ public:
             // Values match DPAD_CX, DPAD_CY+4, and (ARM_W+LIP*2)/2 from the backing block.
             renderer->drawCircle(DPAD_DRAW_X + 67, DPAD_DRAW_Y + g_render_y_offset - 10 - 56 + 4+1, 14, true, BK);
         }
-        renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y  + g_render_y_offset, ABTN_SIZE,   VBTN_COLOR);
-        renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y  + g_render_y_offset, BBTN_SIZE,   VBTN_COLOR);
-        renderer->drawString("\uE0F0", false, SELECT_DRAW_X -3, SELECT_DRAW_Y + g_render_y_offset + 1, SELECT_SIZE, VBTN_COLOR);
-        renderer->drawString(ult::DIVIDER_SYMBOL, false,
-            FB_W / 2 - g_div_half_w, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, 0xF444);
-        renderer->drawString("\uE0EF", false, START_DRAW_X +3, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, VBTN_COLOR);
+        renderer->drawString("\uE0E0", false, ABTN_DRAW_X,  ABTN_DRAW_Y  + g_render_y_offset, ABTN_SIZE,   g_ovl_abtn_col);
+        renderer->drawString("\uE0E1", false, BBTN_DRAW_X,  BBTN_DRAW_Y  + g_render_y_offset, BBTN_SIZE,   g_ovl_bbtn_col);
+        renderer->drawString("\uE0F0", false, SELECT_DRAW_X -3, SELECT_DRAW_Y + g_render_y_offset + 1, SELECT_SIZE, g_ovl_select_col);
+        //renderer->drawString(ult::DIVIDER_SYMBOL, false,
+        //    FB_W / 2 - g_div_half_w, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, 0xF444);
+        renderer->drawString("\uE0EF", false, START_DRAW_X +3, START_DRAW_Y + g_render_y_offset + 1, START_SIZE, g_ovl_start_col);
 
         // ── Focus pass-through flash border ──────────────────────────────────
         // Draws a 4-pixel coloured border for g_focus_flash frames after the
@@ -863,14 +854,14 @@ public:
         }
 
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
-        if (newTouchPresses && g_ingame_haptics && !m_zl_state.pass_through)
+        if (newTouchPresses && g_touch_haptics && !m_zl_state.pass_through)
             triggerRumbleClick.store(true, std::memory_order_release);
         m_prevTouchKeys = g_touch_keys;
 
         // Physical buttons → GB joypad.  Suppressed during drag and pass-through.
         if (!m_zl_state.pass_through && !s_ovl_free_dragging) {
             gb_set_input(keysHeld | g_touch_keys);
-            if (g_ingame_haptics &&
+            if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClick.store(true, std::memory_order_release);
@@ -939,7 +930,7 @@ public:
                         m_touch_start_y = hty;
                         m_pos_start_x   = g_ovl_free_pos_x;
                         m_pos_start_y   = g_ovl_free_pos_y;
-                        triggerNavigationFeedback();
+                        if (g_touch_haptics) triggerNavigationFeedback();
                     }
 
                     if (m_dragging) {
@@ -969,7 +960,7 @@ public:
                 if (m_prev_touching && !htouching) {
                     if (m_dragging) {
                         save_ovl_free_pos();
-                        triggerExitFeedback();
+                        if (g_touch_haptics) triggerExitFeedback();
                         gb_audio_resume();
                         g_gb_frame_next_ns = 0;
                         g_btns_measured    = false;  // recalculate hit centres at new render offset
@@ -1004,7 +995,7 @@ public:
                             m_joy_acc_x   = 0.f;
                             m_joy_acc_y   = 0.f;
                             m_joy_last_ns = 0;
-                            triggerNavigationFeedback();
+                            if (g_touch_haptics) triggerNavigationFeedback();
                         }
                     }
 
@@ -1050,7 +1041,7 @@ public:
                     if (m_plus_armed) {
                         if (m_plus_dragging) {
                             save_ovl_free_pos();
-                            triggerExitFeedback();
+                            if (g_touch_haptics) triggerExitFeedback();
                             gb_audio_resume();
                             g_gb_frame_next_ns = 0;
                             g_btns_measured    = false;  // recalculate hit centres at new render offset

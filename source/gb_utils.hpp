@@ -200,7 +200,7 @@ static void __attribute__((optimize("O3"))) process_zl_pass_through(bool zl_down
 [[gnu::noinline]]
 static void run_once_setup(bool& runOnce, bool& restoreHapticState) {
     if (!runOnce) return;
-    if (g_ingame_haptics && !ult::useHapticFeedback) {
+    if ((g_button_haptics || g_touch_haptics) && !ult::useHapticFeedback) {
         ult::useHapticFeedback = true;
         restoreHapticState = true;
     }
@@ -237,8 +237,8 @@ static void consume_pending_rom(bool& load_failed) {
 //   • ~GBOverlayGui()             — destructor path (user closed overlay)
 //   • GBWindowedGui::handleInput  — combo-exit path (launch combo pressed)
 // run_once_setup() is the write side: it sets useHapticFeedback = true and
-// restoreHapticState = true when g_ingame_haptics is on but the global flag
-// was off at session start.
+// restoreHapticState = true when g_button_haptics or g_touch_haptics is on
+// but the global flag was off at session start.
 // =============================================================================
 static inline void restore_haptic_if_needed(bool& restoreHapticState) {
     if (restoreHapticState) {
@@ -1235,7 +1235,11 @@ static void write_theme_defaults(const std::string& path) {
     static constexpr const char* kv[][2] = {
         {"bg_color",       "000000"},
         {"bg_alpha",       "13"    },
-        {"button_color",   "333333"},
+        {"dpad_button_color",   "333333"},
+        {"a_button_color",     "333333"},
+        {"b_button_color",     "333333"},
+        {"start_button_color", "333333"},
+        {"select_button_color","333333"},
         {"border_color",   "333333"},
         {"backdrop_color", "000000"},
         {"frame_color",    "111111"},
@@ -1292,8 +1296,16 @@ static void load_ovl_theme() {
 
     const std::string bg_hex  = valid_hex(
         ult::parseValueFromIniSection(path, "theme", "bg_color"),      "000000");
-    const std::string btn_hex = valid_hex(
-        ult::parseValueFromIniSection(path, "theme", "button_color"),  "333333");
+    const std::string dpad_hex  = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "dpad_button_color"),   "333333");
+    const std::string abtn_hex  = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "a_button_color"),      "333333");
+    const std::string bbtn_hex  = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "b_button_color"),      "333333");
+    const std::string start_hex = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "start_button_color"),  "333333");
+    const std::string sel_hex   = valid_hex(
+        ult::parseValueFromIniSection(path, "theme", "select_button_color"), "333333");
     const std::string bdr_hex = valid_hex(
         ult::parseValueFromIniSection(path, "theme", "border_color"),  "333333");
     const std::string bkd_hex = valid_hex(
@@ -1317,12 +1329,52 @@ static void load_ovl_theme() {
         if (!av.empty() && parse_uint(av, v) && v <= 15) frame_alpha = v;
     }
 
-    g_ovl_bg_col      = tsl::RGB888(bg_hex,  static_cast<size_t>(alpha));
-    g_ovl_btn_col     = tsl::RGB888(btn_hex, 15u);
+    // Opacity override — when g_ovl_opaque is set, force both variable alpha
+    // channels to 15 regardless of what the theme specifies.  btn, bdr,
+    // backdrop, and text are always 15u, so only bg and frame need adjustment.
+    if (g_ovl_opaque) { alpha = 15; frame_alpha = 15; }
+
+    g_ovl_bg_col      = tsl::RGB888(bg_hex,   static_cast<size_t>(alpha));
+    g_ovl_dpad_col    = tsl::RGB888(dpad_hex, 15u);
+    g_ovl_abtn_col    = tsl::RGB888(abtn_hex, 15u);
+    g_ovl_bbtn_col    = tsl::RGB888(bbtn_hex, 15u);
+    g_ovl_start_col   = tsl::RGB888(start_hex,15u);
+    g_ovl_select_col  = tsl::RGB888(sel_hex,  15u);
     g_ovl_bdr_col     = tsl::RGB888(bdr_hex, 15u);
     g_ovl_backdrop_col= tsl::RGB888(bkd_hex, 15u);
     g_ovl_frame_col   = tsl::RGB888(frm_hex, static_cast<size_t>(frame_alpha));
     g_ovl_text_col    = tsl::RGB888(txt_hex, 15u);
+
+    // tsl HUD / logo overrides — only applied if the key is present and valid in
+    // ovl_theme.ini.  Absent keys leave the tsl:: variable at whatever value
+    // Ultrahand's own theme set, so the regular overlay UI is unaffected.
+    {
+        const auto tryColor = [&](const char* key, tsl::Color& target) {
+            const std::string v = ult::parseValueFromIniSection(path, "theme", key);
+            if (v.size() == 6) target = tsl::RGB888(v, 15u);
+        };
+        tryColor("dynamic_logo_color_1",  tsl::dynamicLogoRGB1);
+        tryColor("dynamic_logo_color_2",  tsl::dynamicLogoRGB2);
+        tryColor("logo_color_1",          tsl::logoColor1);
+        tryColor("logo_color_2",          tsl::logoColor2);
+        tryColor("top_separator_color",   tsl::topSeparatorColor);
+        tryColor("clock_color",           tsl::clockColor);
+        tryColor("temperature_color",     tsl::temperatureColor);
+        tryColor("battery_color",         tsl::batteryColor);
+        tryColor("battery_charging_color",tsl::batteryChargingColor);
+        tryColor("battery_low_color",     tsl::batteryLowColor);
+
+        // widget_backdrop: alpha and color are linked — only apply if color is present.
+        const std::string wbkd_raw = ult::parseValueFromIniSection(path, "theme", "widget_backdrop_color");
+        if (wbkd_raw.size() == 6) {
+            const std::string wbkd_a = ult::parseValueFromIniSection(path, "theme", "widget_backdrop_alpha");
+            int va = static_cast<int>(tsl::widgetBackdropAlpha);  // keep existing alpha as default
+            int vp = 0;
+            if (!wbkd_a.empty() && parse_uint(wbkd_a, vp) && vp <= 15) va = vp;
+            tsl::widgetBackdropAlpha = static_cast<size_t>(va);
+            tsl::widgetBackdropColor = tsl::RGB888(wbkd_raw, tsl::widgetBackdropAlpha);
+        }
+    }
 
     // Recompute packed RGBA4444 for direct-fb writes.
     // Layout: r nibble at bit 0, g at 4, b at 8, a at 12.

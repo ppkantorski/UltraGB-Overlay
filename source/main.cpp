@@ -117,13 +117,40 @@ static void load_config() {
     if (!win_val.empty())
         g_windowed_mode = (win_val == "1");
 
-    const std::string hap_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyIngameHaptics);
-    if (!hap_val.empty())
-        g_ingame_haptics = (hap_val != "0");
+    const std::string btn_hap_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyButtonHaptics);
+    if (!btn_hap_val.empty())
+        g_button_haptics = (btn_hap_val != "0");
 
-    const std::string wall_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOverlayWallpaper);
-    if (!wall_val.empty())
-        g_overlay_wallpaper = (wall_val == "1");
+    const std::string touch_hap_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyTouchHaptics);
+    if (!touch_hap_val.empty())
+        g_touch_haptics = (touch_hap_val != "0");
+
+    const std::string ovl_opaque_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlOpaque);
+    if (!ovl_opaque_val.empty())
+        g_ovl_opaque = (ovl_opaque_val != "0");
+
+    // ovl_theme — filename stem of the selected overlay theme (empty = "default").
+    // Only the name is read here; colors are loaded by load_ovl_theme() when
+    // launching the overlay player.
+    {
+        const std::string th_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlTheme);
+        if (!th_val.empty() && th_val.size() < sizeof(g_ovl_theme_name) - 1) {
+            strncpy(g_ovl_theme_name, th_val.c_str(), sizeof(g_ovl_theme_name) - 1);
+            g_ovl_theme_name[sizeof(g_ovl_theme_name) - 1] = '\0';
+        }
+    }
+
+    // ovl_wallpaper — filename stem of the selected overlay wallpaper (empty = none).
+    // g_overlay_wallpaper is derived: true only when a name is stored AND the
+    // active wallpaper file actually exists (guards against a deleted file).
+    {
+        const std::string wp_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyOvlWallpaperName);
+        if (!wp_val.empty() && wp_val.size() < sizeof(g_ovl_wallpaper_name) - 1) {
+            strncpy(g_ovl_wallpaper_name, wp_val.c_str(), sizeof(g_ovl_wallpaper_name) - 1);
+            g_ovl_wallpaper_name[sizeof(g_ovl_wallpaper_name) - 1] = '\0';
+        }
+        g_overlay_wallpaper = (g_ovl_wallpaper_name[0] != '\0' && ult::isFile(OVL_WALLPAPER_FILE));
+    }
 
     // win_pos_x / win_pos_y — persisted VI-space window position
     {
@@ -204,10 +231,10 @@ static void write_default_config_if_missing() {
     set_if_missing("vol_backup",    "50");
     set_if_missing("game_volume",   "30");
     set_if_missing("game_vol_backup","30");
-    set_if_missing("windowed",      "0");
-    set_if_missing("lcd_grid",      "0");
-    set_if_missing("ingame_haptics", "1");
-    set_if_missing("ingame_wallpaper", "0");
+    set_if_missing("windowed",       "0");
+    set_if_missing("lcd_grid",       "0");
+    set_if_missing("button_haptics", "0");
+    set_if_missing("touch_haptics",  "0");
     set_if_missing("win_pos_x",     "840");
     set_if_missing("win_pos_y",     "432");
     set_if_missing("win_scale",     "1");
@@ -1334,7 +1361,7 @@ public:
 // SelectorMode::QuickCombo — combo picker (stays on list after selection)
 // SelectorMode::OvlTheme   — theme picker (swaps back to SettingsGui on select)
 // =============================================================================
-enum class SelectorMode : uint8_t { QuickCombo, OvlTheme, WindowedSub, OverlaySub };
+enum class SelectorMode : uint8_t { QuickCombo, OvlTheme, WindowedSub, OverlaySub, OvlWallpaper };
 
 static int ovl_theme_filter(const struct dirent* e) {
     const char* n = e->d_name;
@@ -1342,6 +1369,14 @@ static int ovl_theme_filter(const struct dirent* e) {
     if (len < 5) return 0;
     if (strcmp(n, "default.ini") == 0) return 0;
     return (strcmp(n + len - 4, ".ini") == 0) ? 1 : 0;
+}
+
+// Accepts any file ending in ".rgba" inside OVL_WALLPAPERS_DIR.
+static int ovl_wallpaper_filter(const struct dirent* e) {
+    const char* n = e->d_name;
+    const size_t len = strlen(n);
+    if (len < 6) return 0;
+    return (strcmp(n + len - 5, ".rgba") == 0) ? 1 : 0;
 }
 
 class DropdownSelectorGui : public tsl::Gui {
@@ -1390,7 +1425,10 @@ class DropdownSelectorGui : public tsl::Gui {
         else
             write_theme_defaults(OVL_THEME_FILE);
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlTheme, name, "");
-        load_ovl_theme();
+        // Update the display name immediately so the menu reflects the selection,
+        // but do NOT call load_ovl_theme() — colors are applied on next launch only.
+        strncpy(g_ovl_theme_name, name, sizeof(g_ovl_theme_name) - 1);
+        g_ovl_theme_name[sizeof(g_ovl_theme_name) - 1] = '\0';
     }
 
     // Return from OvlTheme: go back to OverlaySub if m_return_to_submenu,
@@ -1401,6 +1439,52 @@ class DropdownSelectorGui : public tsl::Gui {
                                               SelectorMode::OverlaySub);
         else
             tsl::swapTo<SettingsGui>(m_rom_scroll, m_settings_scroll);
+    }
+
+    // ── OvlWallpaper helpers ─────────────────────────────────────────────────
+    // Apply a wallpaper selection.
+    //   name     — filename stem to store in config (ult::OPTION_SYMBOL = "none").
+    //   srcPath  — full path to copy from, or nullptr when clearing.
+    // Copies the .rgba file into OVL_WALLPAPER_FILE, updates the config key,
+    // refreshes g_ovl_wallpaper_name / g_overlay_wallpaper, and triggers a
+    // wallpaper reload so the new image appears immediately in the overlay.
+    void apply_wallpaper(const char* name, const char* srcPath) {
+        if (srcPath) {
+            // Copy chosen .rgba → active wallpaper slot.
+            copy_file(srcPath, OVL_WALLPAPER_FILE);
+        } else {
+            // "None" selected — remove the active wallpaper file.
+            delete_file(OVL_WALLPAPER_FILE);
+        }
+
+        // Persist the selection name (empty string clears the key).
+        const bool isNone = (!name || name == ult::OPTION_SYMBOL || name[0] == '\0');
+        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlWallpaperName,
+                             isNone ? "" : name);
+
+        // Update runtime state.
+        if (isNone) {
+            g_ovl_wallpaper_name[0] = '\0';
+            g_overlay_wallpaper     = false;
+        } else {
+            strncpy(g_ovl_wallpaper_name, name, sizeof(g_ovl_wallpaper_name) - 1);
+            g_ovl_wallpaper_name[sizeof(g_ovl_wallpaper_name) - 1] = '\0';
+            g_overlay_wallpaper = ult::isFile(OVL_WALLPAPER_FILE);
+        }
+
+        // Reload wallpaper into the renderer if expanded memory allows it.
+        if (ult::expandedMemory) {
+            if (g_overlay_wallpaper)
+                ult::reloadWallpaper();
+            else
+                ult::wallpaperData.clear();  // evict any previously loaded data
+        }
+    }
+
+    // Return from OvlWallpaper: always back to OverlaySub (wallpaper lives there).
+    void do_wallpaper_back() {
+        tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, "Wallpaper",
+                                          SelectorMode::OverlaySub);
     }
 
 public:
@@ -1505,7 +1589,7 @@ public:
                                                         std::string(g_ovl_theme_name));
                 th_item->setClickListener([this](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
-                    tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
+                    tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, "",
                                                      SelectorMode::OvlTheme, true);
                     return true;
                 });
@@ -1513,14 +1597,35 @@ public:
             }
 
             if (ult::expandedMemory) {
-                auto* wallpaper_item = new tsl::elm::ToggleListItem(
-                    "Wallpaper", g_overlay_wallpaper, ult::ON, ult::OFF);
-                wallpaper_item->setStateChangedListener([](bool state) {
-                    g_overlay_wallpaper = state;
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOverlayWallpaper,
-                                         state ? "1" : "0", "");
+                // Current wallpaper name: OPTION_SYMBOL when none is selected.
+                const std::string wpDisplay = g_ovl_wallpaper_name[0]
+                    ? std::string(g_ovl_wallpaper_name)
+                    : ult::OPTION_SYMBOL;
+                auto* wallpaper_item = new tsl::elm::ListItem("Wallpaper", wpDisplay);
+                wallpaper_item->setClickListener([this](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    triggerEnterFeedback();
+                    tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, "Wallpaper",
+                                                      SelectorMode::OvlWallpaper, true);
+                    return true;
                 });
                 list->addItem(wallpaper_item);
+            }
+
+            // Opaque ─────────────────────────────────────────────────────────
+            // When ON, all overlay alpha channels are forced to 15 (fully opaque),
+            // overriding whatever bg_alpha / frame_alpha the theme specifies.
+            // When OFF, theme alpha values are respected as normal.
+            {
+                auto* opaque_item = new tsl::elm::ToggleListItem("Opaque", g_ovl_opaque,
+                                                                   ult::ON, ult::OFF);
+                opaque_item->setStateChangedListener([](bool state) {
+                    g_ovl_opaque = state;
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlOpaque,
+                                         state ? "1" : "0", "");
+                    //load_ovl_theme();  // re-apply theme with updated opacity setting
+                });
+                list->addItem(opaque_item);
             }
 
             if (!m_settings_scroll.empty())
@@ -1583,6 +1688,73 @@ public:
 
             if (!m_settings_scroll.empty())
                 list->jumpToItem(m_settings_scroll, "", true);
+
+        } else if (m_mode == SelectorMode::OvlWallpaper) {
+            // ── Overlay Wallpaper ─────────────────────────────────────────────
+            // Only reachable when ult::expandedMemory is true (guarded at the
+            // call site in OverlaySub).  Lists every .rgba file in
+            // OVL_WALLPAPERS_DIR plus a leading "none" entry (OPTION_SYMBOL).
+            list->addItem(new tsl::elm::CategoryHeader("Wallpaper"));
+
+            // Ensure the wallpapers directory exists so scandir doesn't fail.
+            ult::createDirectory(OVL_WALLPAPERS_DIR);
+
+            const std::string current(g_ovl_wallpaper_name);
+            std::string jumpTarget;
+
+            // "None" entry — clears the wallpaper.
+            {
+                const bool isCurrent = current.empty();
+                if (isCurrent) jumpTarget = ult::OPTION_SYMBOL;
+
+                auto* item = new tsl::elm::SilentListItem(ult::OPTION_SYMBOL);
+                if (isCurrent)
+                    select_item(item);
+                item->setClickListener([this, item](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    apply_wallpaper(nullptr, nullptr);
+                    select_item(item);
+                    triggerEnterFeedback();
+                    do_wallpaper_back();
+                    return true;
+                });
+                list->addItem(item);
+            }
+
+            // .rgba files from OVL_WALLPAPERS_DIR
+            {
+                struct dirent** entries = nullptr;
+                const int n = scandir(OVL_WALLPAPERS_DIR, &entries, ovl_wallpaper_filter, alphasort);
+                for (int i = 0; i < n; ++i) {
+                    const std::string fname{entries[i]->d_name};
+                    free(entries[i]);
+                    entries[i] = nullptr;
+
+                    // Display name: strip the ".rgba" suffix.
+                    const std::string wname = fname.substr(0, fname.size() - 5);
+                    const std::string wpath = std::string(OVL_WALLPAPERS_DIR) + fname;
+
+                    const bool isCurrent = (current == wname);
+                    if (isCurrent && jumpTarget.empty()) jumpTarget = wname;
+
+                    auto* item = new tsl::elm::SilentListItem(wname);
+                    if (isCurrent)
+                        select_item(item);
+                    item->setClickListener([this, item, wname, wpath](u64 keys) -> bool {
+                        if (!(keys & KEY_A)) return false;
+                        apply_wallpaper(wname.c_str(), wpath.c_str());
+                        select_item(item);
+                        triggerEnterFeedback();
+                        do_wallpaper_back();
+                        return true;
+                    });
+                    list->addItem(item);
+                }
+                free(entries);
+            }
+
+            if (!jumpTarget.empty())
+                list->jumpToItem(jumpTarget, "", true);
 
         } else {
             // ── Overlay Theme ─────────────────────────────────────────────────
@@ -1658,6 +1830,9 @@ public:
             switch (m_mode) {
                 case SelectorMode::OvlTheme:
                     do_theme_back();
+                    break;
+                case SelectorMode::OvlWallpaper:
+                    do_wallpaper_back();
                     break;
                 case SelectorMode::WindowedSub:
                     tsl::swapTo<SettingsGui>(m_rom_scroll, std::string("Windowed"));
@@ -1964,14 +2139,23 @@ public:
             list->addItem(qc_item);
         }
 
-        auto* haptics_item = new tsl::elm::ToggleListItem(
-            "In-Game Haptics", g_ingame_haptics, ult::ON, ult::OFF);
-        haptics_item->setStateChangedListener([](bool state) {
-            g_ingame_haptics = state;
-            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyIngameHaptics,
+        auto* btn_haptics_item = new tsl::elm::ToggleListItem(
+            "Button Haptics", g_button_haptics, ult::ON, ult::OFF);
+        btn_haptics_item->setStateChangedListener([](bool state) {
+            g_button_haptics = state;
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyButtonHaptics,
                                  state ? "1" : "0", "");
         });
-        list->addItem(haptics_item);
+        list->addItem(btn_haptics_item);
+
+        auto* touch_haptics_item = new tsl::elm::ToggleListItem(
+            "Touch Haptics", g_touch_haptics, ult::ON, ult::OFF);
+        touch_haptics_item->setStateChangedListener([](bool state) {
+            g_touch_haptics = state;
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyTouchHaptics,
+                                 state ? "1" : "0", "");
+        });
+        list->addItem(touch_haptics_item);
 
         // Restore the previously focused item (empty on first visit or after a game launch).
         if (!m_settings_scroll.empty())
@@ -2353,8 +2537,13 @@ class Overlay : public tsl::Overlay {
     // Non-static: initially<T>() is an inherited non-static member of tsl::Overlay.
     std::unique_ptr<tsl::Gui> launch_overlay_gui(const char* rom_path,
                                                   char*       clear_src = nullptr) {
-        if (ult::expandedMemory)
+        load_ovl_theme();
+        if (ult::expandedMemory) {
+            // Always use the overlay-specific wallpaper slot so the overlay
+            // player never picks up a UI wallpaper from a different path.
+            ult::WALLPAPER_PATH = OVL_WALLPAPER_FILE;
             ult::loadWallpaperFileWhenSafe();
+        }
         safe_copy(g_pending_rom_path, rom_path);
         if (clear_src) clear_src[0] = '\0';
         return initially<GBOverlayGui>();
@@ -2363,7 +2552,7 @@ class Overlay : public tsl::Overlay {
 public:
     void initServices() override {
         tsl::overrideBackButton = true;
-        ult::COPY_BUFFER_SIZE   = 1024*2;
+        //ult::COPY_BUFFER_SIZE   = 1024*2;
 
         // ── Common init (every session type) ─────────────────────────────────
         ult::createDirectory(CONFIG_DIR);
@@ -2400,8 +2589,9 @@ public:
         if (!m_game_session) {
             write_default_config_if_missing();
             write_default_ovl_theme_if_missing();
+            ult::createDirectory(OVL_WALLPAPERS_DIR);
         }
-        load_ovl_theme();
+        
 
         // ── Mode-specific init ────────────────────────────────────────────────
         // g_win_scale_locked is set by setup_windowed_framebuffer() in main()
@@ -2770,6 +2960,7 @@ int main(int argc, char* argv[]) {
     // load_config() only runs later inside initServices().
     // All other sessions need no pre-loop work beyond what Phase 2 already did.
     if (session == SessionType::Windowed) {
+        ult::COPY_BUFFER_SIZE   = 1024*2;
         g_win_1080  = (ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput) == "1080");
         g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
         const std::string wrom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowedRom);
@@ -2792,6 +2983,7 @@ int main(int argc, char* argv[]) {
         setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 
     } else if (session == SessionType::FreeOverlayPlayer) {
+        ult::COPY_BUFFER_SIZE   = 1024*2;
         // Free overlay: 448×OVL_FREE_FB_H framebuffer, windowed-style floating
         // layer sized at 1.5× (= 672×954 VI pixels at 720p).  Setting
         // g_win_scale_locked=true makes Tesla use windowed layer sizing instead

@@ -1168,7 +1168,7 @@ public:
         // so the background app owns HID natively; we must not double-route input.
         if (!m_dragging && !m_plus_dragging && !m_zl_state.pass_through) {
             gb_set_input(keysHeld | keysDown);
-            if (g_ingame_haptics &&
+            if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClick.store(true, std::memory_order_release);
@@ -1321,7 +1321,7 @@ public:
                     m_touch_start_y = ty;
                     m_pos_start_x   = g_win_pos_x;
                     m_pos_start_y   = g_win_pos_y;
-                    triggerNavigationFeedback();  // haptic: drag started
+                    if (g_touch_haptics) triggerNavigationFeedback();  // haptic: drag started
                 }
 
                 if (m_dragging) {
@@ -1352,7 +1352,7 @@ public:
             if (m_prev_touching && !touching) {
                 if (m_dragging) {
                     save_win_pos();        // persist VI coords to config.ini
-                    triggerExitFeedback(); // haptic: position locked
+                    if (g_touch_haptics) triggerExitFeedback(); // haptic: position locked
                     gb_audio_resume();
                     g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                 }
@@ -1390,7 +1390,7 @@ public:
                         m_joy_acc_x     = 0.f;
                         m_joy_acc_y     = 0.f;
                         m_joy_last_ns   = 0;      // will be anchored on first active frame
-                        triggerNavigationFeedback(); // haptic: drag started
+                        if (g_touch_haptics) triggerNavigationFeedback(); // haptic: drag started
                     }
                 }
 
@@ -1449,7 +1449,7 @@ public:
                 if (m_plus_armed) {
                     if (m_plus_dragging) {
                         save_win_pos();        // persist VI coords to config.ini
-                        triggerExitFeedback(); // haptic: position locked
+                        if (g_touch_haptics) triggerExitFeedback(); // haptic: position locked
                         gb_audio_resume();
                         g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                         s_win_dragging  = false;

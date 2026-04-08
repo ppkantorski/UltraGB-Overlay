@@ -40,8 +40,10 @@ static constexpr const char* SAVE_BASE_DIR     = "sdmc:/config/ultragb/saves/";
 static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
 static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
 static constexpr const char* CONFIGURE_DIR     = "sdmc:/config/ultragb/configure/";
-static constexpr const char* OVL_THEMES_DIR    = "sdmc:/config/ultragb/ovl_themes/";
-static constexpr const char* OVL_THEME_FILE    = "sdmc:/config/ultragb/ovl_theme.ini";
+static constexpr const char* OVL_THEMES_DIR     = "sdmc:/config/ultragb/ovl_themes/";
+static constexpr const char* OVL_THEME_FILE     = "sdmc:/config/ultragb/ovl_theme.ini";
+static constexpr const char* OVL_WALLPAPERS_DIR = "sdmc:/config/ultragb/ovl_wallpapers/";
+static constexpr const char* OVL_WALLPAPER_FILE = "sdmc:/config/ultragb/ovl_wallpaper.rgba";
 
 static constexpr size_t PATH_BUFFER_SIZE = 128;
 static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
@@ -80,8 +82,9 @@ static const std::string kKeyGameVolume    {"game_volume"};
 static const std::string kKeyGameVolBackup {"game_vol_backup"};
 static const std::string kKeyLcdGrid       {"lcd_grid"};
 static const std::string kKeyWindowed      {"windowed"};
-static const std::string kKeyIngameHaptics {"ingame_haptics"};
-static const std::string kKeyOverlayWallpaper{"overlay_wallpaper"};
+static const std::string kKeyButtonHaptics    {"button_haptics"};
+static const std::string kKeyTouchHaptics     {"touch_haptics"};
+static const std::string kKeyOvlWallpaperName {"ovl_wallpaper"};
 static const std::string kKeyWinPosX       {"win_pos_x"};
 static const std::string kKeyWinPosY       {"win_pos_y"};
 static const std::string kKeyWinScale      {"win_scale"};
@@ -94,6 +97,7 @@ static const std::string kKeyOvlTheme     {"ovl_theme"};     // selected overlay
 static const std::string kKeyOvlFreeMode  {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
 static const std::string kKeyOvlFreePosX  {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
 static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
+static const std::string kKeyOvlOpaque    {"ovl_opaque"};       // 0=theme alpha (default), 1=force all alpha to 15
 
 // =============================================================================
 // ROM size thresholds
@@ -133,9 +137,12 @@ static u8 g_game_vol_backup = 30;
 // ── Windowed mode ─────────────────────────────────────────────────────────────
 // When true the ROM selector relaunches this overlay with -windowed <path>,
 // rendering the Game Boy screen as a small draggable window with no UI chrome.
-static bool g_windowed_mode    = false;
-static bool g_ingame_haptics   = true;
-static bool g_overlay_wallpaper = false;  // off by default; only relevant when expandedMemory is true
+static bool g_windowed_mode     = false;
+static bool g_button_haptics    = false;  // controller button presses; off by default
+static bool g_touch_haptics     = false;  // screen touch (virtual d-pad/buttons, repositioning); off by default
+static bool g_ovl_opaque        = false;  // when true, all overlay alpha channels are forced to 15 (fully opaque)
+static bool g_overlay_wallpaper = false;  // derived: true when a wallpaper file is selected + file exists
+static char g_ovl_wallpaper_name[64] = {};  // selected wallpaper filename stem (empty = none)
 
 // Set true by main() when the overlay is relaunched with the -returning argument.
 // Read and cleared in Overlay::initServices() to restore the settings scroll position.
@@ -325,11 +332,14 @@ static constexpr int SELECT_DRAW_Y = START_DRAW_Y;
 // to 000000/D — not baked in here so toggling wallpaper takes effect live.
 //
 // Defaults: bg black/alpha-13, buttons+border #333333 (GBC-style dark grey).
-// MUST be declared before VBTN_COLOR which references g_ovl_btn_col.
 // =============================================================================
 static char       g_ovl_theme_name[64] = "default";
 static tsl::Color g_ovl_bg_col    {0x0, 0x0, 0x0, 0xD};  // bg_color + bg_alpha
-static tsl::Color g_ovl_btn_col   {0x3, 0x3, 0x3, 0xF};  // button_color — applied to glyphs
+static tsl::Color g_ovl_dpad_col  {0x3, 0x3, 0x3, 0xF};  // dpad_button_color
+static tsl::Color g_ovl_abtn_col  {0x3, 0x3, 0x3, 0xF};  // a_button_color
+static tsl::Color g_ovl_bbtn_col  {0x3, 0x3, 0x3, 0xF};  // b_button_color
+static tsl::Color g_ovl_start_col {0x3, 0x3, 0x3, 0xF};  // start_button_color
+static tsl::Color g_ovl_select_col{0x3, 0x3, 0x3, 0xF};  // select_button_color
 static tsl::Color g_ovl_bdr_col   {0x3, 0x3, 0x3, 0xF};  // border_color
 static uint16_t   g_ovl_bg_packed = 0xD000u;              // packed RGBA4444 for direct-fb writes
 
@@ -347,9 +357,8 @@ static uint16_t   g_ovl_frame_packed = 0xE111u;  // packed RGBA4444; recomputed 
 // rendered inside the letterbox.  Default: white {0xF,0xF,0xF,0xF}.
 static tsl::Color g_ovl_text_col {0xF, 0xF, 0xF, 0xF};
 
-// Button glyph color — driven by active overlay theme (button_color key).
+// Per-button glyph colors — driven by active overlay theme.
 // BK (the backing shapes behind glyphs) is separate, driven by backdrop_color.
-static const tsl::Color& VBTN_COLOR = g_ovl_btn_col;
 
 // Hit-test centres, populated on first draw from getTextDimensions().
 static int   g_dpad_hx       = DPAD_DRAW_X  + DPAD_SIZE  / 2;
@@ -363,7 +372,7 @@ static int   g_start_hy      = START_DRAW_Y - START_SIZE  / 2;
 static int   g_select_hx     = SELECT_DRAW_X + SELECT_SIZE / 2;
 static int   g_select_hy     = SELECT_DRAW_Y - SELECT_SIZE / 2;
 static bool  g_btns_measured = false;
-static int   g_div_half_w    = 0;
+//static int   g_div_half_w    = 0;
 static float g_dpad_glyph_w  = 0.f;
 static float g_dpad_glyph_h  = 0.f;
 
