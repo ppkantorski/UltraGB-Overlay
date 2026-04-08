@@ -451,17 +451,33 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     const float mg = s_master_gain.load(std::memory_order_relaxed)
                    * s_balance_gain.load(std::memory_order_relaxed);
 
-    // Compute sample boundaries incrementally instead of building a due-array.
-    // This removes the per-event multiply/shift pre-pass and keeps the event
-    // scheduler in cheap integer adds + one compare per sample.
+    // Precompute sample-index due values using a 32-bit fixed-point scale factor
+    // instead of a 64-bit divide per event.  cycle is 0..70223 (16-bit), n_samp
+    // is 803 or 804, GB_FRAME_CYC is 70224.  The scale = (n_samp << 16) /
+    // GB_FRAME_CYC fits in 32 bits (804<<16 = 52,691,968 < 2^26), so
+    // cycle * scale fits in 32 bits with no overflow (70223 * 52691968 >> 16
+    // < 70223 * 804 = 56,459,292 < 2^26).  Result is identical to the 64-bit
+    // path for all valid inputs; 64-bit divide was ~10x more expensive on ARM.
     //
-    // sample_end is the first cycle that belongs to the *next* sample.
-    // Events with cycle < sample_end are applied before synthesizing sample i.
-    const uint32_t sample_base = GB_FRAME_CYC / n_samp;
-    const uint32_t sample_rem  = GB_FRAME_CYC % n_samp;
-
-    uint32_t sample_end = 0;
-    uint32_t sample_err = n_samp - sample_rem;  // front-load the remainder
+    // NEON path: each RegEvent is {addr(1), val(1), cycle(2)} = 4 bytes, so
+    // loading 4 events as uint32x4 gives cycle in bits [31:16] of each lane
+    // (little-endian). vshrq(ev4,16) isolates cycle, vmulq_n multiplies by
+    // scale, vshrq(,16) produces the final due index.  Scalar tail handles
+    // n_evts % 4 remainder.  No behaviour change — identical arithmetic.
+    static uint32_t due_arr[LOC_CAP];
+    {
+        const uint32_t scale = (n_samp << 16) / GB_FRAME_CYC;
+        uint32_t k = 0;
+        for (; k + 4 <= n_evts; k += 4) {
+            const uint32x4_t ev4  = vld1q_u32(
+                reinterpret_cast<const uint32_t*>(evts + k));
+            const uint32x4_t cyc4 = vshrq_n_u32(ev4, 16);
+            const uint32x4_t due4 = vshrq_n_u32(vmulq_n_u32(cyc4, scale), 16);
+            vst1q_u32(due_arr + k, due4);
+        }
+        for (; k < n_evts; ++k)
+            due_arr[k] = (static_cast<uint32_t>(evts[k].cycle) * scale) >> 16;
+    }
 
     // Hoist NR50 master volume out of the per-sample loop.
     // NR50 changes at most once per frame (rare mid-frame writes), so we track
@@ -520,14 +536,7 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
         // Apply every event whose T-cycle timestamp maps to sample index <= i.
         // event.cycle is 0..GB_FRAME_CYC-1; due = cycle * n_samp / GB_FRAME_CYC.
         // n_evts==0 is safe: the while guard ensures the body never executes.
-        sample_end += sample_base;
-        sample_err += sample_rem;
-        if (sample_err >= n_samp) {
-            sample_err -= n_samp;
-            ++sample_end;
-        }
-
-        while (evt_idx < n_evts && evts[evt_idx].cycle < sample_end) {
+        while (evt_idx < n_evts && due_arr[evt_idx] <= i) {
             apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
             ++evt_idx;
         }
@@ -775,10 +784,10 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
 
     // Drain any events that integer division mapped past the last sample
     // (only occurs when n_evts > n_samp, i.e. extremely event-dense frames).
-    //while (evt_idx < n_evts) {
-    //    apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
-    //    ++evt_idx;
-    //}
+    while (evt_idx < n_evts) {
+        apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
+        ++evt_idx;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

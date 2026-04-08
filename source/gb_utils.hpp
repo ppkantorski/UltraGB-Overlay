@@ -192,6 +192,31 @@ static void __attribute__((optimize("O3"))) process_zl_pass_through(bool zl_down
 }
 
 // =============================================================================
+// process_home_foreground_release
+//
+// Companion to process_zl_pass_through.  Call once per update() frame in both
+// GBOverlayGui and GBWindowedGui, right after process_zl_pass_through.
+//
+// Consumes tsl::homeButtonPressedInGame (set by Tesla's background poller when
+// the home button fires during a game session where normal hiding is suppressed).
+// If foreground is currently held (!st.pass_through), releases it and triggers
+// the same red-flash border as the ZL double-click-hold release path, so the
+// user gets clear visual feedback that HID has been handed back to the system.
+// No-op when foreground is already released or the flag is not set.
+// =============================================================================
+[[gnu::noinline]]
+static void process_home_foreground_release(ZLPassThroughState& st) {
+    if (!tsl::homeButtonPressedInGame.exchange(false, std::memory_order_acq_rel))
+        return;
+    if (!st.pass_through) {           // currently holding foreground — release it
+        st.pass_through = true;
+        tsl::hlp::requestForeground(false);
+        g_focus_flash_red = true;
+        g_focus_flash     = 45;
+    }
+}
+
+// =============================================================================
 // run_once_setup
 //
 // One-time per-session setup called from update() on the first tick of both

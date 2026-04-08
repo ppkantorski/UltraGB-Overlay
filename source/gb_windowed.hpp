@@ -1185,6 +1185,7 @@ public:
             const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
             const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
             process_zl_pass_through(zl_down, zl_held, m_zl_state);
+            process_home_foreground_release(m_zl_state);
         }
 
         // ── Right/Left stick click: resize window ────────────────────────────

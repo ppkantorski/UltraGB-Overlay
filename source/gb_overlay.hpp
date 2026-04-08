@@ -815,6 +815,7 @@ public:
             const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
             const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
             process_zl_pass_through(zl_down, zl_held, m_zl_state);
+            process_home_foreground_release(m_zl_state);
         }
 
         // ── Touch → virtual button state ──────────────────────────────────────
