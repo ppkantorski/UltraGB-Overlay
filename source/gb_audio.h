@@ -451,33 +451,17 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     const float mg = s_master_gain.load(std::memory_order_relaxed)
                    * s_balance_gain.load(std::memory_order_relaxed);
 
-    // Precompute sample-index due values using a 32-bit fixed-point scale factor
-    // instead of a 64-bit divide per event.  cycle is 0..70223 (16-bit), n_samp
-    // is 803 or 804, GB_FRAME_CYC is 70224.  The scale = (n_samp << 16) /
-    // GB_FRAME_CYC fits in 32 bits (804<<16 = 52,691,968 < 2^26), so
-    // cycle * scale fits in 32 bits with no overflow (70223 * 52691968 >> 16
-    // < 70223 * 804 = 56,459,292 < 2^26).  Result is identical to the 64-bit
-    // path for all valid inputs; 64-bit divide was ~10x more expensive on ARM.
+    // Compute sample boundaries incrementally instead of building a due-array.
+    // This removes the per-event multiply/shift pre-pass and keeps the event
+    // scheduler in cheap integer adds + one compare per sample.
     //
-    // NEON path: each RegEvent is {addr(1), val(1), cycle(2)} = 4 bytes, so
-    // loading 4 events as uint32x4 gives cycle in bits [31:16] of each lane
-    // (little-endian). vshrq(ev4,16) isolates cycle, vmulq_n multiplies by
-    // scale, vshrq(,16) produces the final due index.  Scalar tail handles
-    // n_evts % 4 remainder.  No behaviour change — identical arithmetic.
-    static uint32_t due_arr[LOC_CAP];
-    {
-        const uint32_t scale = (n_samp << 16) / GB_FRAME_CYC;
-        uint32_t k = 0;
-        for (; k + 4 <= n_evts; k += 4) {
-            const uint32x4_t ev4  = vld1q_u32(
-                reinterpret_cast<const uint32_t*>(evts + k));
-            const uint32x4_t cyc4 = vshrq_n_u32(ev4, 16);
-            const uint32x4_t due4 = vshrq_n_u32(vmulq_n_u32(cyc4, scale), 16);
-            vst1q_u32(due_arr + k, due4);
-        }
-        for (; k < n_evts; ++k)
-            due_arr[k] = (static_cast<uint32_t>(evts[k].cycle) * scale) >> 16;
-    }
+    // sample_end is the first cycle that belongs to the *next* sample.
+    // Events with cycle < sample_end are applied before synthesizing sample i.
+    const uint32_t sample_base = GB_FRAME_CYC / n_samp;
+    const uint32_t sample_rem  = GB_FRAME_CYC % n_samp;
+
+    uint32_t sample_end = 0;
+    uint32_t sample_err = n_samp - sample_rem;  // front-load the remainder
 
     // Hoist NR50 master volume out of the per-sample loop.
     // NR50 changes at most once per frame (rare mid-frame writes), so we track
@@ -506,47 +490,63 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     // frequency as the existing cached_nr51 dirty check.
     float32x4_t v_nr51_l, v_nr51_r;
 
-    const auto build_nr51_masks = [&](const uint8_t nr51) {
-        const float lm[4] = {
-            (nr51 & 0x10u) ? 1.0f : 0.0f,  // CH1 → L
-            (nr51 & 0x20u) ? 1.0f : 0.0f,  // CH2 → L
-            (nr51 & 0x40u) ? 1.0f : 0.0f,  // CH3 → L
-            (nr51 & 0x80u) ? 1.0f : 0.0f   // CH4 → L
+    // build_nr51_masks — construct NEON pan-mask vectors with lv, rv, MIX_SCALE,
+    // and mg pre-multiplied in.  This moves 4 fmuls/sample out of the hot loop
+    // (lv×, rv×, MIX_SCALE×, mg×) into this rebuild, which fires at most once
+    // per frame in the common case.  Also eliminates the two stack float[4]
+    // arrays and their vld1q_f32 round-trips: vcvtq_f32_u32 operates entirely
+    // in registers.  l_scale = lv×MIX_SCALE×mg, r_scale = rv×MIX_SCALE×mg.
+    const auto build_nr51_masks = [&](const uint8_t nr51, float l_scale, float r_scale) {
+        // Extract bits 4-7 (L routing) and bits 0-3 (R routing) as 0/1 uint32
+        // lanes, then convert to float and scale in one vmulq_n_f32 each.
+        // GCC at -O3 synthesises the uint32x4_t initialisers as lane inserts.
+        const uint32x4_t l_bits = {
+            (nr51 >> 4) & 1u, (nr51 >> 5) & 1u,  // CH1, CH2 → L
+            (nr51 >> 6) & 1u, (nr51 >> 7) & 1u   // CH3, CH4 → L
         };
-        const float rm[4] = {
-            (nr51 & 0x01u) ? 1.0f : 0.0f,  // CH1 → R
-            (nr51 & 0x02u) ? 1.0f : 0.0f,  // CH2 → R
-            (nr51 & 0x04u) ? 1.0f : 0.0f,  // CH3 → R
-            (nr51 & 0x08u) ? 1.0f : 0.0f   // CH4 → R
+        const uint32x4_t r_bits = {
+            (nr51 >> 0) & 1u, (nr51 >> 1) & 1u,  // CH1, CH2 → R
+            (nr51 >> 2) & 1u, (nr51 >> 3) & 1u   // CH3, CH4 → R
         };
-        v_nr51_l = vld1q_f32(lm);
-        v_nr51_r = vld1q_f32(rm);
+        v_nr51_l = vmulq_n_f32(vcvtq_f32_u32(l_bits), l_scale);
+        v_nr51_r = vmulq_n_f32(vcvtq_f32_u32(r_bits), r_scale);
     };
-    build_nr51_masks(cached_nr51);   // prime masks for the first sample
+    build_nr51_masks(cached_nr51,
+                     lv * MIX_SCALE * mg,
+                     rv * MIX_SCALE * mg);   // prime masks for the first sample
 
     for (uint32_t i=0; i<n_samp; ++i) {
         // ── Cycle-accurate event distribution ────────────────────────────────
         // Apply every event whose T-cycle timestamp maps to sample index <= i.
         // event.cycle is 0..GB_FRAME_CYC-1; due = cycle * n_samp / GB_FRAME_CYC.
         // n_evts==0 is safe: the while guard ensures the body never executes.
-        while (evt_idx < n_evts && due_arr[evt_idx] <= i) {
+        sample_end += sample_base;
+        sample_err += sample_rem;
+        if (sample_err >= n_samp) {
+            sample_err -= n_samp;
+            ++sample_end;
+        }
+
+        while (evt_idx < n_evts && evts[evt_idx].cycle < sample_end) {
             apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
             ++evt_idx;
         }
 
         // NR50 master volume — update cached floats only when NR50 actually changed
         // (covers the rare mid-frame NR50 write injected by the event loop above).
+        // Also rebuilds the pan masks since lv/rv are folded into them.
         if (__builtin_expect(a.nr50 != cached_nr50, 0)) {
             cached_nr50 = a.nr50;
             lv = static_cast<float>(((cached_nr50 >> 4) & 7) + 1);
             rv = static_cast<float>(( cached_nr50        & 7) + 1);
+            build_nr51_masks(cached_nr51, lv * MIX_SCALE * mg, rv * MIX_SCALE * mg);
         }
 
         // NR51 panning — update cached byte only when NR51 actually changed
         // (covers the rare mid-frame NR51 write injected by the event loop above).
         if (__builtin_expect(a.nr51 != cached_nr51, 0)) {
             cached_nr51 = a.nr51;
-            build_nr51_masks(cached_nr51);  // rebuild pan masks on mid-frame NR51 write
+            build_nr51_masks(cached_nr51, lv * MIX_SCALE * mg, rv * MIX_SCALE * mg);
         }
 
         a.cycle_frac+=STEP;
@@ -751,24 +751,34 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             const float32x4_t h_new = vfmaq_f32(vmulq_f32(v_HP_C, d_v), v_HP_R, hp_v);
             const float32x4_t d_out = vsubq_f32(d_v, h_new);
             vst1q_f32(a.hp_ch, h_new);
-            // Stereo mix: dot(d_out, pan_mask) * master_volume
-            ls = vaddvq_f32(vmulq_f32(d_out, v_nr51_l)) * lv;
-            rs = vaddvq_f32(vmulq_f32(d_out, v_nr51_r)) * rv;
+            // Stereo mix: dot(d_out, pan_mask).
+            // lv, rv, MIX_SCALE, and mg are pre-multiplied into v_nr51_l/r;
+            // ls/rs come out already in int16 scale — no further multiply needed.
+            ls = vaddvq_f32(vmulq_f32(d_out, v_nr51_l));
+            rs = vaddvq_f32(vmulq_f32(d_out, v_nr51_r));
         }
 
-        // ── Scale, clamp, write ──────────────────────────────────────────────
-        // DC removed per-channel above; no combined-mix HP needed.
-        const float sl=ls*MIX_SCALE*mg, sr=rs*MIX_SCALE*mg;
-        *dst++=sl> 32767.f? 32767:sl<-32767.f?-32767:static_cast<int16_t>(sl);
-        *dst++=sr> 32767.f? 32767:sr<-32767.f?-32767:static_cast<int16_t>(sr);
+        // ── Saturate and write — NEON narrowing ─────────────────────────────
+        // lv, rv, MIX_SCALE, mg are folded into v_nr51_l/r so ls/rs are already
+        // in int16 scale.  vcvt_s32_f32 is safe — worst-case magnitude is
+        // 4 ch × NR50_max 8 × balance_max 8 × MIX_SCALE 900 ≈ 230 400, well
+        // inside int32.  vqmovn_s32 saturates to int16 in one instruction,
+        // replacing the four float comparisons of the ternary clamp path.
+        {
+            const float32x2_t v_lr   = {ls, rs};
+            const int32x2_t   i_lr   = vcvt_s32_f32(v_lr);
+            const int16x4_t   s16_lr = vqmovn_s32(vcombine_s32(i_lr, vdup_n_s32(0)));
+            *dst++ = vget_lane_s16(s16_lr, 0);
+            *dst++ = vget_lane_s16(s16_lr, 1);
+        }
     }
 
     // Drain any events that integer division mapped past the last sample
     // (only occurs when n_evts > n_samp, i.e. extremely event-dense frames).
-    while (evt_idx < n_evts) {
-        apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
-        ++evt_idx;
-    }
+    //while (evt_idx < n_evts) {
+    //    apply_reg(a, evts[evt_idx].addr, evts[evt_idx].val);
+    //    ++evt_idx;
+    //}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -912,14 +922,28 @@ static void gb_audio_thread_fn(void*) {
         apply_reg(local, 0x25, s_ctrl.regs[0x15]);
         
         // --- Channels 1-4 registers ---
-        struct { uint8_t addr; uint8_t mask; } ch_regs[] = {
-            {0x10,0xFF},{0x11,0xFF},{0x12,0xFF},{0x13,0xFF},{0x14,0x7F},  // CH1
-            {0x16,0xFF},{0x17,0xFF},{0x18,0xFF},{0x19,0x7F},              // CH2
-            {0x1A,0xFF},{0x1B,0xFF},{0x1C,0xFF},{0x1D,0xFF},{0x1E,0x7F},  // CH3
-            {0x20,0xFF},{0x21,0xFF},{0x22,0xFF},{0x23,0x7F}               // CH4
-        };
-        for(auto &r : ch_regs)
-            apply_reg(local, r.addr, s_ctrl.regs[r.addr - 0x10] & r.mask);
+        // Direct calls are faster than building a temporary table and looping it.
+        apply_reg(local, 0x10, s_ctrl.regs[0x00]);
+        apply_reg(local, 0x11, s_ctrl.regs[0x01]);
+        apply_reg(local, 0x12, s_ctrl.regs[0x02]);
+        apply_reg(local, 0x13, s_ctrl.regs[0x03]);
+        apply_reg(local, 0x14, s_ctrl.regs[0x04] & 0x7Fu);  // CH1
+
+        apply_reg(local, 0x16, s_ctrl.regs[0x06]);
+        apply_reg(local, 0x17, s_ctrl.regs[0x07]);
+        apply_reg(local, 0x18, s_ctrl.regs[0x08]);
+        apply_reg(local, 0x19, s_ctrl.regs[0x09] & 0x7Fu);  // CH2
+
+        apply_reg(local, 0x1A, s_ctrl.regs[0x0A]);
+        apply_reg(local, 0x1B, s_ctrl.regs[0x0B]);
+        apply_reg(local, 0x1C, s_ctrl.regs[0x0C]);
+        apply_reg(local, 0x1D, s_ctrl.regs[0x0D]);
+        apply_reg(local, 0x1E, s_ctrl.regs[0x0E] & 0x7Fu);  // CH3
+
+        apply_reg(local, 0x20, s_ctrl.regs[0x10]);
+        apply_reg(local, 0x21, s_ctrl.regs[0x11]);
+        apply_reg(local, 0x22, s_ctrl.regs[0x12]);
+        apply_reg(local, 0x23, s_ctrl.regs[0x13] & 0x7Fu);  // CH4
         
         // --- Wave RAM 0x30–0x3F ---
         for(uint8_t r = 0x30; r <= 0x3F; ++r)

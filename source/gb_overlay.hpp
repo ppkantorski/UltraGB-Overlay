@@ -43,8 +43,8 @@
 // Increments the display-frame counter and rate-limits the GB CPU to its
 // true 59.73 fps clock regardless of the 60 fps display vsync.
 // See GBOverlayElement::draw() for the full timing rationale.
-#ifndef GB_TICK_FRAME_DEFINED
-#define GB_TICK_FRAME_DEFINED
+//#ifndef GB_TICK_FRAME_DEFINED
+//#define GB_TICK_FRAME_DEFINED
 inline void __attribute__((optimize("O3"))) gb_tick_frame() {
     ++g_frame_count;
     struct timespec ts;
@@ -64,7 +64,7 @@ inline void __attribute__((optimize("O3"))) gb_tick_frame() {
             g_gb_frame_next_ns = now_ns + GB_RENDER_FRAME_NS;
     }
 }
-#endif
+//#endif
 
 // Set true by GBOverlayGui::handleInput while a free-overlay touch-drag or
 // joystick reposition is active.  Read by GBOverlayElement::draw to overlay
@@ -158,7 +158,7 @@ public:
         // Fall back to the configured theme colour whenever wallpaper cannot
         // render (empty data, wrong frame size, refresh pending, free mode).
         const tsl::Color effBg  = wallpaperWillRender
-            ? tsl::Color{0x0, 0x0, 0x0, 0xD} : g_ovl_bg_col;
+            ? tsl::Color{0x0, 0x0, 0x0, g_ovl_bg_col.a} : g_ovl_bg_col;
         const tsl::Color aEffBg = renderer->a(effBg);
         if (!wallpaperWillRender) {
             renderer->fillScreen(aEffBg);
@@ -328,27 +328,23 @@ public:
                 gb_tick_frame();
         }
 
-        render_gb_letterbox(renderer);
-        // Theme-aware letterbox override: always use g_ovl_frame_packed (frame_color +
+        // Theme-aware letterbox fill: always use g_ovl_frame_col (frame_color +
         // frame_alpha keys) — even when wallpaper is active the frame color applies.
-        // renderer->a() is applied here (not at load time) so opacity fade, opaque-
-        // screenshot mode, and disableTransparency are all respected.  The adjusted
-        // color is packed once and shared across all four fill calls — no per-pixel cost.
+        // renderer->a() applied here so opacity, screenshot mode, and
+        // disableTransparency are all respected.
+        // frame_packed is computed ONCE and passed directly to render_gb_letterbox
+        // so the four fill bands are written in a single pass — no redundant write.
         // After filling, zero the R=10 outer corners of the 400×360 letterbox rectangle
         // so the wallpaper/background shows through — same rounding style as the outer
         // overlay window's top corners.  Inner corners (game screen edge) stay square.
         {
-            static constexpr int ix = 40, iy = 36, iw = 320, ih = 288;
-            const tsl::Color    fc           = renderer->a(g_ovl_frame_col);
-            const uint16_t      frame_packed = static_cast<uint16_t>(
+            const tsl::Color fc = renderer->a(g_ovl_frame_col);
+            const uint16_t frame_packed = static_cast<uint16_t>(
                 static_cast<uint16_t>(fc.r)        |
                 (static_cast<uint16_t>(fc.g) <<  4) |
                 (static_cast<uint16_t>(fc.b) <<  8) |
                 (static_cast<uint16_t>(fc.a) << 12));
-            fill_letterbox_rect(fb16, 0,       ix,       0,       VP_H, frame_packed);
-            fill_letterbox_rect(fb16, ix + iw, VP_W,     0,       VP_H, frame_packed);
-            fill_letterbox_rect(fb16, ix,      ix + iw,  0,       iy,   frame_packed);
-            fill_letterbox_rect(fb16, ix,      ix + iw,  iy + ih, VP_H, frame_packed);
+            render_gb_letterbox(renderer, frame_packed);
             fill_vp_corners_448(fb16, pre_wp_bg);
         }
         render_gb_screen(renderer);
@@ -598,9 +594,9 @@ public:
         // with count divided by actual elapsed nanoseconds so a window that ran
         // slightly over 1 s doesn't erroneously show 61 fps.
         {
-            static uint64_t s_fps_win_start = 0;   // ns timestamp of window open
-            static int       s_fps_frame_cnt = 0;   // frames counted this second
-            static int       s_fps_display   = 0;   // last completed 1 s measurement
+            static uint64_t s_fps_win_start   = 0;   // ns timestamp of window open
+            static int      s_fps_frame_cnt   = 0;   // frames counted this second
+            static int      s_fps_display_x10 = 0;   // last completed 1 s measurement ×10
 
             const uint64_t now = ult::nowNs();
             if (s_fps_win_start == 0) s_fps_win_start = now;
@@ -608,23 +604,37 @@ public:
             ++s_fps_frame_cnt;
             if (now - s_fps_win_start >= 1'000'000'000ULL) {
                 const uint64_t elapsed = now - s_fps_win_start;
-                s_fps_display   = static_cast<int>(
-                    static_cast<uint64_t>(s_fps_frame_cnt) * 1'000'000'000ULL / elapsed);
+                s_fps_display_x10 = static_cast<int>(
+                    (static_cast<uint64_t>(s_fps_frame_cnt) * 10ULL * 1'000'000'000ULL + elapsed / 2ULL) / elapsed);
                 s_fps_frame_cnt = 0;
                 s_fps_win_start = now;
             }
 
-            // Stack-only integer formatter — no heap, no <cstdio> overhead.
+            // Stack-only fixed-point formatter — no heap, no <cstdio> overhead.
+            // Formats:
+            //   6.0
+            //  59.7
+            // 100.0
             char buf[8];
-            int  v   = s_fps_display;
-            int  len = 0;
-            if      (v >= 100) { buf[len++] = '0' + v / 100; v %= 100;
-                                  buf[len++] = '0' + v / 10;
-                                  buf[len++] = '0' + v % 10; }
-            else if (v >=  10) { buf[len++] = '0' + v / 10;
-                                  buf[len++] = '0' + v % 10; }
-            else                { buf[len++] = '0' + v; }
-            buf[len] = '\0';
+            int  v     = s_fps_display_x10;
+            int  whole = v / 10;
+            int  frac  = v % 10;
+            int  len   = 0;
+
+            if (whole >= 100) {
+                buf[len++] = '0' + whole / 100;
+                whole %= 100;
+                buf[len++] = '0' + whole / 10;
+                buf[len++] = '0' + whole % 10;
+            } else if (whole >= 10) {
+                buf[len++] = '0' + whole / 10;
+                buf[len++] = '0' + whole % 10;
+            } else {
+                buf[len++] = '0' + whole;
+            }
+            buf[len++] = '.';
+            buf[len++] = '0' + frac;
+            buf[len]   = '\0';
 
             // Font size: fixed 10 px — the overlay viewport is always the same
             // physical size (400×360) regardless of handheld vs docked, so a
@@ -758,7 +768,7 @@ public:
         run_once_setup(runOnce, m_restoreHapticState);
     }
 
-    virtual bool handleInput(u64 keysDown, u64 keysHeld,
+    virtual __attribute__((optimize("O3"))) bool handleInput(u64 keysDown, u64 keysHeld,
                              const HidTouchState& touchPos,
                              HidAnalogStickState leftJoy,
                              HidAnalogStickState rightJoy) override {

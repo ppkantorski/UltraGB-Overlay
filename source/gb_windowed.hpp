@@ -795,7 +795,7 @@ public:
 #ifdef GB_FPS
         // ── FPS indicator ─────────────────────────────────────────────────────
         // Counts display frames rendered in the past second and overlays the
-        // result as a small integer in the top-left corner of the game window.
+        // result as a small decimal in the top-left corner of the game window.
         //
         // Compiled in ONLY when -DGB_FPS is supplied to the build; the #ifdef
         // guarantees zero code, zero data, and zero runtime cost in production.
@@ -805,9 +805,9 @@ public:
         // Font size grows linearly with g_win_scale (8 px at 1×, 18 px at 5×)
         // so the label is always legible without overflowing a narrow window.
         {
-            static uint64_t s_fps_win_start  = 0;   // ns timestamp of window open
-            static int       s_fps_frame_cnt  = 0;   // frames counted this second
-            static int       s_fps_display    = 0;   // last completed 1 s measurement
+            static uint64_t s_fps_win_start   = 0;   // ns timestamp of window open
+            static int      s_fps_frame_cnt   = 0;   // frames counted this second
+            static int      s_fps_display_x10 = 0;   // last completed 1 s measurement ×10
 
             const uint64_t now = ult::nowNs();
             if (s_fps_win_start == 0) s_fps_win_start = now;
@@ -815,25 +815,40 @@ public:
             ++s_fps_frame_cnt;
             if (now - s_fps_win_start >= 1'000'000'000ULL) {
                 // Divide by actual elapsed ns, not a nominal 1 s, so a window
-                // that ran 1.017 s with 61 ticks still resolves to 60 fps.
+                // that ran 1.017 s with 61 ticks still resolves to ~60.0 fps.
+                // Store FPS × 10 for one decimal place without using floats.
                 const uint64_t elapsed = now - s_fps_win_start;
-                s_fps_display   = static_cast<int>(
-                    static_cast<uint64_t>(s_fps_frame_cnt) * 1'000'000'000ULL / elapsed);
+                s_fps_display_x10 = static_cast<int>(
+                    (static_cast<uint64_t>(s_fps_frame_cnt) * 10ULL * 1'000'000'000ULL + elapsed / 2ULL) / elapsed);
                 s_fps_frame_cnt = 0;
                 s_fps_win_start = now;
             }
 
-            // Stack-only integer formatter — no heap, no <cstdio> overhead.
+            // Stack-only fixed-point formatter — no heap, no <cstdio> overhead.
+            // Formats:
+            //   6.0
+            //  59.7
+            // 100.0
             char buf[8];
-            int  v   = s_fps_display;
-            int  len = 0;
-            if      (v >= 100) { buf[len++] = '0' + v / 100; v %= 100;
-                                  buf[len++] = '0' + v / 10;
-                                  buf[len++] = '0' + v % 10; }
-            else if (v >=  10) { buf[len++] = '0' + v / 10;
-                                  buf[len++] = '0' + v % 10; }
-            else                { buf[len++] = '0' + v; }
-            buf[len] = '\0';
+            int  v     = s_fps_display_x10;
+            int  whole = v / 10;
+            int  frac  = v % 10;
+            int  len   = 0;
+
+            if (whole >= 100) {
+                buf[len++] = '0' + whole / 100;
+                whole %= 100;
+                buf[len++] = '0' + whole / 10;
+                buf[len++] = '0' + whole % 10;
+            } else if (whole >= 10) {
+                buf[len++] = '0' + whole / 10;
+                buf[len++] = '0' + whole % 10;
+            } else {
+                buf[len++] = '0' + whole;
+            }
+            buf[len++] = '.';
+            buf[len++] = '0' + frac;
+            buf[len]   = '\0';
 
             // Font size: 8 px at scale 1, +2 px per scale step (18 px at scale 5).
             const s32 font_sz = 6 + g_win_scale * 2;
@@ -882,7 +897,7 @@ public:
     ~GBWindowedFrame() override { delete m_content; }
 
     // ── Rendering ─────────────────────────────────────────────────────────────
-    void draw(tsl::gfx::Renderer* renderer) override {
+    void __attribute__((optimize("O3"))) draw(tsl::gfx::Renderer* renderer) override {
         // No chrome.  Just render the game element.
         if (m_content) m_content->frame(renderer);
     }
@@ -1076,7 +1091,7 @@ public:
     }
 
     // ── handleInput ──────────────────────────────────────────────────────────
-    bool handleInput(u64 keysDown, u64 keysHeld,
+    bool __attribute__((optimize("O3"))) handleInput(u64 keysDown, u64 keysHeld,
                      const HidTouchState& /*touchPos*/,  // ignored — we poll HID directly
                      HidAnalogStickState leftJoy, HidAnalogStickState) override {
 
