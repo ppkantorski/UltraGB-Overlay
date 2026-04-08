@@ -366,7 +366,8 @@ static float __attribute__((optimize("O3"))) joy_sens(float fx, float fy) {
 // =============================================================================
 [[gnu::noinline]]
 static bool __attribute__((optimize("O3"))) draw_focus_flash(tsl::gfx::Renderer* renderer,
-                              s32 x0, s32 y0, s32 w, s32 h) {
+                              s32 x0, s32 y0, s32 w, s32 h,
+                              bool rounded = false) {
     if (g_focus_flash <= 0) return false;
     const u8 al = g_focus_flash > 15
         ? static_cast<u8>(0xF)
@@ -375,10 +376,41 @@ static bool __attribute__((optimize("O3"))) draw_focus_flash(tsl::gfx::Renderer*
         ? tsl::Color{0xF, 0x0, 0x0, al}
         : tsl::Color{0x0, 0xF, 0x0, al};
     static constexpr int B = 4;
-    renderer->drawRect(x0,         y0,          w, B,        fc);
-    renderer->drawRect(x0,         y0 + h - B,  w, B,        fc);
-    renderer->drawRect(x0,         y0 + B,      B, h - B*2,  fc);
-    renderer->drawRect(x0 + w - B, y0 + B,      B, h - B*2,  fc);
+
+    if (!rounded) {
+        // Square border — windowed mode and fixed overlay mode.
+        renderer->drawRect(x0,         y0,          w, B,        fc);
+        renderer->drawRect(x0,         y0 + h - B,  w, B,        fc);
+        renderer->drawRect(x0,         y0 + B,      B, h - B*2,  fc);
+        renderer->drawRect(x0 + w - B, y0 + B,      B, h - B*2,  fc);
+    } else {
+        // Rounded border — free overlay mode.
+        // Matches the overlay player shape exactly: top corners R=10, bottom corners R=20,
+        // same geometry driven by kOvlR10Arc / kOvlR20Arc in gb_renderer.h.
+        //
+        // Straight edges are B px thick (shortened by the respective arc radius on each
+        // side so they don't form square corners where the arc leaves transparent cutouts).
+        // Corner arcs are filled by drawing B inset passes of the 1-px arc tables — each
+        // pass shifts the arc origin 1 px inward, painting the arc band to full thickness.
+        // Using the same R=10/R=20 tables for all B passes (instead of computing inset
+        // radii R-t) produces an imperceptible ~1 px deviation at B=4.
+        static constexpr int R_T = 10, R_B = 20;
+        // Straight edges
+        renderer->drawRect(x0 + R_T, y0,      w - 2*R_T, B,          fc);  // top
+        renderer->drawRect(x0 + R_B, y0+h-B,  w - 2*R_B, B,          fc);  // bottom
+        renderer->drawRect(x0,       y0+R_T,  B,          h-R_T-R_B, fc);  // left
+        renderer->drawRect(x0+w-B,   y0+R_T,  B,          h-R_T-R_B, fc);  // right
+        // Corner arcs — B inset passes (top corners via draw_r10_2corners,
+        // bottom corners via kOvlR20Arc loop, mirrored left ↔ right).
+        for (int t = 0; t < B; ++t) {
+            draw_r10_2corners(renderer, x0+t, x0+w-t, y0+t, false, fc);
+            for (const auto& a : kOvlR20Arc) {
+                const int row = (y0+h-1-t) - a.dy;
+                renderer->drawRect( x0+t       + a.dx,             row, a.cnt, a.h, fc);
+                renderer->drawRect((x0+w-t)    - a.dx - a.cnt,     row, a.cnt, a.h, fc);
+            }
+        }
+    }
     --g_focus_flash;
     return true;
 }

@@ -1454,7 +1454,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 //
 // Called by GBWindowedElement::draw() and GBOverlayElement::draw() while a
 // touch-drag or joystick reposition is active.  Both paths produce the same
-// visual: a semi-transparent dim over the game region, a 4 px red inset border
+// visual: a semi-transparent dim over the game region, a 4 px inset border
 // marking the window boundary, and "Paused" centred within a caller-specified
 // sub-region.
 //
@@ -1466,6 +1466,12 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 //   txt_rx, txt_ry      — top-left of the text-centering sub-region
 //   txt_rw, txt_rh      — size of the text-centering sub-region
 //   font_size           — font size for getTextDimensions / drawString
+//   fb16                — when non-null (free overlay mode) enables rounded corners:
+//                         the dim rect's corner pixels are re-zeroed via
+//                         clear_ovl_corners_448, then the 4 px border follows the
+//                         same R=10 top / R=20 bottom arc geometry as the overlay
+//                         player frame.  Pass nullptr (default) for square corners
+//                         (windowed mode and fixed overlay mode).
 //
 // [[gnu::noinline]] forces exactly one copy in .text so the five drawRect +
 // one drawString calls are not duplicated at each call site.
@@ -1474,7 +1480,8 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
 static void draw_drag_dim_border(tsl::gfx::Renderer* renderer,
     s32 y, s32 w, s32 h,
     s32 txt_rx, s32 txt_ry, s32 txt_rw, s32 txt_rh,
-    u32 font_size)
+    u32 font_size,
+    uint16_t* fb16 = nullptr)
 {
     static constexpr tsl::Color DIM   = {0x0, 0x0, 0x0, 0x8};
     static constexpr tsl::Color RED   = {0xF, 0x0, 0x0, 0xF};
@@ -1484,11 +1491,40 @@ static void draw_drag_dim_border(tsl::gfx::Renderer* renderer,
     // Semi-transparent black veil (~50 % opacity in RGBA4444).
     renderer->drawRect(0, y, w, h, DIM);
 
-    // Red border (4 px inset) so the window boundary is obvious during drag.
-    renderer->drawRect(0,        y,            w,    BORD,          RED);
-    renderer->drawRect(0,        y + h - BORD, w,    BORD,          RED);
-    renderer->drawRect(0,        y + BORD,     BORD, h - BORD * 2,  RED);
-    renderer->drawRect(w - BORD, y + BORD,     BORD, h - BORD * 2,  RED);
+    if (!fb16) {
+        // Square border — windowed mode / fixed overlay mode.
+        renderer->drawRect(0,        y,            w,    BORD,          RED);
+        renderer->drawRect(0,        y + h - BORD, w,    BORD,          RED);
+        renderer->drawRect(0,        y + BORD,     BORD, h - BORD * 2,  RED);
+        renderer->drawRect(w - BORD, y + BORD,     BORD, h - BORD * 2,  RED);
+    } else {
+        // Rounded border — free overlay mode.
+        //
+        // The dim drawRect above wrote non-transparent pixels into the corner
+        // regions that must stay transparent (outside the R=10/R=20 arcs).
+        // clear_ovl_corners_448 re-zeroes exactly those pixels, restoring the
+        // rounded silhouette before the red border is painted on top.
+        clear_ovl_corners_448(fb16, y, y + h);
+
+        // Rounded red border matching the free overlay player shape.
+        // Top corners R=10, bottom corners R=20 — same kOvlR10Arc / kOvlR20Arc
+        // tables used by render_ovl_free_border, drawn BORD px thick via inset passes.
+        static constexpr int R_T = 10, R_B = 20;
+        // Straight edges (shortened by the respective corner radius on each end)
+        renderer->drawRect(R_T,     y,          w - 2*R_T, BORD,          RED);  // top
+        renderer->drawRect(R_B,     y+h-BORD,   w - 2*R_B, BORD,          RED);  // bottom
+        renderer->drawRect(0,       y+R_T,      BORD,       h-R_T-R_B,    RED);  // left
+        renderer->drawRect(w-BORD,  y+R_T,      BORD,       h-R_T-R_B,    RED);  // right
+        // Corner arcs — BORD inset passes so the arc band is BORD px thick.
+        for (int t = 0; t < BORD; ++t) {
+            draw_r10_2corners(renderer, t, w-t, y+t, false, RED);
+            for (const auto& a : kOvlR20Arc) {
+                const int row = (y+h-1-t) - a.dy;
+                renderer->drawRect( t       + a.dx,         row, a.cnt, a.h, RED);
+                renderer->drawRect((w-t)    - a.dx - a.cnt, row, a.cnt, a.h, RED);
+            }
+        }
+    }
 
     // "Paused" centred within the caller-supplied text sub-region.
     const auto [tw, th] = renderer->getTextDimensions("Paused", false, font_size);

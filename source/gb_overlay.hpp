@@ -533,7 +533,8 @@ public:
         // draw_focus_flash returns true when the border was drawn this frame.
         // Used below to decide whether to re-zero rounded corners.
         const bool flash_was_active = draw_focus_flash(
-            renderer, 0, fb_top, static_cast<s32>(FB_W), fb_bot - fb_top);
+            renderer, 0, fb_top, static_cast<s32>(FB_W), fb_bot - fb_top,
+            free_mode);  // rounded=true in free overlay mode → matches player shape
 
         if (!free_mode) {
             if (!ult::useRightAlignment)
@@ -568,7 +569,7 @@ public:
             draw_drag_dim_border(renderer,
                 fbt, fw, fbc,
                 (s32)VP2_X, scr_y, (s32)VP2_W, (s32)VP2_H,
-                20u);
+                20u, fb16);  // fb16 → rounded corners matching the overlay player frame
         }
         } // end fb_top/fb_bot scope
 
