@@ -56,15 +56,17 @@
 
 #pragma once
 
-// Windowed pixel blit — per-frame, same hot path as GBOverlayElement::draw().
-// O3: critical for the scale×scale inner write loop and LUT address arithmetic.
-// Explicit so it is immune to include order.
-#pragma GCC optimize("O3")
 
 #include <cstring>
 #include <algorithm>
 
 // gb_renderer.h (rgb555_to_packed, rgb565_to_packed) is already included above.
+
+// Per-function attributes override this file-level Os baseline where needed.
+// Hot per-frame functions carry __attribute__((optimize("O3"))).
+// Cold setup / pool management functions inherit Os from the push below.
+#pragma GCC push_options
+#pragma GCC optimize("Os")
 
 // ── Swizzle LUTs for the scaled framebuffer ───────────────────────────────────
 // Tesla block-linear formula (from tesla.hpp getPixelOffset, no scissor):
@@ -267,7 +269,7 @@ static void init_win_luts(int scale) {
 
 // Rebuild s_win_row in place when the game content y_offset changes (drag).
 // No-op in steady state — single int comparison.
-static inline void update_win_row_lut(int y_offset) {
+static inline void __attribute__((optimize("O3"))) update_win_row_lut(int y_offset) {
     if (!s_win_lut_ready || y_offset == s_win_last_y_offset) return;
     build_row_lut(s_win_row, y_offset, s_win_fh, s_win_owv);
     s_win_last_y_offset = y_offset;
@@ -316,7 +318,7 @@ static inline void update_win_row_lut(int y_offset) {
 // prepacked — source already holds RGBA4444 (DMG pre-packed palette path).
 // sy_start/end — half-open range of GB source rows this thread owns.
 template <bool LCD_GRID, int SCALE>
-static void win_blit_rows(uint16_t* __restrict__ fb,
+static void __attribute__((optimize("O3"))) win_blit_rows(uint16_t* __restrict__ fb,
                           const uint16_t* __restrict__ src_fb,
                           bool is565, bool prepacked,
                           int sy_start, int sy_end) {
@@ -573,7 +575,7 @@ static bool        s_win_pool_active = false;
 // initialised (s_win_pool_active false) the function falls through to
 // single-thread as a safe default.
 template <bool LCD_GRID, int SCALE>
-static void launch_win_blit(uint16_t* fb, const uint16_t* src_fb,
+static void __attribute__((optimize("O3"))) launch_win_blit(uint16_t* fb, const uint16_t* src_fb,
                              bool is565, bool prepacked) {
     // Compile-time elimination: single-thread for scale 1 and 2.
     if constexpr (SCALE < 3) {
@@ -620,7 +622,7 @@ static void launch_win_blit(uint16_t* fb, const uint16_t* src_fb,
 // =============================================================================
 class GBWindowedElement : public tsl::elm::Element {
 public:
-    void draw(tsl::gfx::Renderer* renderer) override {
+    void __attribute__((optimize("O3"))) draw(tsl::gfx::Renderer* renderer) override {
 
         // ── Always clear the full framebuffer to transparent first ────────────
         // Fixes stale-pixel corruption on both double-buffer frames: any row
@@ -689,8 +691,26 @@ public:
         // rate-limits the GB CPU to 59.73 fps.  During a touch-drag the game is
         // frozen, so timing is suppressed — but the display-frame counter still
         // advances so double-click detectors keep working.
-        if (!s_win_dragging) gb_tick_frame();
-        else                 ++g_frame_count;
+        //
+        // Screenshot capture: mirror the drag-pause behavior — pause audio on the
+        // rising edge of disableTransparency so the SPSC ring never empties and
+        // buzzes, hold the last frame for the 1.5 s window, then resume and
+        // re-anchor the GB clock on the falling edge so we don't try to catch up.
+        {
+            static bool s_was_screenshot = false;
+            const bool  capturing        = ult::disableTransparency;
+            if (capturing != s_was_screenshot) {
+                if (capturing) {
+                    gb_audio_pause();
+                } else {
+                    gb_audio_resume();
+                    g_gb_frame_next_ns = 0;
+                }
+                s_was_screenshot = capturing;
+            }
+            if (!s_win_dragging && !capturing) gb_tick_frame();
+            else                               ++g_frame_count;
+        }
 
         // ── Row LUT: rebuild if the game's y_offset changed since last frame ──
         // Happens on every drag frame; zero-cost in steady state (one int cmp).
@@ -718,28 +738,28 @@ public:
         // because do_grid = g_lcd_grid && scale >= 2).  Handle it directly here
         // so the compiler never needs to instantiate launch_win_blit<true,1> /
         // win_blit_rows<true,1> — those are dead code at scale 1.
-        // Automatically has no visible effect at windowed 1× scale.
+        // NOTE: no early return here — the post-blit setLayerPos / overlay draws
+        // must run for scale 1 exactly as they do for all other scales.
         if (scale == 1) {
             launch_win_blit<false, 1>(fb, g_gb_fb, is565, prpk);
-            return;
+        } else {
+            // Resolve SCALE at compile time so inner loops are fully unrolled.
+            // LCD_GRID branches are compile-time eliminated in each instantiation.
+            // case 1 is gone — handled above, so the GRID=true lambda never
+            // references launch_win_blit<true,1>.
+            const auto dispatch = [&]<bool GRID>() __attribute__((always_inline)) {
+                switch (scale) {
+                    case 2: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
+                    case 3: launch_win_blit<GRID, 3>(fb, g_gb_fb, is565, prpk); break;
+                    case 4: launch_win_blit<GRID, 4>(fb, g_gb_fb, is565, prpk); break;
+                    case 5: launch_win_blit<GRID, 5>(fb, g_gb_fb, is565, prpk); break;
+                    case 6: launch_win_blit<GRID, 6>(fb, g_gb_fb, is565, prpk); break;
+                    default: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
+                }
+            };
+            if (do_grid) dispatch.operator()<true>();
+            else         dispatch.operator()<false>();
         }
-
-        // Resolve SCALE at compile time so inner loops are fully unrolled.
-        // LCD_GRID branches are compile-time eliminated in each instantiation.
-        // case 1 is gone — handled above, so the GRID=true lambda never
-        // references launch_win_blit<true,1>.
-        const auto dispatch = [&]<bool GRID>() __attribute__((always_inline)) {
-            switch (scale) {
-                case 2: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
-                case 3: launch_win_blit<GRID, 3>(fb, g_gb_fb, is565, prpk); break;
-                case 4: launch_win_blit<GRID, 4>(fb, g_gb_fb, is565, prpk); break;
-                case 5: launch_win_blit<GRID, 5>(fb, g_gb_fb, is565, prpk); break;
-                case 6: launch_win_blit<GRID, 6>(fb, g_gb_fb, is565, prpk); break;
-                default: launch_win_blit<GRID, 2>(fb, g_gb_fb, is565, prpk); break;
-            }
-        };
-        if (do_grid) dispatch.operator()<true>();
-        else         dispatch.operator()<false>();
 
         // ── Sync layer position with the just-rendered FB ────────────────────
         // Called here, after the blit, so the layer VI position and y_ofs are
@@ -771,6 +791,63 @@ public:
                 y_ofs, fw, fh,
                 0, y_ofs, fw, fh,
                 static_cast<u32>(14 * g_win_scale));
+
+#ifdef GB_FPS
+        // ── FPS indicator ─────────────────────────────────────────────────────
+        // Counts display frames rendered in the past second and overlays the
+        // result as a small integer in the top-left corner of the game window.
+        //
+        // Compiled in ONLY when -DGB_FPS is supplied to the build; the #ifdef
+        // guarantees zero code, zero data, and zero runtime cost in production.
+        //
+        // Placement: (2, y_ofs + font_sz + 1) puts the baseline just inside the
+        // top-left of the game-content region regardless of anchor or scale.
+        // Font size grows linearly with g_win_scale (8 px at 1×, 18 px at 5×)
+        // so the label is always legible without overflowing a narrow window.
+        {
+            static uint64_t s_fps_win_start  = 0;   // ns timestamp of window open
+            static int       s_fps_frame_cnt  = 0;   // frames counted this second
+            static int       s_fps_display    = 0;   // last completed 1 s measurement
+
+            const uint64_t now = ult::nowNs();
+            if (s_fps_win_start == 0) s_fps_win_start = now;
+
+            ++s_fps_frame_cnt;
+            if (now - s_fps_win_start >= 1'000'000'000ULL) {
+                // Divide by actual elapsed ns, not a nominal 1 s, so a window
+                // that ran 1.017 s with 61 ticks still resolves to 60 fps.
+                const uint64_t elapsed = now - s_fps_win_start;
+                s_fps_display   = static_cast<int>(
+                    static_cast<uint64_t>(s_fps_frame_cnt) * 1'000'000'000ULL / elapsed);
+                s_fps_frame_cnt = 0;
+                s_fps_win_start = now;
+            }
+
+            // Stack-only integer formatter — no heap, no <cstdio> overhead.
+            char buf[8];
+            int  v   = s_fps_display;
+            int  len = 0;
+            if      (v >= 100) { buf[len++] = '0' + v / 100; v %= 100;
+                                  buf[len++] = '0' + v / 10;
+                                  buf[len++] = '0' + v % 10; }
+            else if (v >=  10) { buf[len++] = '0' + v / 10;
+                                  buf[len++] = '0' + v % 10; }
+            else                { buf[len++] = '0' + v; }
+            buf[len] = '\0';
+
+            // Font size: 8 px at scale 1, +2 px per scale step (18 px at scale 5).
+            const s32 font_sz = 6 + g_win_scale * 2;
+
+            // Semi-transparent black shadow one pixel down-right for contrast,
+            // then the yellow label on top.
+            const s32 tx = 3;
+            const s32 ty = y_ofs + font_sz + 2;
+            renderer->drawString(buf, false, tx + 1, ty + 1, font_sz,
+                                 tsl::Color{0x0, 0x0, 0x0, 0xA});  // shadow
+            renderer->drawString(buf, false, tx,     ty,     font_sz,
+                                 tsl::Color{0xF, 0xE, 0x0, 0xF});  // yellow
+        }
+#endif  // GB_FPS
     }
 
     void layout(u16, u16, u16, u16) override {
@@ -1374,3 +1451,5 @@ public:
         return m_dragging || m_plus_dragging;
     }
 };
+
+#pragma GCC pop_options

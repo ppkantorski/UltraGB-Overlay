@@ -31,12 +31,10 @@
 #include "gb_globals.hpp"       // all global variables + gb_audio.h/gb_core.h/gb_renderer.h
 #include "elm_ultraframe.hpp"   // UltraGBOverlayFrame — needed by make_bare_frame
 
-// All helpers in this file are cold paths: save/load/config/ROM scanning/slot
-// management.  They fire at most once per user action, never during gameplay.
-// The hot emulation code (gb_audio.h, gb_core.h, gb_renderer.h) carries its
-// own O3 pragmas and is unaffected.  Os here prevents INI-parsing and
-// save-file I/O loops from being unrolled into bloated .text at O3.
-#pragma GCC optimize("O2")
+// Hot per-frame functions carry __attribute__((optimize("O3"))).
+// Everything else compiles at Os to keep cold utility code lean.
+#pragma GCC push_options
+#pragma GCC optimize("Os")
 
 // =============================================================================
 // make_bare_frame
@@ -73,7 +71,7 @@ static std::string make_slot_detail_header(int slot, const std::string& name) {
 // True when the Ultrahand launch combo is down this frame.
 // Called from GBOverlayGui::handleInput and GBWindowedGui::handleInput.
 // =============================================================================
-static bool combo_pressed(u64 keysDown, u64 keysHeld) {
+static bool __attribute__((optimize("O3"))) combo_pressed(u64 keysDown, u64 keysHeld) {
     return (keysDown & tsl::cfg::launchCombo) &&
            (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo);
 }
@@ -107,7 +105,7 @@ static inline void audio_exit_if_enabled() {
 // Caller pre-computes zr_down/zr_held (applying any pass-through guard first).
 // =============================================================================
 [[gnu::noinline]]
-static void process_zr_fast_forward(bool zr_down, bool zr_held,
+static void __attribute__((optimize("O3"))) process_zr_fast_forward(bool zr_down, bool zr_held,
                                      bool& zr_first_seen, uint32_t& zr_first_frame) {
     static constexpr uint32_t kWindow = 20;  // ~333 ms at 60 fps
     if (zr_down) {
@@ -155,7 +153,7 @@ struct ZLPassThroughState {
 };
 
 [[gnu::noinline]]
-static void process_zl_pass_through(bool zl_down, bool zl_held,
+static void __attribute__((optimize("O3"))) process_zl_pass_through(bool zl_down, bool zl_held,
                                     ZLPassThroughState& st) {
     static constexpr uint32_t kWindow = 20;  // ~333 ms at 60 fps
     static constexpr uint32_t kHold   = 18;  // ~300 ms at 60 fps
@@ -277,7 +275,7 @@ static inline void restore_haptic_if_needed(bool& restoreHapticState) {
 // Still a 10× reduction in IPC calls vs the original every-frame polling.
 static constexpr uint32_t kDockCheckInterval = 6;   // frames between service queries
 
-static bool poll_console_docked() {
+static bool __attribute__((optimize("O3"))) poll_console_docked() {
     if (g_frame_count >= g_dock_next_check) {
         g_console_docked  = ult::consoleIsDocked();
         g_dock_next_check = g_frame_count + kDockCheckInterval;
@@ -295,7 +293,7 @@ static bool poll_console_docked() {
 // noinline: single copy in .text instead of one inlined copy per call site.
 // =============================================================================
 [[gnu::noinline]]
-static bool poll_touch(int& out_x, int& out_y) {
+static bool __attribute__((optimize("O3"))) poll_touch(int& out_x, int& out_y) {
     HidTouchScreenState ts = {};
     hidGetTouchScreenStates(&ts, 1);
     if (ts.count > 0) {
@@ -316,7 +314,7 @@ static bool poll_touch(int& out_x, int& out_y) {
 // noinline: single copy in .text instead of one inlined copy per call site.
 // =============================================================================
 [[gnu::noinline]]
-static float joy_sens(float fx, float fy) {
+static float __attribute__((optimize("O3"))) joy_sens(float fx, float fy) {
     const float norm   = (fx*fx + fy*fy) / (32767.f * 32767.f);
     const float curve2 = norm   * norm;
     const float curve4 = curve2 * curve2;
@@ -342,7 +340,7 @@ static float joy_sens(float fx, float fy) {
 // would otherwise inline the body twice — one copy per element class.
 // =============================================================================
 [[gnu::noinline]]
-static bool draw_focus_flash(tsl::gfx::Renderer* renderer,
+static bool __attribute__((optimize("O3"))) draw_focus_flash(tsl::gfx::Renderer* renderer,
                               s32 x0, s32 y0, s32 w, s32 h) {
     if (g_focus_flash <= 0) return false;
     const u8 al = g_focus_flash > 15
@@ -675,6 +673,20 @@ static bool load_game_no_sprite_limit(const char* romPath) {
 
 static void save_game_no_sprite_limit(const char* romPath, bool enabled) {
     save_game_cfg_str(romPath, "no_sprite_limit", enabled ? "1" : "0");
+}
+
+// ── Per-game audio balance ─────────────────────────────────────────────────
+// Stored as a plain signed integer string ("-50"…"50") in the per-ROM .ini.
+// Missing / empty key → 0 (neutral, no gain change).
+// Range is clamped on load so values written by older builds are safe.
+static int16_t load_game_audio_balance(const char* romPath) {
+    const std::string s = load_game_cfg_str(romPath, "audio_balance");
+    if (s.empty()) return 0;
+    return static_cast<int16_t>(std::clamp(std::stoi(s), -200, 200));
+}
+static void save_game_audio_balance(const char* romPath, int16_t balance) {
+    save_game_cfg_str(romPath, "audio_balance",
+                      std::to_string(static_cast<int>(balance)).c_str());
 }
 
 // =============================================================================
@@ -1364,3 +1376,4 @@ static void close_overlay_direct_mode() {
     }
     tsl::Overlay::get()->close();
 }
+#pragma GCC pop_options

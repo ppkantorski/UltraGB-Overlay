@@ -37,6 +37,7 @@
 #include "gb_audio.h"   // gb_audio_mark_frame_start and friends — required by gb_core.h
 #include "gb_core.h"
 
+#pragma GCC push_options
 #pragma GCC optimize("O3")
 
 // Set by gb_load_rom: true when the ROM is a CGB game (Walnut outputs RGB565).
@@ -123,7 +124,7 @@ static int g_render_y_offset = 0;
 //
 // Both are static inline — the compiler inlines the small loop into each
 // caller and the helpers produce zero additional .text symbols.
-static inline void build_col_lut(uint32_t* dst, int start_x, int count) {
+static inline void __attribute__((optimize("Os"))) build_col_lut(uint32_t* dst, int start_x, int count) {
     for (int i = 0; i < count; ++i) {
         const uint32_t x = static_cast<uint32_t>(start_x + i);
         dst[i] = (((x >> 5u) << 3u) << 9u)
@@ -132,7 +133,7 @@ static inline void build_col_lut(uint32_t* dst, int start_x, int count) {
                +  (x &  7u);
     }
 }
-static inline void build_row_lut(uint32_t* dst, int start_y, int count, uint32_t owv) {
+static inline void __attribute__((optimize("Os"))) build_row_lut(uint32_t* dst, int start_y, int count, uint32_t owv) {
     for (int i = 0; i < count; ++i) {
         const uint32_t y = static_cast<uint32_t>(start_y + i);
         dst[i] = ((((y & 127u) >> 4u) + ((y >> 7u) * owv)) << 9u)
@@ -166,7 +167,7 @@ static uint32_t s_outer_col_lut[VP_W];   // col_part(VP_X + ox), ox = 0..VP_W-1
 static uint32_t s_outer_row_lut[VP_H];   // row_part(VP_Y + oy), oy = 0..VP_H-1
 static bool     s_outer_lut_ready = false;
 
-static void init_outer_lut() {
+static void __attribute__((optimize("Os"))) init_outer_lut() {
     // Track the last g_render_y_offset the row LUT was built for.
     // In fixed overlay mode this is always 0.
     // In free overlay mode it varies as the user repositions the overlay
@@ -256,8 +257,10 @@ static inline void neon_lut_fill(uint16_t* __restrict__ row_ptr,
     const uint16x8_t vpk = vdupq_n_u16(packed);
     int ox = ox0;
     while (ox < ox1 && (ox & 7)) { row_ptr[lut[ox]] = packed; ++ox; }
-    for (; ox + 8 <= ox1; ox += 8)
+    for (; ox + 8 <= ox1; ox += 8) {
+        __builtin_prefetch(lut + ox + 16, 0, 1);  // prime LUT 2 tiles ahead (L1)
         vst1q_u16(row_ptr + lut[ox], vpk);
+    }
     while (ox < ox1) { row_ptr[lut[ox]] = packed; ++ox; }
 }
 
@@ -338,8 +341,9 @@ inline void render_gb_grid_overlay(tsl::gfx::Renderer* renderer) {
     for (int sy = 0; sy < GB_H; ++sy) {
         uint16_t* row_ptr = fb + s_row_lut[sy * 2 + 1];
         for (int ox = 0; ox < VP2_W; ox += 8) {
-            uint16x8_t px = vld1q_u16(&row_ptr[s_col_lut[ox]]);
-            vst1q_u16(&row_ptr[s_col_lut[ox]], dim_packed_grid_vec(px));
+            const uint32_t c = s_col_lut[ox];   // load LUT entry once; avoids
+            uint16x8_t px = vld1q_u16(&row_ptr[c]); // double-read the compiler
+            vst1q_u16(&row_ptr[c], dim_packed_grid_vec(px)); // may not hoist
         }
     }
 
@@ -431,7 +435,7 @@ static inline void update_sprite_flicker_state() {
 // [[gnu::noinline]] — cold path, called at most once per ROM load.
 // Returns false if any allocation fails so apply_lcd_ghosting can bail early.
 [[gnu::noinline]]
-static bool alloc_ghosting_buffers(int total) {
+static bool __attribute__((optimize("Os"))) alloc_ghosting_buffers(int total) {
     if (!s_prev_fb) {
         s_prev_fb = static_cast<uint16_t*>(malloc(total * sizeof(uint16_t)));
         if (!s_prev_fb) return false;
@@ -508,19 +512,35 @@ inline void apply_lcd_ghosting() {
         // RGB565 layout: R[15:11] G[10:5] B[4:0]
         // Mask constants hoisted outside the loop — one movi each, loaded
         // into NEON registers once and reused across all 2,880 iterations.
-        const uint16x8_t mask_g = vdupq_n_u16(0x3Fu);
-        const uint16x8_t mask_b = vdupq_n_u16(0x1Fu);
+        const uint16x8_t mask_g    = vdupq_n_u16(0x3Fu);
+        const uint16x8_t mask_b    = vdupq_n_u16(0x1Fu);
+        const uint16x8_t mask_byte = vdupq_n_u16(0x00FFu); // for vtstq_u16 flicker test
         for (int i = 0; i < n8; i += 8) {
-            const uint16x8_t curr8 = vld1q_u16(g_gb_fb  + i);
+            // Load flicker flags first — they are 8-byte reads and very likely to
+            // be in L1 cache.  Reinterpret both as a single u64: if zero, no pixel
+            // in this chunk is flickering and we skip the full blend (~15 NEON ops
+            // saved).  Common case when no sprites are currently alternating.
+            const uint8x8_t fc    = vld1_u8(s_flicker_pixel_curr + i);
+            const uint8x8_t fp    = vld1_u8(s_flicker_pixel_prev + i);
+            const uint8x8_t fany8 = vorr_u8(fc, fp);
+
+            const uint16x8_t curr8 = vld1q_u16(g_gb_fb + i);
+
+            // Fast path: no flickering pixel in this 8-wide chunk.
+            // Advance the previous-frame buffer and continue without touching prev8
+            // or doing any channel extraction / blend work.
+            if (vget_lane_u64(vreinterpret_u64_u8(fany8), 0) == 0u) {
+                vst1q_u16(s_prev_fb + i, curr8);
+                continue;
+            }
+
             const uint16x8_t prev8 = vld1q_u16(s_prev_fb + i);
 
             // Blend condition mask
-            const uint8x8_t  fc  = vld1_u8(s_flicker_pixel_curr + i);
-            const uint8x8_t  fp  = vld1_u8(s_flicker_pixel_prev + i);
-            const uint16x8_t fany         = vmovl_u8(vorr_u8(fc, fp));
-            const uint16x8_t has_flicker  = vtstq_u16(fany, vdupq_n_u16(0x00FFu));
-            const uint16x8_t ne           = vmvnq_u16(vceqq_u16(curr8, prev8));
-            const uint16x8_t blend_mask   = vandq_u16(has_flicker, ne);
+            const uint16x8_t fany        = vmovl_u8(fany8);
+            const uint16x8_t has_flicker = vtstq_u16(fany, mask_byte);
+            const uint16x8_t ne          = vmvnq_u16(vceqq_u16(curr8, prev8));
+            const uint16x8_t blend_mask  = vandq_u16(has_flicker, ne);
 
             // Channel extract + halving-add (50/50 blend, no overflow)
             const uint16x8_t cr = vhaddq_u16(vshrq_n_u16(curr8, 11),
@@ -541,17 +561,29 @@ inline void apply_lcd_ghosting() {
         // DMG prepacked (RGBA4444) or non-prepacked (GB15):
         // Both treated as 4-bit nibble channels r4|g4<<4|b4<<8|a4<<12.
         // Alpha comes from curr only — identical to the scalar path.
-        const uint16x8_t mask4 = vdupq_n_u16(0x000Fu);
+        const uint16x8_t mask4     = vdupq_n_u16(0x000Fu);
+        const uint16x8_t mask_byte = vdupq_n_u16(0x00FFu); // for vtstq_u16 flicker test
         for (int i = 0; i < n8; i += 8) {
-            const uint16x8_t curr8 = vld1q_u16(g_gb_fb  + i);
+            // Load flicker flags first — fast early-exit when no pixel in this
+            // chunk is flickering.  Saves ~15 NEON ops for non-flickering chunks.
+            const uint8x8_t fc    = vld1_u8(s_flicker_pixel_curr + i);
+            const uint8x8_t fp    = vld1_u8(s_flicker_pixel_prev + i);
+            const uint8x8_t fany8 = vorr_u8(fc, fp);
+
+            const uint16x8_t curr8 = vld1q_u16(g_gb_fb + i);
+
+            // Fast path: no flickering pixel in this 8-wide chunk.
+            if (vget_lane_u64(vreinterpret_u64_u8(fany8), 0) == 0u) {
+                vst1q_u16(s_prev_fb + i, curr8);
+                continue;
+            }
+
             const uint16x8_t prev8 = vld1q_u16(s_prev_fb + i);
 
-            const uint8x8_t  fc  = vld1_u8(s_flicker_pixel_curr + i);
-            const uint8x8_t  fp  = vld1_u8(s_flicker_pixel_prev + i);
-            const uint16x8_t fany         = vmovl_u8(vorr_u8(fc, fp));
-            const uint16x8_t has_flicker  = vtstq_u16(fany, vdupq_n_u16(0x00FFu));
-            const uint16x8_t ne           = vmvnq_u16(vceqq_u16(curr8, prev8));
-            const uint16x8_t blend_mask   = vandq_u16(has_flicker, ne);
+            const uint16x8_t fany        = vmovl_u8(fany8);
+            const uint16x8_t has_flicker = vtstq_u16(fany, mask_byte);
+            const uint16x8_t ne          = vmvnq_u16(vceqq_u16(curr8, prev8));
+            const uint16x8_t blend_mask  = vandq_u16(has_flicker, ne);
 
             const uint16x8_t cr = vhaddq_u16(vandq_u16(curr8,                   mask4),
                                               vandq_u16(prev8,                   mask4));
@@ -609,7 +641,7 @@ inline void apply_lcd_ghosting() {
 // apply_lcd_ghosting() to overwrite s_prev_fb via memcpy and zero both
 // flicker pixel buffers on the very first frame it runs after a reset,
 // before any blend logic executes.  Zeroing them here would be redundant.
-inline void reset_lcd_ghosting() {
+inline void __attribute__((optimize("Os"))) reset_lcd_ghosting() {
     s_prev_fb_valid = false;
     memset(s_sprite_rendered_curr, 0, sizeof(s_sprite_rendered_curr));
     memset(s_sprite_rendered_prev, 0, sizeof(s_sprite_rendered_prev));
@@ -617,7 +649,7 @@ inline void reset_lcd_ghosting() {
 }
 // Release all ghosting heap memory.  Called from gb_unload_rom() so the
 // memory returns to the heap when no game is running.
-inline void free_lcd_ghosting() {
+inline void __attribute__((optimize("Os"))) free_lcd_ghosting() {
     free(s_prev_fb);
     free(s_flicker_pixel_curr);
     free(s_flicker_pixel_prev);
@@ -886,7 +918,7 @@ static u32  s_wp_yParts[kWP_H];             // y-contribution to block-linear of
 static u32  s_wp_xGroupParts[kWP_GW];       // x-contribution for start of each group
 static bool s_wp_tables_ready = false;
 
-static void init_wallpaper_swizzle_tables() {
+static void __attribute__((optimize("Os"))) init_wallpaper_swizzle_tables() {
     if (__builtin_expect(s_wp_tables_ready, 1)) return;
     static constexpr u32 kOWV = 112u;       // ((448/2)>>4)<<3 — constant for 448-wide FB
     for (u32 y = 0u; y < kWP_H; ++y) {
@@ -1357,7 +1389,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                         for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
                     }
 
-                    ult::inPlotBarrier.arrive_and_wait();
+                    //ult::inPlotBarrier.arrive_and_wait(); // commented out, unnecessary unless we are swapping
                 };
 
                 // Dispatch once at thread-start — zero inner-loop overhead.
@@ -1422,3 +1454,5 @@ static void draw_drag_dim_border(tsl::gfx::Renderer* renderer,
         txt_ry + (txt_rh + static_cast<s32>(th)) / 2,
         font_size, WHITE);
 }
+
+#pragma GCC pop_options

@@ -23,30 +23,28 @@
 
 #pragma once
 
-#include <cstdint>
 
-// Forward-declare the audio callbacks before the optimize pragma so these
-// declarations carry no optimization attribute.  The definitions live in
-// gb_audio.h (compiled under its own O3 pragma); mismatched attributes on a
-// declaration that follows a definition trigger -Wattributes even when both
-// sides are "O3" because GCC treats them as distinct attribute objects.
-// Placing the declarations here — before any pragma GCC optimize — keeps them
-// attribute-free and silences the warning without changing codegen.
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <arm_neon.h>
+
+
+// Forward-declare the audio callbacks with an explicit O3 pragma so the
+// declaration attribute always matches the definition in gb_audio.h (which is
+// compiled at O3 via its own push/pop).  Wrapping with push/pop makes this
+// immune to whatever surrounding pragma is active when gb_core.h is included
+// (e.g. elm_ultraframe.hpp pushes Os before pulling in gb_renderer.h which
+// then includes this file — a bare declaration would inherit Os and cause a
+// -Wattributes mismatch).
+#pragma GCC push_options
+#pragma GCC optimize("O3")
 extern "C" {
     uint8_t audio_read(uint8_t addr);
     void    audio_write(uint8_t addr, uint8_t val);
 }
 
-// GB CPU emulation — hottest code in the binary.
-// 70,224 T-cycles per frame through the Peanut-GB opcode decoder.
-// O3: full loop unrolling, aggressive inlining, NEON auto-vectorisation.
-// Explicit so correctness does not rely on include-chain pragma inheritance.
-#pragma GCC optimize("O3")
-
-#include <cstdlib>
-#include <cstring>
-#include <cstdio>
-#include <arm_neon.h>
 
 // ── Walnut-GB compile-time options ───────────────────────────────────────────
 #ifndef ENABLE_LCD
@@ -70,10 +68,11 @@ extern "C" {
 // Safe dual-fetch flags (MBC/DMA/opcodes) are set to 1 directly in
 // walnut_cgb.h — they are unconditional #defines so #ifndef guards here
 // have no effect.  Edit walnut_cgb.h lines 62-64 to change them.
-
 extern "C" {
 #include "walnut_cgb.h"
 }
+
+
 
 // ── Screen and viewport dimensions ───────────────────────────────────────────
 static constexpr int GB_W          = LCD_WIDTH;    // 160
@@ -821,6 +820,13 @@ extern bool      g_fb_is_prepacked;  // true → g_gb_fb already contains RGBA44
 // Layout (little-endian): r4 | g4<<4 | b4<<8 | a4<<12.
 // Defined here so gb_select_dmg_palette can pre-bake the flat palette without
 // including gb_renderer.h (which would create a circular dependency).
+// ── Per-function optimization ─────────────────────────────────────────────────
+// Default to Os for cold setup paths (gb_select_dmg_palette, gb_error, etc.).
+// Hot callbacks used every emulation frame carry __attribute__((optimize("O3"))).
+// push/pop confines the pragma to this file — does not bleed into includers.
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+
 static inline uint16_t gb_pack_rgb555(const uint16_t c) {
     const uint8_t r = ( c        & 0x1F) >> 1;
     const uint8_t g = ((c >>  5) & 0x1F) >> 1;
@@ -921,10 +927,10 @@ static inline void gb_select_dmg_palette() {
     }
 }
 
-// ── Peanut-GB C callbacks (static so they have C linkage via the extern "C" block) ─
+// ── Walnut-CGB C callbacks (static so they have C linkage via the extern "C" block) ─
 // Defined in main.cpp where the global state lives.
 
-static uint8_t gb_rom_read(struct gb_s*, const uint_fast32_t addr) {
+static uint8_t __attribute__((optimize("O3"))) gb_rom_read(struct gb_s*, const uint_fast32_t addr) {
     if (addr >= g_gb.romSize) return 0xFF;
     return g_gb.rom[addr];
 }
@@ -932,12 +938,12 @@ static uint8_t gb_rom_read(struct gb_s*, const uint_fast32_t addr) {
 // Walnut-CGB requires 16-bit and 32-bit ROM read functions for its dual-fetch
 // CPU execution model.  These are simple unaligned little-endian reads —
 // safe because g_gb.rom is a heap buffer with no alignment restrictions.
-static uint16_t gb_rom_read16(struct gb_s*, const uint_fast32_t addr) {
+static uint16_t __attribute__((optimize("O3"))) gb_rom_read16(struct gb_s*, const uint_fast32_t addr) {
     if (addr + 1 >= g_gb.romSize) return 0xFFFF;
     return (uint16_t)g_gb.rom[addr] | ((uint16_t)g_gb.rom[addr + 1] << 8);
 }
 
-static uint32_t gb_rom_read32(struct gb_s*, const uint_fast32_t addr) {
+static uint32_t __attribute__((optimize("O3"))) gb_rom_read32(struct gb_s*, const uint_fast32_t addr) {
     if (addr + 3 >= g_gb.romSize) return 0xFFFFFFFF;
     return (uint32_t)g_gb.rom[addr]
          | ((uint32_t)g_gb.rom[addr + 1] << 8)
@@ -945,12 +951,12 @@ static uint32_t gb_rom_read32(struct gb_s*, const uint_fast32_t addr) {
          | ((uint32_t)g_gb.rom[addr + 3] << 24);
 }
 
-static uint8_t gb_cart_ram_read(struct gb_s*, const uint_fast32_t addr) {
+static uint8_t __attribute__((optimize("O3"))) gb_cart_ram_read(struct gb_s*, const uint_fast32_t addr) {
     if (!g_gb.cartRam || addr >= g_gb.cartRamSz) return 0xFF;
     return g_gb.cartRam[addr];
 }
 
-static void gb_cart_ram_write(struct gb_s*, const uint_fast32_t addr, const uint8_t val) {
+static void __attribute__((optimize("O3"))) gb_cart_ram_write(struct gb_s*, const uint_fast32_t addr, const uint8_t val) {
     if (!g_gb.cartRam || addr >= g_gb.cartRamSz) return;
     g_gb.cartRam[addr] = val;
 }
@@ -974,7 +980,7 @@ static void gb_error(struct gb_s*, const enum gb_error_e, const uint16_t) {
 //
 // 3. Remainder pixels handled scalar for safety.
 // 4. Framebuffer is g_gb_fb (raw 16-bit RGB565), ghosting handled later.
-static void gb_lcd_draw_line(struct gb_s* gb,
+static void __attribute__((optimize("O3"))) gb_lcd_draw_line(struct gb_s* gb,
                              const uint8_t* pixels,
                              const uint_fast8_t line)
 {
@@ -1052,9 +1058,31 @@ static void gb_lcd_draw_line(struct gb_s* gb,
 
             return;
         } else {
-            // Normal CGB path: one lookup per pixel
-            for (int x = 0; x < GB_W; x++)
-                row[x] = gb->cgb.fixPalette[pixels[x]];
+            // Normal CGB path: 8-wide scalar unroll.
+            //
+            // fixPalette[] is 64 entries × 2 bytes = 128 bytes — fits in two
+            // cache lines and stays hot in L1 after the first scanline.
+            //
+            // Pure scalar beats vld1_u8 + vget_lane_u8 here: each vget_lane_u8
+            // crosses from NEON to the ARM integer unit (~8-cycle stall on
+            // Cortex-A57).  With 8 extractions per iteration that is ≥64 stall
+            // cycles per loop body — worse than 8 independent ldrb instructions
+            // that the OOO integer pipeline overlaps freely.
+            //
+            // Caching fixPalette in a local lets the compiler hold the base
+            // pointer in one register across all 20 loop iterations (GB_W=160).
+            // GB_W=160 is divisible by 8, so the loop covers every pixel exactly.
+            const uint16_t* const fp = gb->cgb.fixPalette;
+            for (int x = 0; x < GB_W; x += 8) {
+                row[x+0] = fp[pixels[x+0]];
+                row[x+1] = fp[pixels[x+1]];
+                row[x+2] = fp[pixels[x+2]];
+                row[x+3] = fp[pixels[x+3]];
+                row[x+4] = fp[pixels[x+4]];
+                row[x+5] = fp[pixels[x+5]];
+                row[x+6] = fp[pixels[x+6]];
+                row[x+7] = fp[pixels[x+7]];
+            }
         }
         return;
     }
@@ -1112,7 +1140,7 @@ void gb_unload_rom();
 //      skipping it for 1-cycle instructions and making lcd_count advance too fast.
 //
 // Must only be called when g_gb.running == true.
-inline void gb_run_one_frame() {
+inline void __attribute__((optimize("O3"))) gb_run_one_frame() {
     if (g_gb.running) {
         // Stamp the frame origin so every audio_write() call during this frame
         // can compute an accurate T-cycle offset for generate_samples().
@@ -1128,3 +1156,5 @@ inline void gb_run_one_frame() {
 // Update the joypad from the overlay's keysHeld bitmask.
 // Uses Peanut-GB's active-low convention: 0 = pressed.
 void gb_set_input(uint64_t keysHeld);
+
+#pragma GCC pop_options

@@ -24,10 +24,11 @@
 
 #pragma once
 
-// Per-frame rendering and emulation tick — called at 59.73 fps.
-// O3: enables full unrolling of gb_tick_frame(), GBOverlayElement::draw(),
-// and the fast-forward loop.  Explicit so it is immune to include order.
-#pragma GCC optimize("O3")
+// Per-function attributes override this file-level Os baseline where needed.
+// Hot per-frame functions carry __attribute__((optimize("O3"))).
+// Cold GUI / setup functions inherit Os from the push below.
+#pragma GCC push_options
+#pragma GCC optimize("Os")
 
 // GBOverlayGui never calls swapTo — all navigation is done via
 // setNextOverlay + close(), exactly as GBWindowedGui does.
@@ -44,7 +45,7 @@
 // See GBOverlayElement::draw() for the full timing rationale.
 #ifndef GB_TICK_FRAME_DEFINED
 #define GB_TICK_FRAME_DEFINED
-inline void gb_tick_frame() {
+inline void __attribute__((optimize("O3"))) gb_tick_frame() {
     ++g_frame_count;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -75,7 +76,7 @@ static bool s_ovl_free_dragging = false;
 // =============================================================================
 class GBOverlayElement : public tsl::elm::Element {
 public:
-    virtual void draw(tsl::gfx::Renderer* renderer) override {
+    virtual void __attribute__((optimize("O3"))) draw(tsl::gfx::Renderer* renderer) override {
         // In free overlay mode set the Y render offset BEFORE any draw call so
         // init_outer_lut() (called lazily inside render_gb_screen / letterbox)
         // builds the row LUT with the trimmed viewport base.  Reset to 0 in
@@ -119,12 +120,53 @@ public:
         ult::hasNextPageButton.store(false, std::memory_order_release);
 
         // Background fill — use theme bg_color/bg_alpha.
-        // When wallpaper is active, force the default 000000/D so a custom bg
-        // colour does not bleed into exposed edges around the wallpaper image.
-        {
-            const tsl::Color effBg = has_wallpaper
-                ? tsl::Color{0x0, 0x0, 0x0, 0xD} : g_ovl_bg_col;
-            renderer->fillScreen(renderer->a(effBg));
+        // When wallpaper is active and WILL render, force pure black (000000/D)
+        // so a custom bg colour does not bleed into sub-pixel edges of the image.
+        //
+        // BUG FIX: wallpaperWillRender is evaluated BEFORE effBg.
+        // The previous code keyed the colour choice on `has_wallpaper` alone
+        // (expandedMemory && g_overlay_wallpaper), which is true whenever wallpaper
+        // is enabled in settings — even when the wallpaper data was never loaded
+        // because a 4 MB ROM consumed most of the 8 MB heap.  In that situation
+        // `wallpaperData.empty()` is true, wallpaper cannot render, but the
+        // background was still forced to black instead of the user's theme colour.
+        // Gating the black-override on `wallpaperWillRender` (the same conjunction
+        // draw_wallpaper_direct tests internally) fixes this: the theme colour
+        // g_ovl_bg_col is used whenever wallpaper cannot actually be drawn.
+        //
+        // Optimization — skip fillScreen when wallpaper will cover every pixel.
+        // In fixed overlay mode, draw_wallpaper_direct + render_gb_{screen,letterbox}
+        // together write all 448×720 = 322,560 pixels, making fillScreen's ~645 KB
+        // write entirely redundant (one full extra memory pass per frame, wasted).
+        // draw_wallpaper_direct reads framebuffer[0] once for bg_r/g/b/a; we prime
+        // only that slot and skip the full-frame write.
+        // Free-overlay mode is excluded: its variable-height transparent rows are
+        // zeroed by clear_fb_rows_transparent_448, and the coverage maths changes
+        // with pos_y — fillScreen is kept there for safety.
+        //
+        // refreshWallpaper is snapshot once; if it flips after this point,
+        // draw_wallpaper_direct returns early and one stale frame is shown —
+        // the same one-frame artifact the prior code already produced.
+        const bool wallpaperWillRender =
+            !free_mode &&
+            has_wallpaper &&
+            !ult::wallpaperData.empty() &&
+            !ult::refreshWallpaper.load(std::memory_order_acquire) &&
+            ult::correctFrameSize;
+
+        // Force black only when wallpaper WILL cover every pixel.
+        // Fall back to the configured theme colour whenever wallpaper cannot
+        // render (empty data, wrong frame size, refresh pending, free mode).
+        const tsl::Color effBg  = wallpaperWillRender
+            ? tsl::Color{0x0, 0x0, 0x0, 0xD} : g_ovl_bg_col;
+        const tsl::Color aEffBg = renderer->a(effBg);
+        if (!wallpaperWillRender) {
+            renderer->fillScreen(aEffBg);
+        } else {
+            // Prime pixel[0] — the only framebuffer slot draw_wallpaper_direct
+            // reads (for bg_r/g/b/a).  Every other pixel is written by
+            // draw_wallpaper_direct or the GB screen/letterbox renderers.
+            reinterpret_cast<tsl::Color*>(fb16)[0] = aEffBg;
         }
 
         // Draw the wallpaper, skipping the GB viewport region that render_gb_screen
@@ -141,10 +183,10 @@ public:
         // region splits into three branch-free bands and uses NEON 8-pixel
         // stores throughout.
         //
-        // pre_wp_bg: background colour from fillScreen, captured from framebuffer[0]
-        // BEFORE wallpaper blends into it.  Used by fill_vp_corners_448 later so
-        // the corner blend matches draw_wallpaper_direct exactly.
-        const uint16_t pre_wp_bg = fb16[0];  // read after fillScreen, before wallpaper
+        // pre_wp_bg: packed RGBA4444 at fb16[0], set by either fillScreen or the
+        // single-pixel prime above.  Used by fill_vp_corners_448 after the
+        // letterbox fill so corner blending matches draw_wallpaper_direct exactly.
+        const uint16_t pre_wp_bg = fb16[0];  // read before wallpaper blends into it
         if (has_wallpaper) {
             if (free_mode) {
                 // Free mode: framebuffer is OVL_FREE_FB_H (720) rows tall.
@@ -260,8 +302,31 @@ public:
         // is dragging so the game is truly paused (not just audio-silenced).  The
         // last rendered framebuffer continues to be drawn by render_gb_screen below,
         // giving a clean frozen frame under the dim/border/"Paused" overlay.
-        if (!s_ovl_free_dragging)
-            gb_tick_frame();
+        //
+        // Screenshot capture: backgroundEventPoller sets ult::disableTransparency=true
+        // for 1.5 s while the system takes the screenshot, then sets it false.
+        // We mirror the drag-pause behavior exactly: pause audio on the rising edge
+        // (so the SPSC ring never empties and buzzes), hold the last rendered frame
+        // for the duration, then resume and re-anchor the GB clock on the falling edge
+        // (so the emulator doesn't try to catch up 1.5 s of missed frames).
+        // ult::disableTransparency is a plain bool written by the background thread;
+        // reading it here carries the same benign race already present elsewhere in
+        // the render loop and is safe in practice on ARMv8 with a single writer.
+        {
+            static bool s_was_screenshot = false;
+            const bool  capturing        = ult::disableTransparency;
+            if (capturing != s_was_screenshot) {
+                if (capturing) {
+                    gb_audio_pause();           // stop feeding audio ring → no buzz
+                } else {
+                    gb_audio_resume();
+                    g_gb_frame_next_ns = 0;     // re-anchor clock; don't catch up 1.5 s
+                }
+                s_was_screenshot = capturing;
+            }
+            if (!s_ovl_free_dragging && !capturing)
+                gb_tick_frame();
+        }
 
         render_gb_letterbox(renderer);
         // Theme-aware letterbox override: always use g_ovl_frame_packed (frame_color +
@@ -519,6 +584,64 @@ public:
                 20u);
         }
         } // end fb_top/fb_bot scope
+
+#ifdef GB_FPS
+        // ── FPS indicator (overlay player mode) ───────────────────────────────
+        // Compiled in ONLY when -DGB_FPS is supplied to the build; the #ifdef
+        // guarantees zero code, zero data, and zero runtime cost in production.
+        //
+        // Placement: 3 px inside the top-left corner of the game viewport,
+        // adjusted by g_render_y_offset so the label tracks correctly in both
+        // fixed-overlay and free-overlay modes.
+        //
+        // Measurement: same 1-second counting window as the windowed element,
+        // with count divided by actual elapsed nanoseconds so a window that ran
+        // slightly over 1 s doesn't erroneously show 61 fps.
+        {
+            static uint64_t s_fps_win_start = 0;   // ns timestamp of window open
+            static int       s_fps_frame_cnt = 0;   // frames counted this second
+            static int       s_fps_display   = 0;   // last completed 1 s measurement
+
+            const uint64_t now = ult::nowNs();
+            if (s_fps_win_start == 0) s_fps_win_start = now;
+
+            ++s_fps_frame_cnt;
+            if (now - s_fps_win_start >= 1'000'000'000ULL) {
+                const uint64_t elapsed = now - s_fps_win_start;
+                s_fps_display   = static_cast<int>(
+                    static_cast<uint64_t>(s_fps_frame_cnt) * 1'000'000'000ULL / elapsed);
+                s_fps_frame_cnt = 0;
+                s_fps_win_start = now;
+            }
+
+            // Stack-only integer formatter — no heap, no <cstdio> overhead.
+            char buf[8];
+            int  v   = s_fps_display;
+            int  len = 0;
+            if      (v >= 100) { buf[len++] = '0' + v / 100; v %= 100;
+                                  buf[len++] = '0' + v / 10;
+                                  buf[len++] = '0' + v % 10; }
+            else if (v >=  10) { buf[len++] = '0' + v / 10;
+                                  buf[len++] = '0' + v % 10; }
+            else                { buf[len++] = '0' + v; }
+            buf[len] = '\0';
+
+            // Font size: fixed 10 px — the overlay viewport is always the same
+            // physical size (400×360) regardless of handheld vs docked, so a
+            // constant size is appropriate (unlike the windowed element which
+            // scales with g_win_scale).
+            static constexpr s32 font_sz = 10;
+
+            // Semi-transparent black shadow one pixel down-right for contrast,
+            // then the yellow label on top.
+            const s32 tx = VP_X + 3;
+            const s32 ty = VP_Y + g_render_y_offset + font_sz + 2;
+            renderer->drawString(buf, false, tx + 1, ty + 1, font_sz,
+                                 tsl::Color{0x0, 0x0, 0x0, 0xA});  // shadow
+            renderer->drawString(buf, false, tx,     ty,     font_sz,
+                                 tsl::Color{0xF, 0xE, 0x0, 0xF});  // yellow
+        }
+#endif  // GB_FPS
     }  // end draw()
 
     virtual void layout(u16, u16, u16, u16) override {
@@ -934,6 +1057,39 @@ public:
             if (s_ovl_free_dragging) return true;
         }
 
+        // ── Left/Right stick click: swap overlay mode ─────────────────────────
+        // Active in both fixed and free overlay player modes.
+        // Mirrors the windowed-mode resize scheme but switches overlay type instead
+        // of scale.  Settings (ovl_free_mode) are saved before relaunch so the new
+        // session starts in the correct mode immediately.
+        //
+        //   Left  stick click → reload as fixed overlay  (-overlay)
+        //   Right stick click → reload as free overlay   (-freeoverlay)
+        //
+        // Not active during pass-through or while a drag reposition is in progress.
+        // Game state is preserved: exitServices() → gb_unload_rom() saves state.
+        if (!m_zl_state.pass_through && !s_ovl_free_dragging) {
+            const bool lstick = (keysDown & KEY_LSTICK) && !(keysHeld & ~KEY_LSTICK & ALL_KEYS_MASK);
+            const bool rstick = (keysDown & KEY_RSTICK) && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK);
+            if (lstick || rstick) {
+                const bool wantFree = rstick;   // lstick → fixed (false), rstick → free (true)
+                g_overlay_free_mode = wantFree;
+                save_ovl_free_mode();
+                triggerRumbleClick.store(true, std::memory_order_release);
+                // Suppress directMode exit double-click, matching windowed resize behaviour.
+                launchComboHasTriggered.store(true, std::memory_order_release);
+                if (g_gb.romPath[0]) {
+                    if (wantFree)
+                        launch_free_overlay_mode(g_gb.romPath);
+                    else
+                        launch_overlay_mode(g_gb.romPath);
+                }
+                return true;
+            }
+        }
+
         return true;  // consume all input while in-game
     }
 };
+
+#pragma GCC pop_options

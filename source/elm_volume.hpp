@@ -22,8 +22,9 @@
 
 #pragma once
 
-// UI element — cold path, never called during gameplay.
-// Os: keeps binary lean; draw() fires only on menu navigation, not per game-frame.
+// Cold UI path — only active when the overlay menu is open.
+// Os keeps these lean; no per-frame hot paths exist in this file.
+#pragma GCC push_options
 #pragma GCC optimize("Os")
 
 #include <tesla.hpp>
@@ -156,3 +157,55 @@ public:
 private:
     std::function<void()> m_iconTapCallback;
 };
+
+
+// =============================================================================
+// AudioBalanceTrackBar — per-game GB-audio balance trim (−150% … 0% … +150%).
+//
+// Internal m_value is the direct offset from m_minValue (= 0 at far left,
+// 300 at far right), so each key/touch step is exactly 1 percentage point.
+//
+//   m_value   0  →  display "−150%"  (2^−3  = 0.125× gain)
+//   m_value 150  →  display    "0%"  (2^ 0  = 1.000× gain, neutral)
+//   m_value 300  →  display "+150%"  (2^+3  = 8.000× gain)
+//
+//   dispVal = −150 + m_value        (minValue=−150, maxValue=+150)
+//
+// KEY_Y while focused → reset to m_value 150 (0% balance); handled in
+// GameSettingsGui::handleInput().
+// =============================================================================
+class AudioBalanceTrackBar final : public tsl::elm::TrackBar {
+public:
+    static constexpr int kMinBalance = -150;
+    static constexpr int kMaxBalance =  150;
+
+    AudioBalanceTrackBar(const char icon[3], bool usingStepTrackbar,
+                         bool usingNamedStepTrackbar, bool useV2Style,
+                         const std::string& label, const std::string& units,
+                         bool unlockedTrackbar)
+        : TrackBar(icon, usingStepTrackbar, usingNamedStepTrackbar,
+                   useV2Style, label, units, unlockedTrackbar)
+    {
+        // m_minValue / m_maxValue are protected TrackBar members (s16).
+        // The slider span becomes (300), giving 301 positions — one per 1%.
+        m_minValue = static_cast<s16>(kMinBalance);
+        m_maxValue = static_cast<s16>(kMaxBalance);
+        // "+" prefix for positive values is automatic when m_minValue < 0.
+    }
+
+    // -----------------------------------------------------------------------
+    // Convert between the raw m_value (0–300) and the balance domain (−150…+150).
+    //   sliderToBalance(0)   = −150
+    //   sliderToBalance(150) =    0
+    //   sliderToBalance(300) = +150
+    // -----------------------------------------------------------------------
+    static int16_t sliderToBalance(u16 raw) {
+        return static_cast<int16_t>(kMinBalance + static_cast<int>(raw));
+    }
+    static u16 balanceToSlider(int16_t b) {
+        const int clamped = std::clamp(static_cast<int>(b), kMinBalance, kMaxBalance);
+        return static_cast<u16>(clamped - kMinBalance);
+    }
+};
+
+#pragma GCC pop_options

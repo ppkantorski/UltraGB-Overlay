@@ -30,7 +30,6 @@
 #include "gb_core.h"
 #include "gb_renderer.h"
 
-#pragma GCC optimize("O3")
 
 // =============================================================================
 // Paths / config
@@ -78,6 +77,7 @@ static const std::string kKeyLastRom       {"last_rom"};
 static const std::string kKeyVolume        {"volume"};
 static const std::string kKeyVolBackup     {"vol_backup"};
 static const std::string kKeyGameVolume    {"game_volume"};
+static const std::string kKeyGameVolBackup {"game_vol_backup"};
 static const std::string kKeyLcdGrid       {"lcd_grid"};
 static const std::string kKeyWindowed      {"windowed"};
 static const std::string kKeyIngameHaptics {"ingame_haptics"};
@@ -124,6 +124,11 @@ static const char* vol_to_str(u8 v, char (&buf)[4]) {
 // Persisted to vol_backup in config.ini so it survives app exit.
 // Always > 0; initialized to 50 as a safe default.
 static u8 g_vol_backup = 50;
+
+// Unmute backup for background-title (Active Title) volume.
+// Persisted to game_vol_backup in config.ini so it survives app exit.
+// Always > 0; initialized to 30 matching the game_volume default.
+static u8 g_game_vol_backup = 30;
 
 // ── Windowed mode ─────────────────────────────────────────────────────────────
 // When true the ROM selector relaunches this overlay with -windowed <path>,

@@ -46,8 +46,8 @@ WALNUT_DEFINES := -DENABLE_LCD=1 \
 #---------------------------------------------------------------------------------
 ARCH := -march=armv8-a+simd+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS := -Wall -O2 \
-          -ffunction-sections -fdata-sections -flto \
+CFLAGS := -Wall -Os \
+          -ffunction-sections -fdata-sections -flto=6 \
           -fuse-linker-plugin -fomit-frame-pointer \
           -fno-strict-aliasing -frename-registers \
           -falign-functions=16 \
@@ -69,6 +69,15 @@ CFLAGS += -DUSING_WIDGET_DIRECTIVE=$(USING_WIDGET_DIRECTIVE)
 NO_BACK_KEY_DIRECTIVE := 1
 CFLAGS += -DNO_BACK_KEY_DIRECTIVE=$(NO_BACK_KEY_DIRECTIVE)
 
+# Targeted speed optimizations
+CFLAGS += -DTESLA_TARGETED_SPEED
+
+# Targeted size optimizations
+CFLAGS += -DULTRA_TARGETED_SIZE
+
+# FPS Indicator (for debugging)
+CFLAGS += -DGB_FPS
+
 CXXFLAGS := $(CFLAGS) -std=c++26 \
             -Wno-dangling-else \
             -ffast-math \
@@ -82,11 +91,9 @@ LDFLAGS  += -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,-Map,$(notdir $*.
 
 LIBS := -lcurl -lz -lmbedtls -lmbedx509 -lmbedcrypto -lnx
 
-CXXFLAGS += -ffunction-sections -fdata-sections
 LDFLAGS  += -Wl,--gc-sections -Wl,--as-needed
 
 # LTO with parallel LTRANS jobs — run make -j6
-CXXFLAGS += -flto -fuse-linker-plugin -flto=6
 LDFLAGS  += -flto=6
 
 #---------------------------------------------------------------------------------

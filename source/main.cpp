@@ -27,6 +27,7 @@
 #include "gb_utils.hpp"      // ← globals + all shared helpers
                              //   (pulls in gb_globals.hpp → gb_audio.h, gb_core.h, gb_renderer.h)
 
+
 #include <dirent.h>
 #include <ctime>
 #include <vector>
@@ -35,12 +36,6 @@
 
 using namespace ult;
 
-// ── Optimization boundary ─────────────────────────────────────────────────────
-// Cold paths: config load/save, ROM load/unload, state/save-slot I/O.
-// These run at most once per ROM change — binary size matters, not speed.
-// Hot paths (gb_audio.h, gb_core.h, gb_renderer.h, gb_overlay.hpp,
-// gb_windowed.hpp) carry their own O3 pragmas and are unaffected.
-#pragma GCC optimize("O3")
 
 // =============================================================================
 // Paths, globals, and data-coupled helpers → gb_globals.hpp (via gb_utils.hpp)
@@ -89,16 +84,28 @@ static void load_config() {
         strncpy(g_last_rom_path, last_rom_val.c_str(), sizeof(g_last_rom_path) - 1);
 
     // volume — master GB audio volume (0–100), default 50
-    { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolume), v))
-        gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100))); }
+    {
+        int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolume), v))
+        gb_audio_set_volume(static_cast<u8>(std::clamp(v, 0, 100)));
+    }
 
     // vol_backup — unmute restore target (0 treated as absent → default 50)
-    { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolBackup), v))
-        g_vol_backup = static_cast<u8>(std::clamp(v, 1, 100)); }
+    {
+        int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyVolBackup), v))
+        g_vol_backup = static_cast<u8>(std::clamp(v, 1, 100));
+    }
 
     // game_volume — per-process master volume for background title on player-mode entry (0–100), default 100
-    { int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyGameVolume), v))
-        g_game_volume = static_cast<u8>(std::clamp(v, 0, 100)); }
+    {
+        int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyGameVolume), v))
+        g_game_volume = static_cast<u8>(std::clamp(v, 0, 100));
+    }
+
+    // game_vol_backup — unmute restore target for Active Title (0 treated as absent → default 30)
+    {
+        int v = 0; if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyGameVolBackup), v))
+        g_game_vol_backup = static_cast<u8>(std::clamp(v, 1, 100));
+    }
 
     // lcd_grid — 0 = off (default), 1 = LCD grid effect enabled
     const std::string grid_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyLcdGrid);
@@ -119,9 +126,11 @@ static void load_config() {
         g_overlay_wallpaper = (wall_val == "1");
 
     // win_pos_x / win_pos_y — persisted VI-space window position
-    { int v = 0;
-      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosX), v)) g_win_pos_x = v;
-      if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosY), v)) g_win_pos_y = v; }
+    {
+        int v = 0;
+        if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosX), v)) g_win_pos_x = v;
+        if (parse_uint(ult::parseValueFromIniSection(path, kConfigSection, kKeyWinPosY), v)) g_win_pos_y = v;
+    }
 
     // win_scale — windowed display scale: 1–6 (default 1).
     // Any absent or unrecognised value falls back to 1.
@@ -193,7 +202,8 @@ static void write_default_config_if_missing() {
     set_if_missing("save_dir",      g_save_dir);
     set_if_missing("volume",        "50");
     set_if_missing("vol_backup",    "50");
-    set_if_missing("game_volume",   "100");
+    set_if_missing("game_volume",   "30");
+    set_if_missing("game_vol_backup","30");
     set_if_missing("windowed",      "0");
     set_if_missing("lcd_grid",      "0");
     set_if_missing("ingame_haptics", "1");
@@ -527,6 +537,8 @@ bool gb_load_rom(const char* path) {
     // gb_init_lcd sets no_sprite_limit=true; override here for games that
     // have the hardware cap re-enabled in their config.
     g_gb.gb->direct.no_sprite_limit = load_game_no_sprite_limit(path);
+    // Apply per-game audio balance trim so every launch starts at the correct level.
+    gb_audio_set_balance(load_game_audio_balance(path));
 
     // Allocate the framebuffer — ~45 KB heap, only resident during active gameplay.
     g_gb_fb = static_cast<uint16_t*>(calloc(GB_W * GB_H, sizeof(uint16_t)));
@@ -551,6 +563,9 @@ bool gb_load_rom(const char* path) {
     // load_state calls gb_init_lcd internally to re-patch function pointers,
     // which resets no_sprite_limit to true.  Re-apply the per-game preference.
     g_gb.gb->direct.no_sprite_limit = load_game_no_sprite_limit(path);
+    // Re-apply audio balance — load_state doesn't touch it, but belt-and-suspenders
+    // ensures the correct gain is always set regardless of the load path taken.
+    gb_audio_set_balance(load_game_audio_balance(path));
 
     if (!apu_restored) {
         // No v3 APU snapshot available (cold boot, v1 file, or read error).
@@ -622,18 +637,13 @@ void gb_unload_rom() {
     maybe_reload_wallpaper();
 }
 
-// ── Optimization boundary ─────────────────────────────────────────────────────
-// Hot paths: gb_set_input and draw_ultragb_title are called every display
-// frame (59.73 fps).  O3 enables register pressure reduction and full
-// inlining of the joypad bit-mask chain and per-letter wave math.
-#pragma GCC optimize("O3")
 
 // =============================================================================
 // gb_set_input — KEY_* macros (old libnx style used by this libtesla fork)
 // GB joypad active-low: 0 = pressed
 //   bit 0=A  1=B  2=Select  3=Start  4=Right  5=Left  6=Up  7=Down
 // =============================================================================
-void gb_set_input(u64 keysHeld) {
+void __attribute__((optimize("O3"))) gb_set_input(u64 keysHeld) {
     if (!g_gb.running) return;
     uint8_t joy = 0xFF;
     if (keysHeld & KEY_A)     joy &= ~(1u << 0);
@@ -652,7 +662,7 @@ void gb_set_input(u64 keysHeld) {
 // =============================================================================
 // filter function for scandir(); accepts .gb / .gbc files only.
 // is_gb_rom inlined here — it was only ever called from this one site.
-static int gb_rom_filter(const struct dirent* e) {
+static int __attribute__((optimize("Os"))) gb_rom_filter(const struct dirent* e) {
     const char* n = e->d_name;
     const size_t len = strlen(n);
     if (len >= 4) {
@@ -674,7 +684,7 @@ static int gb_rom_filter(const struct dirent* e) {
 //   Static:  "Ultra" = logoColor1 (white)
 //            "GB"   = logoColor2 (fixed accent)
 // Uses a stack char[2] buffer per letter to avoid per-call heap allocation.
-static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
+static s32 __attribute__((optimize("O3"))) draw_ultragb_title(tsl::gfx::Renderer* renderer,
                                 const s32 x, const s32 y, const u32 fontSize, bool quickModeSymbol = false) {
     static constexpr double CYCLE  = 1.6;
     static constexpr double WSCALE = 2.0 * ult::_M_PI / CYCLE;
@@ -720,7 +730,7 @@ static s32 draw_ultragb_title(tsl::gfx::Renderer* renderer,
 // Cold paths: all GUI classes below fire on menu open/navigation, never
 // during gameplay.  Os shrinks createUI(), handleInput(), and constructors
 // which account for the bulk of non-emulation .text in this file.
-#pragma GCC optimize("Os")
+//#pragma GCC optimize("Os")
 
 class RomSelectorGui;       // forward declare
 class GameSettingsGui;      // forward declare
@@ -886,7 +896,7 @@ public:
             // ── Confirmation screen (formerly ConfirmGui::createUI) ───────────
             list->addItem(new tsl::elm::CategoryHeader(
                 std::string(make_slot_label(m_slot)) +
-                " " + ult::DIVIDER_SYMBOL + " " + confirm_action_label(m_pending_action)));
+                " " + ult::DIVIDER_SYMBOL + " Confirm " + confirm_action_label(m_pending_action)));
 
             auto* yesItem = new tsl::elm::SilentListItem("Yes");
             yesItem->setClickListener([this](u64 keys) -> bool {
@@ -1076,9 +1086,10 @@ public:
 // B returns to RomSelectorGui.
 // =============================================================================
 class GameSettingsGui : public tsl::Gui {
-    std::string m_rom_path;
-    std::string m_display_name;
-    std::string m_jump_to;   // item label to restore scroll on re-entry
+    std::string           m_rom_path;
+    std::string           m_display_name;
+    std::string           m_jump_to;        // item label to restore scroll on re-entry
+    AudioBalanceTrackBar* m_bal_slider = nullptr;  // KEY_Y reset target
 public:
     GameSettingsGui(std::string romPath, std::string displayName, std::string jumpTo = "")
         : m_rom_path(std::move(romPath))
@@ -1249,6 +1260,35 @@ public:
             list->addItem(ghost_item);
         }
 
+
+        list->addItem(new tsl::elm::CategoryHeader("Volume "+ult::DIVIDER_SYMBOL+" \uE0E3 Reset"));
+
+        // ── Audio Balance ─────────────────────────────────────────────────────
+        // Per-game GB-audio trim stored in the per-ROM .ini as "audio_balance".
+        // Range: −100% (1/4 volume) … 0% (neutral) … +100% (4x volume).
+        // Applied as a power-of-2 gain multiplier (gain = 2^(bal/50)) on top of
+        // the master volume so the main volume control still scales every game
+        // identically — only the relative loudness between games is adjusted here.
+        // Live-applies when the ROM is running in the background.
+        // KEY_Y while focused resets to 0% (neutral).
+        {
+            const int16_t curBal = load_game_audio_balance(romPath.c_str());
+            auto* bal_slider = new AudioBalanceTrackBar(
+                "\uE13C", false, false, true, "Audio Balance", "%", false);
+            bal_slider->setProgress(AudioBalanceTrackBar::balanceToSlider(curBal));
+            bal_slider->setValueChangedListener([romPath](u16 sliderVal) {
+                const int16_t bal = AudioBalanceTrackBar::sliderToBalance(sliderVal);
+                save_game_audio_balance(romPath.c_str(), bal);
+                // Live-apply if this ROM is currently running in the background.
+                if (g_gb.rom &&
+                    strncmp(g_gb.romPath, romPath.c_str(), sizeof(g_gb.romPath)) == 0)
+                    gb_audio_set_balance(bal);
+            });
+            m_bal_slider = bal_slider;
+            list->addItem(bal_slider);
+        }
+
+
         // Restore scroll position when returning from a sub-screen
         if (!m_jump_to.empty())
             list->jumpToItem(m_jump_to, "", true);
@@ -1264,6 +1304,16 @@ public:
         if (keysDown & KEY_B) {
             triggerExitFeedback();
             tsl::swapTo<RomSelectorGui>(m_display_name);
+            return true;
+        }
+        // KEY_Y while Audio Balance slider is focused → reset to 0% (neutral).
+        if ((keysDown & KEY_Y) && m_bal_slider && m_bal_slider->hasFocus()) {
+            m_bal_slider->setProgress(AudioBalanceTrackBar::balanceToSlider(0));
+            save_game_audio_balance(m_rom_path.c_str(), 0);
+            if (g_gb.rom &&
+                strncmp(g_gb.romPath, m_rom_path.c_str(), sizeof(g_gb.romPath)) == 0)
+                gb_audio_set_balance(0);
+            triggerNavigationFeedback();
             return true;
         }
         return false;
@@ -1647,7 +1697,7 @@ class SettingsGui : public tsl::Gui {
     u8                 m_vol             = 100;
     u8                 m_vol_backup      = 100;
     u8                 m_game_vol        = 100;
-    u8                 m_game_vol_backup = 100;
+    u8                 m_game_vol_backup = 30;
     std::string        m_rom_scroll;       // ROM name to scroll to when returning to RomSelectorGui
     std::string        m_settings_scroll; // scroll target passed in at construction; forwarded to QuickComboSelectorGui so it can restore position on return
 
@@ -1657,7 +1707,7 @@ class SettingsGui : public tsl::Gui {
     std::string focused_label() {
         auto* f = getFocusedElement();
         if (!f) return {};
-        if (f == m_vol_slider)      return std::string("GB Player");
+        if (f == m_vol_slider)      return std::string("Game Boy");
         if (f == m_game_vol_slider) return std::string("Active Title");
         return static_cast<tsl::elm::ListItem*>(f)->getText();
     }
@@ -1688,10 +1738,16 @@ class SettingsGui : public tsl::Gui {
     // (useful for silencing the background game while in the settings menu).
     void do_game_vol_toggle() {
         if (m_game_vol > 0) {
+            // Muting — capture current positive volume as the restore target and persist it.
             m_game_vol_backup = m_game_vol;
+            g_game_vol_backup = m_game_vol;
+            char vbuf2[4];
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyGameVolBackup,
+                                 vol_to_str(m_game_vol_backup, vbuf2), "");
             m_game_vol = 0;
         } else {
-            m_game_vol = (m_game_vol_backup > 0) ? m_game_vol_backup : 100;
+            // Unmuting — restore to the persisted backup (always > 0).
+            m_game_vol = (m_game_vol_backup > 0) ? m_game_vol_backup : 30;
         }
         m_game_vol_slider->setProgress(m_game_vol);
         g_game_volume = m_game_vol;
@@ -1750,9 +1806,9 @@ public:
         m_vol_backup = g_vol_backup;  // load persisted backup; never 0
 
         auto* vol_slider = new VolumeTrackBar(
-            "\uE13C", false, false, true, "GB Player", "%", false);
+            "\uE13C", false, false, true, "Game Boy", "%", false);
         vol_slider->setProgress(m_vol);
-        vol_slider->setValueChangedListener([this](u8 value) {
+        vol_slider->setValueChangedListener([this](u16 value) {
             m_vol = value;
             gb_audio_set_volume(value);
             char vbuf[4];
@@ -1779,20 +1835,24 @@ public:
         // Changes take effect immediately via aud:a / audout:a so the running title
         // responds live while the settings menu is open.
         m_game_vol = g_game_volume;
-        m_game_vol_backup = (m_game_vol > 0) ? m_game_vol : 100;
+        m_game_vol_backup = g_game_vol_backup;  // load persisted backup; never 0
         auto* game_vol_slider = new VolumeTrackBar(
             "\uE13C", false, false, true, "Active Title", "%", false);
         game_vol_slider->setProgress(m_game_vol);
-        game_vol_slider->setValueChangedListener([this](u8 value) {
+        game_vol_slider->setValueChangedListener([this](u16 value) {
             m_game_vol = value;
             g_game_volume = value;
             char vbuf[4];
             ult::setIniFileValue(kConfigFile, kConfigSection, kKeyGameVolume,
                                  vol_to_str(value, vbuf), "");
             // Keep the unmute backup up to date (mirror the GB slider logic).
-            const u8 newBackup = (value > 0) ? value : static_cast<u8>(100);
-            if (newBackup != m_game_vol_backup)
-                m_game_vol_backup = newBackup;
+            const u8 newBackup = (value > 0) ? value : static_cast<u8>(30);
+            if (newBackup != m_game_vol_backup) {
+                m_game_vol_backup  = newBackup;
+                g_game_vol_backup  = newBackup;
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeyGameVolBackup,
+                                     vol_to_str(newBackup, vbuf), "");
+            }
             // Apply immediately to the running background title.
             if (s_pre_game_pid != 0 && R_SUCCEEDED(s_audproc_init())) {
                 s_audproc_set_vol(s_pre_game_pid, std::clamp(value / 100.f, 0.f, 1.f));
@@ -2202,17 +2262,17 @@ public:
 // The commented-out WindowedOverlay class at the bottom of gb_windowed.hpp
 // is kept for reference only — it is never dispatched.
 // =============================================================================
-// ── Optimization boundary ─────────────────────────────────────────────────────
-// gb_windowed.hpp carries its own O3 pragma — this boundary is here so the
-// pragma is visible in main.cpp's include list and cannot be missed in review.
-#pragma GCC optimize("O3")
+// gb_windowed.hpp manages its own push/Os/pop pragma stack internally.
+// Hot functions (update_win_row_lut, win_blit_rows, launch_win_blit,
+// GBWindowedElement::draw) carry __attribute__((optimize("O3"))) directly.
+// No file-level O3 pragma needed or wanted here.
 #include "gb_windowed.hpp"
 
 // ── Optimization boundary ─────────────────────────────────────────────────────
 // Cold paths: class Overlay (initServices, onShow, onHide, onRequestFocus —
 // all one-shot lifecycle calls), clamp_win_scale, setup_windowed_framebuffer,
 // and main() itself.  Os keeps these lean.
-#pragma GCC optimize("Os")
+//#pragma GCC optimize("Os")
 
 // =============================================================================
 // Overlay — single unified overlay class for every launch path:
@@ -2721,11 +2781,13 @@ int main(int argc, char* argv[]) {
         // re-read both later but g_win_scale_locked prevents it from clobbering
         // the stored value.  parse_uint leaves globals at their defaults (0)
         // on empty/invalid string, which is a safe top-anchor position.
-        { int v = 0;
-          if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosX), v))
-              g_win_pos_x = v;
-          if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosY), v))
-              g_win_pos_y = v; }
+        {
+            int v = 0;
+            if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosX), v))
+                g_win_pos_x = v;
+            if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosY), v))
+                g_win_pos_y = v;
+        }
         g_win_limited_fb = (earlyLimited && g_win_scale == 3);  // simple FB: only scale 3 on 4MB heap needs this
         setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 

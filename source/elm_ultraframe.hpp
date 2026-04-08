@@ -37,18 +37,23 @@
 
 #pragma once
 
-// UI frame element — cold path, never called during gameplay.
-// Os: string ops and footer layout math do not benefit from O3 unrolling.
-#pragma GCC optimize("O3")
+// Cold UI path — only active when the overlay menu is open.
+// Os keeps these lean; no per-frame hot paths exist in this file.
+#pragma GCC push_options
+#pragma GCC optimize("Os")
 
 #include <tesla.hpp>
 #include <string>
 #include "gb_renderer.h"   // draw_wallpaper_direct + all rendering primitives
 
-// draw_ultragb_title is defined in main.cpp (static, visible here because
-// this header is included after the definition).
-// Forward-declare the signature so the compiler is happy if included earlier.
+// draw_ultragb_title is defined in main.cpp with __attribute__((optimize("O3"))).
+// Wrap the forward declaration in a matching push/O3/pop so GCC never sees a
+// declaration-vs-definition attribute mismatch (-Wattributes), regardless of
+// whether this header is included before or after the definition.
+#pragma GCC push_options
+#pragma GCC optimize("O3")
 static s32 draw_ultragb_title(tsl::gfx::Renderer*, s32, s32, u32, bool);
+#pragma GCC pop_options
 
 class UltraGBOverlayFrame final : public tsl::elm::Element {
 public:
@@ -68,8 +73,26 @@ public:
     ~UltraGBOverlayFrame() override { delete m_contentElement; }
 
     // -----------------------------------------------------------------------
-    void draw(tsl::gfx::Renderer* renderer) override {
-        renderer->fillScreen(a(tsl::defaultBackgroundColor));
+    void __attribute__((optimize("O3"))) draw(tsl::gfx::Renderer* renderer) override {
+        // Optimization — skip fillScreen when wallpaper will cover the full frame.
+        // draw_wallpaper_direct with no skip parameters writes all 448×720 pixels,
+        // making fillScreen's ~645 KB write entirely redundant.  Prime only
+        // framebuffer[0] so draw_wallpaper_direct can read bg_r/g/b/a for its
+        // blend kernel; every other pixel is written by draw_wallpaper_direct.
+        // Fall back to fillScreen when wallpaper will not render this frame.
+        {
+            const bool wallpaperWillRender =
+                ult::expandedMemory &&
+                !ult::wallpaperData.empty() &&
+                !ult::refreshWallpaper.load(std::memory_order_acquire) &&
+                ult::correctFrameSize;
+            if (wallpaperWillRender) {
+                *static_cast<tsl::Color*>(renderer->getCurrentFramebuffer()) =
+                    a(tsl::defaultBackgroundColor);
+            } else {
+                renderer->fillScreen(a(tsl::defaultBackgroundColor));
+            }
+        }
         draw_wallpaper_direct(renderer);
 
 #if USING_WIDGET_DIRECTIVE
@@ -274,3 +297,4 @@ private:
     std::string m_cachedFooterString;           ///< Full bottom-line string passed to drawStringWithColoredSections.
     float       m_cachedPageLabelWidth = 0.f;   ///< getTextDimensions(m_cachedPageLabel) + gapWidth.
 };
+#pragma GCC pop_options

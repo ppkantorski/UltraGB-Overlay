@@ -33,6 +33,16 @@
  *     IIR used by most accurate GB emulators.  HP_R is derived from the Pan
  *     Docs capacitor spec: 0.999958^(4194304/48000/4) ≈ 0.99908 per sample.
  *
+ *   NEON optimisations in generate_samples (ARM AArch64, Switch Cortex-A57):
+ *   - due_arr precompute: events processed 4-wide via vmulq_n_u32 + vshrq.
+ *     Largest gain for Pokémon Yellow (~2,680 events/frame, Pikachu voice).
+ *   - DC-blocker: all 4 per-channel HP filters batched into one float32x4
+ *     pass (vfmaq_f32 + vsubq_f32 + vst1q_f32).  ~4× throughput vs scalar.
+ *   - NR51 panning: precomputed 0/1 mask vectors; per-sample mix is
+ *     2 × vmulq_f32 + 2 × vaddvq_f32 instead of 8 conditional float adds.
+ *   - d_out from the DC-blocker feeds the NR51 mix directly — no
+ *     extract-and-reload cycle between the two stages.
+ *
  *   Pause / resume (system-combo overlay hide / show):
  *   - gb_audio_pause()  — sets paused flag; audio thread discards SPSC events
  *     and submits silence.  GBAPU state (including hp_ch[]) is preserved.
@@ -71,6 +81,7 @@
 #include <switch.h>
 #include "tesla.hpp"   // ult::Audio::m_audioMutex, m_initialized
 
+#pragma GCC push_options
 #pragma GCC optimize("O3")
 
 // Forward-declare the APU callbacks that walnut_cgb.h calls.
@@ -198,6 +209,13 @@ struct GBAPU {
 // is imperceptible.
 static std::atomic<float> s_master_gain{1.0f};
 
+// Per-game audio balance trim — set once at game launch via gb_audio_set_balance().
+// Maps [-100, +100] → gain [0.25×, 4.0×] on a power-of-2 curve through 1.0 at 0:
+//   gain = 2^(balance / 50)  →  -100 → 0.25×,  0 → 1.00×,  +100 → 4.00×
+// Written from the UI / launch thread; read every frame in generate_samples().
+// Relaxed ordering matches s_master_gain — a one-frame lag on load is fine.
+static std::atomic<float> s_balance_gain{1.0f};
+
 // ── Background-title (Switch game) volume ─────────────────────────────────────
 // g_game_volume      : stored preference (0–100); persisted to config.ini.
 //                      Applied via aud:a / audout:a on player-mode entry.
@@ -231,7 +249,7 @@ static Result s_audproc_set_vol(u64 pid, float vol) {
     return rc;
 }
 
-static u8    g_game_volume       = 100;
+static u8    g_game_volume       = 30;
 static float s_pre_game_proc_vol = 1.0f;
 static u64   s_pre_game_pid      = 0;
 
@@ -428,9 +446,10 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
 
     uint32_t evt_idx = 0;   // next event to apply
 
-    // Hoist master gain: one atomic load per frame-call, not per sample.
-    // A one-frame lag on a slider drag is imperceptible.
-    const float mg = s_master_gain.load(std::memory_order_relaxed);
+    // Hoist master gain + per-game balance trim: two atomic loads per frame-call,
+    // not per sample.  Multiplied together here so the hot sample loop stays lean.
+    const float mg = s_master_gain.load(std::memory_order_relaxed)
+                   * s_balance_gain.load(std::memory_order_relaxed);
 
     // Precompute sample-index due values using a 32-bit fixed-point scale factor
     // instead of a 64-bit divide per event.  cycle is 0..70223 (16-bit), n_samp
@@ -439,10 +458,24 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     // cycle * scale fits in 32 bits with no overflow (70223 * 52691968 >> 16
     // < 70223 * 804 = 56,459,292 < 2^26).  Result is identical to the 64-bit
     // path for all valid inputs; 64-bit divide was ~10x more expensive on ARM.
+    //
+    // NEON path: each RegEvent is {addr(1), val(1), cycle(2)} = 4 bytes, so
+    // loading 4 events as uint32x4 gives cycle in bits [31:16] of each lane
+    // (little-endian). vshrq(ev4,16) isolates cycle, vmulq_n multiplies by
+    // scale, vshrq(,16) produces the final due index.  Scalar tail handles
+    // n_evts % 4 remainder.  No behaviour change — identical arithmetic.
     static uint32_t due_arr[LOC_CAP];
     {
         const uint32_t scale = (n_samp << 16) / GB_FRAME_CYC;
-        for (uint32_t k = 0; k < n_evts; ++k)
+        uint32_t k = 0;
+        for (; k + 4 <= n_evts; k += 4) {
+            const uint32x4_t ev4  = vld1q_u32(
+                reinterpret_cast<const uint32_t*>(evts + k));
+            const uint32x4_t cyc4 = vshrq_n_u32(ev4, 16);
+            const uint32x4_t due4 = vshrq_n_u32(vmulq_n_u32(cyc4, scale), 16);
+            vst1q_u32(due_arr + k, due4);
+        }
+        for (; k < n_evts; ++k)
             due_arr[k] = (static_cast<uint32_t>(evts[k].cycle) * scale) >> 16;
     }
 
@@ -458,6 +491,38 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
     // Hoist NR51 panning out of the per-sample loop.
     // NR51 also rarely changes mid-frame, so cache it exactly like NR50.
     uint8_t cached_nr51 = a.nr51;
+
+    // ── NEON constants — hoisted outside the per-sample loop ─────────────────
+    // HP_R and HP_C are compile-time constants; vdupq_n_f32 at -O3 produces a
+    // single load from the literal pool, hoisting avoids redundant loads in the
+    // inner loop.  The DC-blocker and NR51-mix NEON blocks below consume them.
+    const float32x4_t v_HP_R = vdupq_n_f32(HP_R);
+    const float32x4_t v_HP_C = vdupq_n_f32(HP_C);
+
+    // NR51 pan-mask vectors for NEON stereo mix.
+    //   v_nr51_l lane i = 1.0f  if channel i+1 is routed to the left output.
+    //   v_nr51_r lane i = 1.0f  if channel i+1 is routed to the right output.
+    // Built once here and rebuilt on rare mid-frame NR51 writes — same event
+    // frequency as the existing cached_nr51 dirty check.
+    float32x4_t v_nr51_l, v_nr51_r;
+
+    const auto build_nr51_masks = [&](const uint8_t nr51) {
+        const float lm[4] = {
+            (nr51 & 0x10u) ? 1.0f : 0.0f,  // CH1 → L
+            (nr51 & 0x20u) ? 1.0f : 0.0f,  // CH2 → L
+            (nr51 & 0x40u) ? 1.0f : 0.0f,  // CH3 → L
+            (nr51 & 0x80u) ? 1.0f : 0.0f   // CH4 → L
+        };
+        const float rm[4] = {
+            (nr51 & 0x01u) ? 1.0f : 0.0f,  // CH1 → R
+            (nr51 & 0x02u) ? 1.0f : 0.0f,  // CH2 → R
+            (nr51 & 0x04u) ? 1.0f : 0.0f,  // CH3 → R
+            (nr51 & 0x08u) ? 1.0f : 0.0f   // CH4 → R
+        };
+        v_nr51_l = vld1q_f32(lm);
+        v_nr51_r = vld1q_f32(rm);
+    };
+    build_nr51_masks(cached_nr51);   // prime masks for the first sample
 
     for (uint32_t i=0; i<n_samp; ++i) {
         // ── Cycle-accurate event distribution ────────────────────────────────
@@ -481,12 +546,20 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
         // (covers the rare mid-frame NR51 write injected by the event loop above).
         if (__builtin_expect(a.nr51 != cached_nr51, 0)) {
             cached_nr51 = a.nr51;
+            build_nr51_masks(cached_nr51);  // rebuild pan masks on mid-frame NR51 write
         }
 
         a.cycle_frac+=STEP;
         const int cyc=static_cast<int>(a.cycle_frac>>16);
         a.cycle_frac&=0xFFFFu;
-        const float rcyc = 1.0f / static_cast<float>(cyc);
+        // cyc is guaranteed to be 87 or 88 by the fixed-point STEP arithmetic:
+        //   STEP = floor((GB_CPU_HZ << 16) / GB_OUT_RATE) = 5,726,623
+        //   cyc  = accumulated >> 16 = 87 base, +1 carry when fraction overflows.
+        // Replaces fdivs (~12 cycles, non-pipelined on Cortex-A57) with a
+        // precomputed constant lookup (FCMP + FCSEL, ~3 cycles) × 803 samples/frame.
+        static constexpr float RCP87 = 1.0f / 87.0f;
+        static constexpr float RCP88 = 1.0f / 88.0f;
+        const float rcyc = (cyc == 87) ? RCP87 : RCP88;
 
         // ── Frame sequencer ───────────────────────────────────────────────────
         a.seq_cycles+=cyc;
@@ -549,7 +622,7 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.prev_dac_on[0]  = a.ch1.dac_on;
             a.prev_enabled[0] = a.ch1.enabled;
         }
-        { const float _h=HP_R*a.hp_ch[0]+HP_C*d1; d1-=_h; a.hp_ch[0]=_h; }
+        // ch1 HP-filter applied in combined NEON DC-blocker below (after all 4 channels)
 
         // ── CH2 — integrate square wave ───────────────────────────────────────
         float d2;
@@ -577,7 +650,7 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.prev_dac_on[1]  = a.ch2.dac_on;
             a.prev_enabled[1] = a.ch2.enabled;
         }
-        { const float _h=HP_R*a.hp_ch[1]+HP_C*d2; d2-=_h; a.hp_ch[1]=_h; }
+        // ch2 HP-filter applied in combined NEON DC-blocker below
 
         // ── CH3 — integrate wave table ────────────────────────────────────────
         // Accumulate (nibble_value × cycles_at_that_position) / cyc.
@@ -613,7 +686,7 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.prev_dac_on[2]  = a.ch3.dac_on;
             a.prev_enabled[2] = a.ch3.enabled;
         }
-        { const float _h=HP_R*a.hp_ch[2]+HP_C*d3; d3-=_h; a.hp_ch[2]=_h; }
+        // ch3 HP-filter applied in combined NEON DC-blocker below
 
         // ── CH4 — integrate LFSR noise ────────────────────────────────────────
         // The LFSR state is valid for `t` cycles; when t expires the LFSR shifts.
@@ -649,16 +722,39 @@ static void generate_samples(GBAPU& a, int16_t* dst, uint32_t n_samp,
             a.prev_dac_on[3]  = a.ch4.dac_on;
             a.prev_enabled[3] = a.ch4.enabled;
         }
-        { const float _h=HP_R*a.hp_ch[3]+HP_C*d4; d4-=_h; a.hp_ch[3]=_h; }
-
-        // ── NR51 panning + NR50 volume ────────────────────────────────────────
-        float ls=0.0f,rs=0.0f;
-        const uint8_t nr51 = cached_nr51;
-        if(nr51&0x10u){ls+=d1;} if(nr51&0x01u){rs+=d1;}
-        if(nr51&0x20u){ls+=d2;} if(nr51&0x02u){rs+=d2;}
-        if(nr51&0x40u){ls+=d3;} if(nr51&0x04u){rs+=d3;}
-        if(nr51&0x80u){ls+=d4;} if(nr51&0x08u){rs+=d4;}
-        ls*=lv; rs*=rv;
+        // ── DC blocker (all 4 ch) + NR51 panning + NR50 volume — NEON ────────
+        //
+        // All four per-channel HP filters (previously applied separately after
+        // each channel) are now batched into one float32x4 operation:
+        //
+        //   h_new = HP_R * hp_old + HP_C * d_in   (vfmaq: fused mul-add on A57)
+        //   d_out = d_in  - h_new
+        //
+        // Pop-prevention (above each channel) has already snapped hp_ch[i]=d_i
+        // on any DAC/enable state change, so this load always starts settled.
+        //
+        // d_out is then fed directly into the NEON stereo mix using the
+        // precomputed 0/1 mask vectors v_nr51_l / v_nr51_r.  vaddvq_f32 is the
+        // AArch64 horizontal lane-sum — safe on the Switch (Cortex-A57, 64-bit).
+        //
+        // Net savings per sample vs scalar:
+        //   DC-blocker : 4 × (2 muls + 1 add + 1 sub + 2 mem) → 1 vector pass
+        //   NR51 mix   : 8 conditional float adds + 2 muls    → 2 vmulq + 2 vaddvq
+        //   No extract-and-reload cycle between filter and mix.
+        float ls, rs;
+        {
+            // Direct vector init — no stack array, no vld1q_f32 store/load round-trip.
+            // GCC synthesises this as lane inserts in registers at -O3.
+            const float32x4_t d_v = {d1, d2, d3, d4};
+            const float32x4_t hp_v  = vld1q_f32(a.hp_ch);
+            // h_new = HP_R * hp_v + HP_C * d_v  (vfmaq_f32(a,b,c) = a + b*c)
+            const float32x4_t h_new = vfmaq_f32(vmulq_f32(v_HP_C, d_v), v_HP_R, hp_v);
+            const float32x4_t d_out = vsubq_f32(d_v, h_new);
+            vst1q_f32(a.hp_ch, h_new);
+            // Stereo mix: dot(d_out, pan_mask) * master_volume
+            ls = vaddvq_f32(vmulq_f32(d_out, v_nr51_l)) * lv;
+            rs = vaddvq_f32(vmulq_f32(d_out, v_nr51_r)) * rv;
+        }
 
         // ── Scale, clamp, write ──────────────────────────────────────────────
         // DC removed per-channel above; no combined-mix HP needed.
@@ -810,29 +906,24 @@ static void gb_audio_thread_fn(void*) {
         // by the apply_reg() power gate.
         memcpy(local.hp_ch, s_ctrl.hp_ch, sizeof(local.hp_ch));
 
-        apply_reg(local,0x26,s_ctrl.regs[0x16]);          // NR52 -- power on first
-        apply_reg(local,0x24,s_ctrl.regs[0x14]);          // NR50 master vol
-        apply_reg(local,0x25,s_ctrl.regs[0x15]);          // NR51 panning
-        apply_reg(local,0x10,s_ctrl.regs[0x00]);          // CH1
-        apply_reg(local,0x11,s_ctrl.regs[0x01]);
-        apply_reg(local,0x12,s_ctrl.regs[0x02]);
-        apply_reg(local,0x13,s_ctrl.regs[0x03]);
-        apply_reg(local,0x14,s_ctrl.regs[0x04]&0x7F);    // no retrigger
-        apply_reg(local,0x16,s_ctrl.regs[0x06]);          // CH2
-        apply_reg(local,0x17,s_ctrl.regs[0x07]);
-        apply_reg(local,0x18,s_ctrl.regs[0x08]);
-        apply_reg(local,0x19,s_ctrl.regs[0x09]&0x7F);
-        apply_reg(local,0x1A,s_ctrl.regs[0x0A]);          // CH3
-        apply_reg(local,0x1B,s_ctrl.regs[0x0B]);
-        apply_reg(local,0x1C,s_ctrl.regs[0x0C]);
-        apply_reg(local,0x1D,s_ctrl.regs[0x0D]);
-        apply_reg(local,0x1E,s_ctrl.regs[0x0E]&0x7F);
-        apply_reg(local,0x20,s_ctrl.regs[0x10]);          // CH4
-        apply_reg(local,0x21,s_ctrl.regs[0x11]);
-        apply_reg(local,0x22,s_ctrl.regs[0x12]);
-        apply_reg(local,0x23,s_ctrl.regs[0x13]&0x7F);
-        for(uint8_t r=0x30;r<=0x3F;++r)                  // wave RAM
-            apply_reg(local,r,s_ctrl.regs[r-0x10]);
+        // --- NR52, NR50, NR51 (must remain first) ---
+        apply_reg(local, 0x26, s_ctrl.regs[0x16]);
+        apply_reg(local, 0x24, s_ctrl.regs[0x14]);
+        apply_reg(local, 0x25, s_ctrl.regs[0x15]);
+        
+        // --- Channels 1-4 registers ---
+        struct { uint8_t addr; uint8_t mask; } ch_regs[] = {
+            {0x10,0xFF},{0x11,0xFF},{0x12,0xFF},{0x13,0xFF},{0x14,0x7F},  // CH1
+            {0x16,0xFF},{0x17,0xFF},{0x18,0xFF},{0x19,0x7F},              // CH2
+            {0x1A,0xFF},{0x1B,0xFF},{0x1C,0xFF},{0x1D,0xFF},{0x1E,0x7F},  // CH3
+            {0x20,0xFF},{0x21,0xFF},{0x22,0xFF},{0x23,0x7F}               // CH4
+        };
+        for(auto &r : ch_regs)
+            apply_reg(local, r.addr, s_ctrl.regs[r.addr - 0x10] & r.mask);
+        
+        // --- Wave RAM 0x30–0x3F ---
+        for(uint8_t r = 0x30; r <= 0x3F; ++r)
+            apply_reg(local, r, s_ctrl.regs[r - 0x10]);
     }
 
     // Bresenham: accumulates GB_SPF_FRAC_INC each frame; flips 803→804 when
@@ -847,8 +938,11 @@ static void gb_audio_thread_fn(void*) {
 
         // ── Bresenham sample count for this frame ─────────────────────────────
         spf_acc += GB_SPF_FRAC_INC;
-        const uint32_t n_samp = GB_SPF_BASE + (spf_acc >= GB_CPU_HZ ? 1u : 0u);
-        if (spf_acc >= GB_CPU_HZ) spf_acc -= GB_CPU_HZ;
+        uint32_t n_samp = GB_SPF_BASE;
+        if ((int32_t)(spf_acc - GB_CPU_HZ) >= 0) {  // only one comparison
+            n_samp += 1;
+            spf_acc -= GB_CPU_HZ;
+        }
         const uint32_t n_data = n_samp * 2u * static_cast<uint32_t>(sizeof(int16_t));
 
         if(s_ctrl.paused.load(std::memory_order_acquire)){
@@ -870,11 +964,13 @@ static void gb_audio_thread_fn(void*) {
             {
                 uint32_t r = s_ctrl.evt_r.load(std::memory_order_relaxed);
                 const uint32_t w = s_ctrl.evt_w.load(std::memory_order_acquire);
-                while (r != w) {
+                const uint32_t max_copy = std::min(LOC_CAP, (w - r) & EVT_MASK);
+            
+                for(uint32_t i = 0; i < max_copy; ++i){
                     const RegEvent ev = s_ctrl.events[r];
                     r = (r + 1u) & EVT_MASK;
-                    if (ev.addr == 0xFF) break;              // sentinel: end of frame
-                    if (n_evts < LOC_CAP) s_local_evts[n_evts++] = ev; // guard overflow
+                    if(ev.addr == 0xFF) break;               // sentinel: end of frame
+                    s_local_evts[n_evts++] = ev;
                 }
                 s_ctrl.evt_r.store(r, std::memory_order_release);
             }
@@ -980,6 +1076,15 @@ static void gb_audio_set_volume(u8 percent) {
 // gb_audio_get_volume — read back the current volume (0–100).
 static u8 gb_audio_get_volume() {
     return static_cast<u8>(s_master_gain.load(std::memory_order_relaxed) * 100.f + 0.5f);
+}
+
+// gb_audio_set_balance — apply per-game balance trim (−100…+100).
+// gain = 2^(balance / 50): −100 → 0.25×, −50 → 0.50×, 0 → 1.00×, +50 → 2.00×, +100 → 4.00×
+// Called from gb_load_rom() on every game launch.  Never called from the hot path.
+static void gb_audio_set_balance(int16_t balance) {
+    const float gain = std::pow(2.0f,
+        static_cast<float>(std::clamp(static_cast<int>(balance), -200, 200)) / 50.0f);
+    s_balance_gain.store(gain, std::memory_order_relaxed);
 }
 
 // gb_audio_init — call after gb_init_lcd(), before gb_reset().
@@ -1264,3 +1369,6 @@ static void gb_audio_submit() {
         s_ctrl.evt_w.store(next, std::memory_order_release);
     }
 }
+
+
+#pragma GCC pop_options
