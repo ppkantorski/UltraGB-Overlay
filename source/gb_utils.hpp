@@ -1374,6 +1374,15 @@ static void load_ovl_theme() {
             tsl::widgetBackdropAlpha = static_cast<size_t>(va);
             tsl::widgetBackdropColor = tsl::RGB888(wbkd_raw, tsl::widgetBackdropAlpha);
         }
+
+        // dynamic_widget_colors — optional boolean (1/0).  Only applied when the
+        // key is present; absent key leaves ult::dynamicWidgetColors untouched so
+        // the user's own Ultrahand theme setting is preserved.
+        {
+            const std::string dwc = ult::parseValueFromIniSection(path, "theme", "dynamic_widget_colors");
+            if (!dwc.empty())
+                ult::dynamicWidgetColors = (dwc != ult::FALSE_STR);
+        }
     }
 
     // Recompute packed RGBA4444 for direct-fb writes.

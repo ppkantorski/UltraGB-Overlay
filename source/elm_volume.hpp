@@ -154,6 +154,18 @@ public:
     // Takes by value so callers passing a temporary get a move, not a copy.
     void setLabel(std::string label) { m_label = std::move(label); }
 
+    // matchesJumpCriteria — allows jumpToItem() to locate this slider by its
+    // label.  TrackBar inherits Element's stub (always false) rather than
+    // ListItem's text-matching override, so without this, jumpToItem("Game Boy")
+    // and jumpToItem("Active Title") silently skip the sliders every time.
+    bool matchesJumpCriteria(const std::string& jumpText,
+                             const std::string& /*jumpValue*/,
+                             bool exactMatch) const override {
+        if (jumpText.empty()) return false;
+        return exactMatch ? (m_label == jumpText)
+                          : (m_label.find(jumpText) != std::string::npos);
+    }
+
 private:
     std::function<void()> m_iconTapCallback;
 };
