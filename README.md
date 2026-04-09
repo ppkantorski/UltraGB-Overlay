@@ -27,7 +27,6 @@ Play GB and GBC games on top of any running application.
 ### Display Modes
 
 **Overlay mode** — emulator drawn inside the standard Ultrahand overlay panel (448×720 framebuffer) alongside the UltraGB menu chrome.
-- **2.5× scale** (default) — 400×360 viewport, fills the overlay width
 - **2× pixel-perfect** — 320×288 viewport, integer scale with letterbox; toggleable in-game by tapping the game screen
 
 **Fixed overlay** (default) — overlay panel is anchored to the left edge of the screen, identical to all other Ultrahand overlays.
