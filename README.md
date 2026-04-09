@@ -17,7 +17,7 @@ Play GB and GBC games on top of any running application.
 ## Features
 
 ### Emulation
-- Full **Game Boy** (DMG) and **Game Boy Color** (GBC/CGB) emulation via [Walnut-CGB](https://github.com/Mr-PauI/Walnut-CGB) (a fork of [Peanut-GB](https://github.com/deltabeard/Peanut-GB))
+- Full **Game Boy** (DMG) and **Game Boy Color** (GBC/CGB) emulation via an expanded fork of [Walnut-CGB](https://github.com/Mr-PauI/Walnut-CGB) (a fork of [Peanut-GB](https://github.com/deltabeard/Peanut-GB))
 - Supports ROM-only, MBC1, MBC2, MBC3 (with RTC), and MBC5 (including rumble) cartridge types
 - Accurate 59.73 Hz Game Boy clock rate, decoupled from the display vsync
 - LCD ghosting / frame blending — per-game 50/50 blend of consecutive frames to reproduce the phosphor persistence that 30 Hz flickering transparency effects were designed for
