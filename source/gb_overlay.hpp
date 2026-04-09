@@ -758,6 +758,19 @@ public:
             tsl::Overlay::get()->close();
         }
         run_once_setup(runOnce, m_restoreHapticState);
+
+        // Periodic background-title volume correction — safety net for edge cases
+        // where the title's PID changed without triggering Overlay::onShow() (e.g.
+        // a new title launched while the overlay layer was never hidden).
+        // Also catches system-side volume resets on the same title.
+        // Runs every 120 frames (~2 s) so the pmdmnt + audproc IPC cost is
+        // completely negligible.  Counter is a plain u8; wrapping at 256 is harmless
+        // (fires one frame early every ~4 s — no correctness impact).
+        static u8 s_vol_recheck_ctr = 0;
+        if (++s_vol_recheck_ctr >= 120) {
+            s_vol_recheck_ctr = 0;
+            gb_game_vol_recheck();
+        }
     }
 
     virtual __attribute__((optimize("O3"))) bool handleInput(u64 keysDown, u64 keysHeld,

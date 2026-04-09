@@ -1088,6 +1088,15 @@ public:
             tsl::Overlay::get()->close();
         }
         run_once_setup(runOnce, m_restoreHapticState);
+
+        // Periodic background-title volume correction — same safety net as
+        // GBOverlayGui::update().  See that comment for full rationale.
+        // Runs every 120 frames (~2 s); u8 wrap at 256 is harmless.
+        static u8 s_vol_recheck_ctr = 0;
+        if (++s_vol_recheck_ctr >= 120) {
+            s_vol_recheck_ctr = 0;
+            gb_game_vol_recheck();
+        }
     }
 
     // ── handleInput ──────────────────────────────────────────────────────────

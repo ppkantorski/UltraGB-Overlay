@@ -686,6 +686,19 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
 
     for (int sy = sy_start; sy < sy_end; ++sy) {
         const int oy0 = sy * 2;           // always exactly 2 dest rows at 2× scale
+
+        // Hoist destination row base pointers to the outer loop.
+        // s_row_lut[oy0] and s_row_lut[oy0+1] are constant for every run in
+        // this source row — they depend only on oy0, which doesn't change
+        // inside the sx loop.  Computing them here guarantees a single pair of
+        // LUT loads per row (288 total per frame) instead of one pair per
+        // color run (~1440–2880 per frame).  O3 with strict aliasing should
+        // already hoist these (const uint32_t* cannot alias uint16_t*), but
+        // making it explicit ensures the hoist and removes any register-pressure
+        // uncertainty the compiler might have across the two conditional branches.
+        uint16_t* const r0 = fb + s_row_lut[oy0];
+        uint16_t* const r1 = fb + s_row_lut[oy0 + 1];
+
         const uint16_t* __restrict__ src = g_gb_fb + sy * GB_W;
 
         int      run_sx  = 0;
@@ -719,8 +732,8 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
                 // Same tile: cl[ox] = cl[0] + ox for every ox in [0, run_w).
                 // Use base-pointer + stride — no LUT load per pixel.
                 // run_w ≤ 8; compiler emits stp/str pairs, may auto-vectorize.
-                uint16_t* const p0 = fb + s_row_lut[oy0]     + cl[0];
-                uint16_t* const p1 = fb + s_row_lut[oy0 + 1] + cl[0];
+                uint16_t* const p0 = r0 + cl[0];
+                uint16_t* const p1 = r1 + cl[0];
                 for (int ox = 0; ox < run_w; ++ox) {
                     p0[ox] = packed;
                     p1[ox] = packed;
@@ -732,8 +745,6 @@ static void render_gb_screen_chunk(tsl::gfx::Renderer* renderer,
                 // destination rows.  Halves column LUT loads for multi-tile runs.
                 {
                     const uint16x8_t vpk = vdupq_n_u16(packed);
-                    uint16_t* const r0 = fb + s_row_lut[oy0];
-                    uint16_t* const r1 = fb + s_row_lut[oy0 + 1];
                     int ox = 0;
                     while (ox < run_w && ((ox0 + ox) & 7)) {
                         const uint32_t c = cl[ox++];

@@ -277,6 +277,52 @@ static void gb_game_vol_restore() {
     s_pre_game_pid = 0;
 }
 
+// Re-synchronise the background-title volume after the overlay is shown again
+// (Overlay::onShow) or as a periodic safety-net check from the player GUIs'
+// update() every ~120 frames.
+//
+// Two cases handled in a single IPC round-trip:
+//
+//   PID changed — user pressed Home, launched a different Switch title, and
+//   returned.  s_pre_game_pid is now stale.  We adopt the new PID, capture its
+//   natural (unmodified) volume as the new restore baseline, and apply
+//   g_game_volume immediately.
+//
+//   PID unchanged — same title still running but its volume may have been reset
+//   by the system or another tool while the overlay was hidden.  We just
+//   re-assert g_game_volume to correct any drift.
+//
+// Exits in one cheap pmdmnt IPC call when no player session is active
+// (s_pre_game_pid == 0), so it is safe to call on every onShow() and every
+// 120 frames with negligible overhead.
+static void gb_game_vol_recheck() {
+    if (s_pre_game_pid == 0) return;   // no active player session — nothing to do
+
+    u64 currentPid = 0;
+    if (R_FAILED(pmdmntGetApplicationProcessId(&currentPid))) return;
+
+    if (R_FAILED(s_audproc_init())) return;
+
+    if (currentPid != s_pre_game_pid) {
+        // Title changed under us.  Capture the new title's natural volume as
+        // the restore baseline (it hasn't been touched by us yet), then apply
+        // g_game_volume.  The old PID is discarded — it is either gone or no
+        // longer our responsibility.
+        float newPreVol = 1.0f;
+        if (R_FAILED(s_audproc_get_vol(currentPid, &newPreVol)))
+            newPreVol = 1.0f;
+        s_audproc_set_vol(currentPid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
+        s_pre_game_pid      = currentPid;
+        s_pre_game_proc_vol = newPreVol;
+    } else {
+        // Same title — re-assert in case the system reset the level while the
+        // overlay was hidden (e.g. another overlay or a system event touched it).
+        s_audproc_set_vol(s_pre_game_pid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
+    }
+
+    s_audproc_exit();
+}
+
 static inline int ch1_p(const GBAPU& a){return (2048-a.ch1.period)*4;}
 static inline int ch2_p(const GBAPU& a){return (2048-a.ch2.period)*4;}
 static inline int ch3_p(const GBAPU& a){return (2048-a.ch3.period)*2;}

@@ -2713,6 +2713,16 @@ public:
             gb_audio_resume();
             m_audio_paused = false;
         }
+        // Re-check the background-title volume on every show event.
+        // This is the primary fix for the "press Home → launch different game →
+        // return to overlay" path: s_pre_game_pid may be stale, and the new
+        // title's volume has never been touched.  gb_game_vol_recheck() detects
+        // the PID change, captures the new title's natural volume as the restore
+        // baseline, and applies g_game_volume — all in one open/set/exit cycle.
+        // If the PID is unchanged it just re-asserts g_game_volume in case the
+        // system reset it while the overlay was hidden.
+        // No-ops immediately (single pmdmnt IPC) when no player session is active.
+        gb_game_vol_recheck();
     }
 
     std::unique_ptr<tsl::Gui> loadInitialGui() override {
