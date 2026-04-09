@@ -7,9 +7,13 @@
  *   Saves:  sdmc:/config/ultragb/saves/
  *
  *   Controls in-game:
- *     A / B / D-pad / + (Start) / - (Select) — mapped to GB buttons
- *     X — pause and return to ROM picker (state preserved)
- *     System overlay combo — hides overlay (game pauses automatically)
+ *     A / B / D-pad — mapped to GB A, B, directional pad
+ *     + / X         — GB Start   (both physical buttons map to bit 3)
+ *     − / Y         — GB Select  (both physical buttons map to bit 2)
+ *     ZR (double-click-hold) — fast-forward (4× frame rate)
+ *     ZL (double-click-hold) — background pass-through toggle
+ *     L3 / R3 (stick click)  — switch between fixed and free overlay modes
+ *     System overlay combo   — hides overlay (game pauses automatically)
  * 
  *  Licensed under GPLv2
  *  Copyright (c) 2026 ppkantorski

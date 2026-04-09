@@ -1,8 +1,11 @@
 /********************************************************************************
  * File: elm_volume.hpp
- * VolumeTrackBar
+ * Description:
+ *   VolumeTrackBar and AudioBalanceTrackBar — custom TrackBar subclasses for
+ *   UltraGB's volume and per-game audio balance controls.
  *
- * Extends TrackBar with two behaviours:
+ * VolumeTrackBar
+ *   Extends TrackBar with four behaviours:
  *
  *  1. Mute visualisation — when volume == 0, draws the speaker glyph
  *     left-half only (via scissor) plus a cross glyph in the right half,
@@ -13,7 +16,20 @@
  *     preserve the pre-mute volume level.
  *
  *  3. setLabel() — lets update() relabel the slider live when the running
- *     title ID changes without rebuilding the whole list.
+ *     title ID changes without rebuilding the whole settings list.
+ *
+ *  4. matchesJumpCriteria() — allows jumpToItem() to locate this slider by
+ *     its label.  TrackBar inherits Element's stub (always false) rather than
+ *     ListItem's text-matching override, so without this override,
+ *     jumpToItem("Game Boy") and jumpToItem("Active Title") silently skip the
+ *     sliders every time.
+ *
+ * AudioBalanceTrackBar
+ *   Extends TrackBar for the per-game GB-audio balance trim (−150% … +150%).
+ *   m_minValue / m_maxValue are set to −150 / +150 in the constructor so the
+ *   slider spans 301 positions (one per 1%).  Provides sliderToBalance() and
+ *   balanceToSlider() conversion helpers.  KEY_Y while focused resets to 0%
+ *   (neutral); this is handled in GameSettingsGui::handleInput().
  * 
  *  Licensed under GPLv2
  *  Copyright (c) 2026 ppkantorski

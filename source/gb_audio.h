@@ -50,7 +50,7 @@
  *     real audio on the next iteration.  At most one silence frame (16.7 ms)
  *     precedes the first real-audio frame — imperceptible.
  *
- *   X → ROM menu → re-enter game (gb_audio_shutdown + gb_audio_init):
+ *   ROM selector re-entry (gb_audio_shutdown + gb_audio_init):
  *     hp_ch[] is saved to s_ctrl.hp_ch when the thread exits (shutdown) and
  *     restored into local.hp_ch at thread startup (init).  This prevents the
  *     ~5 ms HP-filter undershoot transient that caused crackling on re-entry.

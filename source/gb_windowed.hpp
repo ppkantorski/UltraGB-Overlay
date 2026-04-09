@@ -12,8 +12,8 @@
  *   reading so it never persists across unrelated launches.
  *
  *   Framebuffer:
- *     DefaultFramebufferWidth  = GB_W * g_win_scale  (160 / 320 / 480)
- *     DefaultFramebufferHeight = GB_H * g_win_scale  (144 / 288 / 432)
+ *     DefaultFramebufferWidth  = GB_W * g_win_scale  (160 / 320 / 480 / 640 / 800)
+ *     DefaultFramebufferHeight = GB_H * g_win_scale  (144 / 288 / 432 / 576 / 720)
  *     Set in main() before tsl::loop<WindowedOverlay>.  Tesla creates a VI
  *     layer of exactly that size.  g_win_scale is read directly from
  *     config.ini before tsl::loop (load_config has not run yet at that point).
@@ -23,6 +23,19 @@
  *     Scale 3: 480×432 px  — VI space 720×648   (3× integer scaled)
  *     Scale 4: 640×576 px  — VI space 960×864   (4× integer scaled)
  *     Scale 5: 800×720 px  — VI space 1200×1080 (5× integer scaled; requires 8 MB+ heap)
+ *
+ *   Input:
+ *     ZR (double-click-hold)  — fast-forward (4× frame rate).
+ *     ZL (double-click-hold)  — background pass-through toggle; ZR/ZL are
+ *                               suppressed while pass-through is active so the
+ *                               background app receives them undisturbed.
+ *     R3 (right stick click)  — increase window scale by 1 (up to max).
+ *     L3 (left  stick click)  — decrease window scale by 1 (down to 1×).
+ *                               Scale change triggers a setNextOverlay relaunch;
+ *                               game state is saved before exit and restored on
+ *                               re-entry.
+ *     + (2 s hold)            — enter joystick-reposition mode; left stick moves
+ *                               the window.  Release + to confirm position.
  *
  *   Pixel blit:
  *     LUTs encode the Tesla block-linear address formula for the scaled

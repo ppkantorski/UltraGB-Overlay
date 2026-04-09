@@ -9,9 +9,12 @@
  *   Start, Select).
  *
  *   GBOverlayGui owns all input: waits for button release after launch,
- *   handles the overlay close / X-return-to-selector paths, screen-region
- *   tap and RS quick-release for scale toggle, ZR double-click-hold for
- *   fast-forward, and maps touch regions to GB key bits each frame.
+ *   handles the overlay close combo path, ZR double-click-hold for
+ *   fast-forward, ZL double-click-hold for background pass-through toggle,
+ *   L3 / R3 stick click to switch between fixed and free overlay modes
+ *   (relaunch preserving game state), touch hold-to-drag and L3 joystick
+ *   repositioning in free overlay mode, and maps virtual on-screen button
+ *   touch regions to GB key bits each frame.
  *
  *   Included at the end of main.cpp (after draw_ultragb_title and all
  *   globals/helpers are fully defined), exactly like gb_windowed.hpp.
