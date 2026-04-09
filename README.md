@@ -284,7 +284,7 @@ sdmc:/
 
 ## Contributing
 
-Contributions are welcome! If you have any ideas, suggestions, or bug reports, please raise an [issue](https://github.com/ppkantorski/UltraGB-Overlay/issues/new/choose), submit a [pull request](https://github.com/ppkantorski/UltraGB-Overlay/compare) or reach out to me directly on [GBATemp]([https://gbatemp.net/threads/ultragb-overlay/](https://gbatemp.net/threads/ultragb-overlay-the-game-boy-gbc-emulation-overlay.680989/).
+Contributions are welcome! If you have any ideas, suggestions, or bug reports, please raise an [issue](https://github.com/ppkantorski/UltraGB-Overlay/issues/new/choose), submit a [pull request](https://github.com/ppkantorski/UltraGB-Overlay/compare) or reach out to me directly on [GBATemp](https://gbatemp.net/threads/ultragb-overlay-the-game-boy-gbc-emulation-overlay.680989/).
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/X8X3VR194)
 
