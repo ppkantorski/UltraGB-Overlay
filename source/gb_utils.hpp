@@ -736,8 +736,31 @@ static void save_game_lcd_ghosting(const char* romPath, bool enabled) {
     save_game_cfg_str(romPath, "lcd_ghosting", enabled ? "1" : "0");
 }
 
+// Read `len` bytes from the ROM header at `offset` and compare against `expected`.
+// Only called when the per-game ini key is absent — never on any hot path.
+static bool rom_header_matches(const char* romPath,
+                               long offset, const char* expected, size_t len) {
+    FILE* f = fopen(romPath, "rb");
+    if (!f) return false;
+    char buf[16] = {};
+    bool match = false;
+    if (fseek(f, offset, SEEK_SET) == 0 && fread(buf, 1, len, f) == len)
+        match = (memcmp(buf, expected, len) == 0);
+    fclose(f);
+    return match;
+}
+
 static bool load_game_no_sprite_limit(const char* romPath) {
-    return load_game_cfg_str(romPath, "no_sprite_limit") != "0";
+    const std::string v = load_game_cfg_str(romPath, "no_sprite_limit");
+    if (!v.empty()) return v != "0";   // user has set an explicit value — respect it
+
+    // Key absent → return the game-specific default.
+    // Link's Awakening / Link's Awakening DX: ROM title = "ZELDA\0" (6 bytes).
+    // Other Zelda GB/GBC titles (Oracle of Ages, Oracle of Seasons, …) all have
+    // longer title strings so the null terminator check uniquely isolates LA/LADX.
+    if (rom_header_matches(romPath, 0x134, "ZELDA\0", 6)) return false;
+
+    return true;  // default ON for everything else
 }
 
 static void save_game_no_sprite_limit(const char* romPath, bool enabled) {

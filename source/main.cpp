@@ -2312,7 +2312,7 @@ public:
             auto* empty = new tsl::elm::CustomDrawer(
                 [](tsl::gfx::Renderer* r, s32 x, s32 y, s32, s32) {
                     r->drawString(msg, false, x + 16, y + 30, 16,
-                                  tsl::Color{0x8, 0x8, 0x8, 0xF});
+                                  tsl::warningTextColor);
                 });
             list->addItem(empty, 200);
         } else {

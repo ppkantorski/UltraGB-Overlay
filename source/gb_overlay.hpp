@@ -990,7 +990,8 @@ public:
                     if (m_dragging) {
                         save_ovl_free_pos();
                         if (g_touch_haptics) triggerExitFeedback();
-                        gb_audio_resume();
+                        if (!m_zl_state.pass_through)
+                            gb_audio_resume();
                         g_gb_frame_next_ns = 0;
                         g_btns_measured    = false;  // recalculate hit centres at new render offset
                     }
@@ -1071,7 +1072,8 @@ public:
                         if (m_plus_dragging) {
                             save_ovl_free_pos();
                             if (g_touch_haptics) triggerExitFeedback();
-                            gb_audio_resume();
+                            if (!m_zl_state.pass_through)
+                                gb_audio_resume();
                             g_gb_frame_next_ns = 0;
                             g_btns_measured    = false;  // recalculate hit centres at new render offset
                             s_ovl_free_dragging = false;

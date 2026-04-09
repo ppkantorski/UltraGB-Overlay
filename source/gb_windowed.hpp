@@ -1382,7 +1382,11 @@ public:
                 if (m_dragging) {
                     save_win_pos();        // persist VI coords to config.ini
                     if (g_touch_haptics) triggerExitFeedback(); // haptic: position locked
-                    gb_audio_resume();
+                    // Only resume GB audio if foreground is ours — pass-through
+                    // mode intentionally keeps audio muted until foreground is
+                    // reclaimed via the ZL gesture.
+                    if (!m_zl_state.pass_through)
+                        gb_audio_resume();
                     g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                 }
                 s_win_dragging = false;
@@ -1479,7 +1483,11 @@ public:
                     if (m_plus_dragging) {
                         save_win_pos();        // persist VI coords to config.ini
                         if (g_touch_haptics) triggerExitFeedback(); // haptic: position locked
-                        gb_audio_resume();
+                        // Only resume GB audio if foreground is ours — pass-through
+                        // mode intentionally keeps audio muted until foreground is
+                        // reclaimed via the ZL gesture.
+                        if (!m_zl_state.pass_through)
+                            gb_audio_resume();
                         g_gb_frame_next_ns = 0;  // don't try to catch up after pause
                         s_win_dragging  = false;
                         m_plus_dragging = false;
