@@ -26,8 +26,8 @@ Play GB and GBC games on top of any running application.
 
 ### Display Modes
 
-**Overlay mode**: emulator drawn inside the standard Ultrahand overlay panel (448×720 framebuffer) alongside the UltraGB menu chrome.
-- **2× pixel-perfect**: 320×288 viewport, integer scale with letterbox; toggleable in-game by tapping the game screen
+**Overlay mode**: emulator drawn inside the standard Ultrahand overlay panel (448x720 framebuffer) alongside the UltraGB menu chrome.
+- **2x pixel-perfect**: 320x288 viewport, integer scale with letterbox; toggleable in-game by tapping the game screen
 
 **Fixed overlay** (default): overlay panel is anchored to the left edge of the screen, identical to all other Ultrahand overlays.
 
@@ -50,7 +50,7 @@ Cycled per game from the per-game config screen. All modes work for both DMG and
 | `Native` | True greyscale: raw luminance values, no tint. |
 
 ### LCD Grid Effect
-Simulates the dark inter-pixel gap of a real Game Boy Color LCD by dimming the last row and column of each scaled source pixel block to approximately 12.5% brightness. Applies in both overlay and windowed modes; automatically invisible at windowed 1× (no room for a gap at 1:1 scale).
+Simulates the dark inter-pixel gap of a real Game Boy Color LCD by dimming the last row and column of each scaled source pixel block to approximately 12.5% brightness. Applies in both overlay and windowed modes; automatically invisible at windowed 1x (no room for a gap at 1:1 scale).
 
 ### Virtual On-Screen Controls (Overlay Mode)
 D-pad, A, B, Start, and Select are drawn below the game screen and mapped to touch input each frame.
@@ -61,7 +61,7 @@ D-pad, A, B, Start, and Select are drawn below the game screen and mapped to tou
 - **Audio Balance**: per-game GB audio trim (−150% … 0% … +150%) stored in the per-game config. Applied as a power-of-2 gain multiplier on top of the master volume so individual games can be normalised without affecting global volume.
 
 ### Themes and Wallpapers
-The overlay UI chrome (background, button colours, border) is fully themeable via `.ini` files placed in `sdmc:/config/ultragb/ovl_themes/`. A wallpaper (448×720 `.rgba` format) can be selected from `sdmc:/config/ultragb/ovl_wallpapers/` and is displayed behind the game screen when expanded memory permits.
+The overlay UI chrome (background, button colours, border) is fully themeable via `.ini` files placed in `sdmc:/config/ultragb/ovl_themes/`. A wallpaper (448x720 `.rgba` format) can be selected from `sdmc:/config/ultragb/ovl_wallpapers/` and is displayed behind the game screen when expanded memory permits.
 
 ---
 
@@ -77,9 +77,9 @@ The overlay UI chrome (background, button colours, border) is fully themeable vi
 | Y / − | GB Select |
 | D-Pad | GB D-Pad |
 | Touch (virtual buttons) | GB D-Pad / A / B / Start / Select |
-| ZR double-click-hold | Fast-forward (4×) |
+| ZR double-click-hold | Fast-forward (4x) |
 | ZL double-click, then hold (≈0.5 s) | Toggle controller pass-through to background app |
-| Quick tap on game screen | Toggle 2.5× ↔ 2× scale |
+| Quick tap on game screen | Toggle 2.5x ↔ 2x scale |
 | Launch combo | Return to ROM selector (normal) / close overlay (quick-launch or direct mode) |
 
 **Free overlay only:**
@@ -100,11 +100,11 @@ The overlay UI chrome (background, button colours, border) is fully themeable vi
 | X / + | GB Start |
 | Y / − | GB Select |
 | D-Pad | GB D-Pad |
-| ZR double-click-hold | Fast-forward (4×) |
+| ZR double-click-hold | Fast-forward (4x) |
 | ZL double-click, then hold (≈0.5 s) | Toggle controller pass-through to background app |
 | Touch hold inside window (≈1 s) | Enter drag mode: move window, release to save position |
 | KEY_PLUS hold (2 s) + left stick | Joystick reposition mode |
-| RS click (solo) | Step scale up (1× → 2× → … → max) |
+| RS click (solo) | Step scale up (1x → 2x → … → max) |
 | LS click (solo) | Step scale down |
 | Launch combo | Return to UltraGB menu / close overlay (quick-exit mode) |
 
@@ -161,7 +161,7 @@ Press **Y** on any ROM in the selector to open its config screen.
 | Mode | Toggle between Overlay and Windowed; takes effect on next ROM launch |
 | LCD Grid | Enable/disable the LCD inter-pixel gap simulation |
 | Overlay | Submenu: Position (Fixed / Free) and Theme |
-| Windowed | Submenu: Scale (1×–6×, heap-gated) and Docked Resolution (720p / 1080p) |
+| Windowed | Submenu: Scale (1x–6x, heap-gated) and Docked Resolution (720p / 1080p) |
 
 ### Miscellaneous
 
@@ -184,7 +184,7 @@ Press **Y** on any ROM in the selector to open its config screen.
 | Item | Description |
 |---|---|
 | Scale | Cycle 1x → 2x → … → max; capped by available heap and ROM size (see Requirements) |
-| Docked Resolution | 720p (default, 1.5× VI layer) or 1080p (pixel-perfect, 1:1 VI layer); takes effect on next windowed launch |
+| Docked Resolution | 720p (default, 1.5x VI layer) or 1080p (pixel-perfect, 1:1 VI layer); takes effect on next windowed launch |
 
 ### Quick Combo / Quick Launch
 Assigning a combo in Settings registers it system-wide and deconflicts it from other overlays and packages automatically. When triggered, the overlay launches straight into the last played ROM, bypassing the selector. The launch combo then closes the overlay entirely rather than returning to the menu.
