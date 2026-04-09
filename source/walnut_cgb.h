@@ -1,3 +1,13 @@
+/********************************************************************************
+ * File: walnut_cgb.h
+ * Description:
+ *  Expansion of Walnut-CGB by Mr. Paul (fork of Peanut-GB by Koshkouei) for
+ *  enhanced features and emulation accuracy for improved title support.
+ * 
+ *  Licensed under GPLv2
+ *  Copyright (c) 2026 ppkantorski
+ ********************************************************************************/
+
 /*
  * Walnut-CGB additions
  * Copyright (c) 2025 Mr. Paul (https://github.com/Mr-PauI)
