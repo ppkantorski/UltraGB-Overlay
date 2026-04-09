@@ -27,11 +27,11 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.9.2
+APP_VERSION := 1.0.0
 TARGET      := ultragb
 BUILD       := build
 SOURCES     := source
-INCLUDES    := source include lib/Walnut-CGB
+INCLUDES    := source include
 NO_ICON     := 1
 
 # libultrahand — keep the same relative location as Tetris Overlay
