@@ -266,10 +266,11 @@ sdmc:/
 
 ## Credits
 
-- **[ppkantorski](https://github.com/ppkantorski)** — UltraGB Overlay, Ultrahand Overlay, libultrahand
+- **[ppkantorski](https://github.com/ppkantorski)** — UltraGB Overlay, Ultrahand Overlay, libultrahand, Walnut-CGB core revision
 - **[Mr-PauI](https://github.com/Mr-PauI)** — [Walnut-CGB](https://github.com/Mr-PauI/Walnut-CGB) (GBC core, CGB palette system, dual-fetch optimisations)
 - **[deltabeard](https://github.com/deltabeard)** — [Peanut-GB](https://github.com/deltabeard/Peanut-GB) (original GB core)
-- **[LIJI32](https://github.com/LIJI32)** — [SameBoy](https://github.com/LIJI32/SameBoy) (portions used for reference in Walnut-CGB)
+- **[libretro](https://github.com/libretro)** - [Gambatte](https://github.com/libretro/gambatte-libretro) (pallet tables from `gbcpalettes.h` used in `gb_core.h`)
+- **[LIJI32](https://github.com/LIJI32)** — [SameBoy](https://github.com/LIJI32/SameBoy) (portions used for reference in correcting Walnut-CGB)
 
 ---
 
