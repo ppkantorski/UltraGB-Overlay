@@ -259,7 +259,7 @@ sdmc:/
         ├── states/
         │   ├── internal/           ← quick-resume state (one per game, auto-managed)
         │   └── <game>/             ← user save-state slots
-        └── configure/
+        └── settings/
             └── <game>.ini          ← per-game settings (palette, ghosting, audio balance, etc.)
 ```
 
