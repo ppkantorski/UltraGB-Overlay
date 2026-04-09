@@ -827,6 +827,16 @@ static struct GACtrl {
     // (one relaxed atomic load per audio frame, ~1 ns).
     std::atomic<bool> resync{false};
 
+    // ff_resync — set by gb_audio_ff_resume() when fast-forward ends.
+    // The audio thread replays s_ctrl.regs → local on its next active iteration,
+    // snapping the GBAPU to the current post-FF register state rather than the
+    // stale pre-FF snapshot that was frozen when gb_audio_pause() was called.
+    // One predicted-not-taken branch per audio frame during normal play — zero
+    // overhead.  Completely separate from resync (handheld↔docked) and from
+    // gb_audio_resume() (system-combo overlay hide), which must NOT resync
+    // because the game was truly paused and local is still correct.
+    std::atomic<bool> ff_resync{false};
+
     // Full GBAPU snapshot written by the audio thread on exit (gb_audio_shutdown).
     // Restored on the next thread startup (gb_audio_init) so all runtime state
     // (channel enabled flags, timers, duty_pos, vol, seq_step, lfsr, ...) is
@@ -989,6 +999,77 @@ static void gb_audio_thread_fn(void*) {
             s_ctrl.nr52_ch_bits.store(0, std::memory_order_release);
 
         } else {
+            // ── Fast-forward resume resync ────────────────────────────────────
+            // When FF ends, local GBAPU is stale (frozen at the pre-FF snapshot)
+            // while s_ctrl.regs[] reflects the current APU state.  Replay the
+            // register mirror into local before generating any real audio.
+            //
+            // __builtin_expect(…, 0): this branch is not taken ~99.98 % of the
+            // time (only once per FF session); the CPU's branch predictor learns
+            // this after the first frame and the check costs ~0 cycles thereafter.
+            if (__builtin_expect(
+                    s_ctrl.ff_resync.load(std::memory_order_acquire), 0)) {
+
+                // Drain any lingering SPSC events so generate_samples starts
+                // clean (the paused path already drained continuously, but a
+                // partial render-frame may have enqueued events between the
+                // last drain and this resume).
+                s_ctrl.evt_r.store(
+                    s_ctrl.evt_w.load(std::memory_order_acquire),
+                    std::memory_order_release);
+
+                // Re-apply current register mirror → local.
+                // Identical sequence to the non-snapshot thread-startup path.
+                // NRx4 trigger bit (0x80) is masked to 0x7F so we update period/
+                // length-enable without false-triggering a channel restart.
+                apply_reg(local, 0x26, s_ctrl.regs[0x16]);  // NR52 — power first
+                apply_reg(local, 0x24, s_ctrl.regs[0x14]);  // NR50
+                apply_reg(local, 0x25, s_ctrl.regs[0x15]);  // NR51
+
+                apply_reg(local, 0x10, s_ctrl.regs[0x00]);  // NR10
+                apply_reg(local, 0x11, s_ctrl.regs[0x01]);  // NR11
+                apply_reg(local, 0x12, s_ctrl.regs[0x02]);  // NR12
+                apply_reg(local, 0x13, s_ctrl.regs[0x03]);  // NR13
+                apply_reg(local, 0x14, s_ctrl.regs[0x04] & 0x7Fu);  // NR14 CH1
+
+                apply_reg(local, 0x16, s_ctrl.regs[0x06]);  // NR21
+                apply_reg(local, 0x17, s_ctrl.regs[0x07]);  // NR22
+                apply_reg(local, 0x18, s_ctrl.regs[0x08]);  // NR23
+                apply_reg(local, 0x19, s_ctrl.regs[0x09] & 0x7Fu);  // NR24 CH2
+
+                apply_reg(local, 0x1A, s_ctrl.regs[0x0A]);  // NR30
+                apply_reg(local, 0x1B, s_ctrl.regs[0x0B]);  // NR31
+                apply_reg(local, 0x1C, s_ctrl.regs[0x0C]);  // NR32
+                apply_reg(local, 0x1D, s_ctrl.regs[0x0D]);  // NR33
+                apply_reg(local, 0x1E, s_ctrl.regs[0x0E] & 0x7Fu);  // NR34 CH3
+
+                apply_reg(local, 0x20, s_ctrl.regs[0x10]);  // NR41
+                apply_reg(local, 0x21, s_ctrl.regs[0x11]);  // NR42
+                apply_reg(local, 0x22, s_ctrl.regs[0x12]);  // NR43
+                apply_reg(local, 0x23, s_ctrl.regs[0x13] & 0x7Fu);  // NR44 CH4
+
+                for (uint8_t r = 0x30; r <= 0x3F; ++r)  // wave RAM
+                    apply_reg(local, r, s_ctrl.regs[r - 0x10]);
+
+                // Snap HP filters to zero so the DC-step from reinitialising all
+                // channels at once is absorbed in one sample rather than producing
+                // an exponential transient audible as a pop.
+                memset(local.hp_ch, 0, sizeof(local.hp_ch));
+
+                // Sync pop-prevention shadows to the freshly-replayed channel
+                // state so the first real sample doesn't trigger spurious snaps.
+                local.prev_dac_on[0]  = local.ch1.dac_on;
+                local.prev_dac_on[1]  = local.ch2.dac_on;
+                local.prev_dac_on[2]  = local.ch3.dac_on;
+                local.prev_dac_on[3]  = local.ch4.dac_on;
+                local.prev_enabled[0] = local.ch1.enabled;
+                local.prev_enabled[1] = local.ch2.enabled;
+                local.prev_enabled[2] = local.ch3.enabled;
+                local.prev_enabled[3] = local.ch4.enabled;
+
+                s_ctrl.ff_resync.store(false, std::memory_order_release);
+            }
+
             // ── Active path ───────────────────────────────────────────────────
             // Collect this frame's events into s_local_evts (flat array owned
             // by the audio thread), stopping at the frame-end sentinel (0xFF).
@@ -1220,6 +1301,24 @@ static void gb_audio_pause() {
 // ─────────────────────────────────────────────────────────────────────────────
 static void gb_audio_resume() {
     s_ctrl.paused.store(false, std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// gb_audio_ff_resume — resume audio after fast-forward ends.
+//
+// Unlike gb_audio_resume() (used for system-combo overlay hide/show, where the
+// game is truly paused and the pre-pause GBAPU state is still correct), this
+// sets ff_resync so the audio thread replays s_ctrl.regs → local before
+// generating its first real frame.  This snaps the GBAPU to the current
+// post-FF register state instead of playing from the stale snapshot that was
+// frozen when FF started.
+//
+// Order matters: ff_resync must be visible before paused is cleared so the
+// audio thread never enters the active path without seeing the flag.
+// ─────────────────────────────────────────────────────────────────────────────
+static void gb_audio_ff_resume() {
+    s_ctrl.ff_resync.store(true,  std::memory_order_release);
+    s_ctrl.paused.store(false,    std::memory_order_release);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

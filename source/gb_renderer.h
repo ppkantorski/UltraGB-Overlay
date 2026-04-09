@@ -916,6 +916,7 @@ inline void render_gb_letterbox(tsl::gfx::Renderer* renderer, uint16_t packed) {
 static constexpr u32 kWP_W  = 448u;
 static constexpr u32 kWP_H  = 720u;
 static constexpr u32 kWP_GW = kWP_W / 8u;   // 56 groups of 8 pixels per row
+static constexpr u32 kWP_RowBytes = kWP_W * 2u;
 
 static u32  s_wp_yParts[kWP_H];             // y-contribution to block-linear offset
 static u32  s_wp_xGroupParts[kWP_GW];       // x-contribution for start of each group
@@ -1000,6 +1001,13 @@ static constexpr OvlArcRow kOvlR20Arc[13] = {
     { 0,16,4,1},{ 1,13,3,1},{ 2,11,2,1},{ 3, 9,2,1},{ 4,8,1,1},{ 5,7,1,1},{ 6,6,1,1},
     { 7, 5,1,1},{ 8, 4,1,1},{10, 3,1,2},{12, 2,1,2},{15,1,1,3},{19,0,1,4}
 };
+
+// Per-row outside-pixel widths for the R=20 bottom-corner clear pass.
+static constexpr uint8_t kOvlCornerR20Widths[20] = {
+    20, 14, 12, 10, 8, 7, 6, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1
+};
+
+
 // draw_r10_2corners
 //
 // Draws the R=10 arc border at two mirrored corners (left + right) on one
@@ -1022,10 +1030,237 @@ static void draw_r10_2corners(tsl::gfx::Renderer* r, int left_x, int right_x,
     }
 }
 
-// Per-row outside-pixel widths for the R=20 bottom-corner clear pass.
-static constexpr uint8_t kOvlCornerR20Widths[20] = {
-    20, 14, 12, 10, 8, 7, 6, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1
-};
+// =============================================================================
+// draw_thick_arc_corners_fb
+//
+// Draws B-pixel-thick corner arcs (top R=10, bottom R=20) for the rounded
+// focus-flash / drag-dim border, writing DIRECTLY into the block-linear
+// RGBA4444 framebuffer via s_wp_yParts / s_wp_xGroupParts swizzle tables.
+//
+// WHY NOT drawRect:
+//   Each drawRect call traverses the full renderer pipeline (clipping, alpha
+//   blending, per-pixel swizzle math).  The swizzle tables are already
+//   initialised here; direct scatter-writes bypass all of that overhead.
+//
+// SMOOTH OUTER EDGE — analytic circle boundary:
+//   The previous table-driven sweep set x_lo from kOvlR10Arc / kOvlR20Arc,
+//   which place the arc outline 2–3 pixels inward from the true circle edge.
+//   For example at R=20, row r=0: the table starts at dx=16, but the analytic
+//   circle already touches pixels at x=13, 14, 15 (each with partial AA
+//   coverage).  The sudden jump from x=16 at r=0 to x=13 at r=1 is the
+//   staircase.  Removing the table and deriving x_lo directly from the circle
+//   equation eliminates those jumps entirely; the 4-corner AA then smooths
+//   the sub-pixel remainder continuously across every row.
+//
+// INNER BOUNDARY — analytic inner circle:
+//   x_hi is computed from the inner circle of radius R−B (same centre).
+//   When that circle does not intersect the current row (r < B), x_hi = R
+//   so the arc fills flush to the start of the straight top/bottom edge.
+//   Past r = B the inner circle converges naturally to B columns at the arc
+//   equator, matching the straight left/right edge width exactly.
+//
+// MEMORY:
+//   kOvlR10Arc and kOvlR20Arc are no longer needed in the inner loop
+//   (they are still used by render_ovl_free_border for the 1-px outline).
+//   The sweep temporaries and the nested t-loop are gone entirely.
+//
+// Parameters
+//   fb          — raw RGBA4444 framebuffer pointer (getCurrentFramebuffer())
+//   left_x      — leftmost x of the bordered region (inclusive)
+//   right_x     — exclusive right boundary (left_x + region width)
+//   y_top       — topmost FB row of the region (top-corner apex)
+//   y_bot       — bottommost FB row of the region (bottom-corner apex, inclusive)
+//   B           — border thickness in pixels
+//   packed      — pre-packed RGBA4444 colour word to write
+// =============================================================================
+[[gnu::noinline]]
+static void draw_thick_arc_corners_fb(uint16_t* fb,
+                                       int left_x, int right_x,
+                                       int y_top,  int y_bot,
+                                       int B, uint16_t packed) {
+    init_wallpaper_swizzle_tables();
+
+    // Pre-extract colour channels for blending.
+    const u8 fc_r = static_cast<u8>( packed        & 0xFu);
+    const u8 fc_g = static_cast<u8>((packed >>  4) & 0xFu);
+    const u8 fc_b = static_cast<u8>((packed >>  8) & 0xFu);
+    const u8 fc_a = static_cast<u8>((packed >> 12) & 0xFu);
+
+    // Blend one arc pixel at absolute column xa, precomputed row offset yp,
+    // with effective alpha ea.  Matches Tesla's blendPixelDirect exactly:
+    //   out_ch = (src_ch * (15−ea) + color_ch * ea) >> 4
+    //   out_a  = ea + (src_a * (15−ea)) >> 4
+    // ea == 0xF fast path: direct store (no read, matches Tesla's a==0xF path).
+    // ea == 0: skip entirely (transparent — no write).
+    const auto blend_one = [&](int xa, u32 yp, u8 ea) __attribute__((always_inline)) {
+        if (__builtin_expect(ea == 0u, 0)) return;
+        const u32 xp  = s_wp_xGroupParts[xa >> 3] + static_cast<u32>(xa & 7);
+        const u32 off = yp + xp;
+        if (ea == 0xFu) {
+            fb[off] = packed;
+        } else {
+            const u16 s   = fb[off];
+            const u8  sr  = static_cast<u8>( s        & 0xFu);
+            const u8  sg  = static_cast<u8>((s >>  4) & 0xFu);
+            const u8  sb  = static_cast<u8>((s >>  8) & 0xFu);
+            const u8  sa  = static_cast<u8>((s >> 12) & 0xFu);
+            const u8  inv = static_cast<u8>(15u - ea);
+            fb[off] = static_cast<u16>(
+                (static_cast<unsigned>(((sr * inv) + (fc_r * ea)) >> 4u))        |
+                (static_cast<unsigned>(((sg * inv) + (fc_g * ea)) >> 4u) <<  4u) |
+                (static_cast<unsigned>(((sb * inv) + (fc_b * ea)) >> 4u) <<  8u) |
+                (static_cast<unsigned>(ea + ((sa * inv) >> 4u))           << 12u));
+        }
+    };
+
+    // 4-corner supersample AA.
+    //
+    // Tests the four corners of pixel (x, r) against the circle of radius R
+    // centred at (R, R) from the corner edge, using a 2× sub-pixel grid
+    // (all distances scaled by 2, so R² → 4R²) to avoid floating point.
+    //
+    // Corner distances² (sub-pixel coords, centre at origin):
+    //   left  face  |dx|² = 4·(R−x)²       right face |dx|² = 4·(R−x−1)²
+    //   top   face  |dy|² = 4·(R−r)²       bot  face  |dy|² = 4·(R−r−1)²
+    //
+    // hits = # corners with |dx|²+|dy|² ≤ 4R².
+    // Effective alpha = (fc_a * hits + 2) >> 2.
+    const auto arc_aa_hits = [](int R, int x, int r) -> int
+            __attribute__((always_inline)) {
+        const long long R2  = 4LL*R*R;
+        const long long a   = R - x,  b   = R - r;
+        const long long ax  = 4*a*a,  ax1 = 4*(a-1)*(a-1);
+        const long long by  = 4*b*b,  by1 = 4*(b-1)*(b-1);
+        return (int)(ax1+by1<=R2) + (int)(ax1+by<=R2)
+             + (int)(ax +by1<=R2) + (int)(ax +by <=R2);
+    };
+
+    // Integer sqrt floor — accurate for n up to ~R²≤400 (R=20).
+    // Uses sqrtf; exact for all values that arise here.
+    const auto isqrt = [](long long n) -> int {
+        return n <= 0 ? 0 : static_cast<int>(sqrtf(static_cast<float>(n)));
+    };
+
+    // outer_x_lo — first column x where pixel (x, r) has any corner inside
+    // the outer circle of radius R.
+    //
+    // Closest corner to centre is bottom-right: (x+1, r+1).
+    // Condition: (R−x−1)² + (R−r−1)² ≤ R²
+    //   → x ≥ R − 1 − isqrt(R²−(R−r−1)²)
+    //
+    // For r ≥ R (past the equator) the whole row is inside the circle → 0.
+    const auto outer_x_lo = [&](int R, int r) -> int {
+        if (r >= R) return 0;
+        const long long dy  = static_cast<long long>(R - r - 1);
+        const long long val = static_cast<long long>(R)*R - dy*dy;
+        return (val < 0) ? R : std::max(0, R - 1 - isqrt(val));
+    };
+
+    // inner_x_hi — first column x where pixel (x, r) is fully inside the inner
+    // circle of radius Ri = R−B (same centre), i.e. where the border ends.
+    //
+    // Farthest corner from centre is top-left: (x, r).
+    // Condition for full containment: (R−x)² + (R−r)² ≤ Ri²
+    //   → x ≥ R − isqrt(Ri²−(R−r)²)
+    //
+    // When (R−r)² > Ri² (row r < B), the inner circle does not intersect
+    // this row → return R so the span fills flush to the straight-edge start.
+    const auto inner_x_hi = [&](int R, int r) -> int {
+        const int  Ri  = R - B;
+        if (Ri <= 0) return R;
+        const long long dy  = static_cast<long long>(R - r);
+        const long long val = static_cast<long long>(Ri)*Ri - dy*dy;
+        return (val < 0) ? R : (R - isqrt(val));
+    };
+
+    // inner_x_first — first column x where pixel (x, r) has ANY corner inside
+    // the inner circle of radius Ri (same centre).
+    //
+    // Closest corner to centre is bottom-right: (x+1, r+1).
+    // Condition: (R−x−1)² + (R−r−1)² ≤ Ri²
+    //   → x ≥ R − 1 − isqrt(Ri²−(R−r−1)²)
+    //
+    // This is the mirror of outer_x_lo but for the inner circle.  Pixels in
+    // [inner_x_first, inner_x_hi) have partial inner-circle overlap and need
+    // inner AA.  When the inner circle doesn't reach this row → returns R
+    // (no inner AA on this row).
+    const auto inner_x_first = [&](int R, int r) -> int {
+        const int  Ri  = R - B;
+        if (Ri <= 0) return R;
+        const long long dy  = static_cast<long long>(R - r - 1);
+        const long long val = static_cast<long long>(Ri)*Ri - dy*dy;
+        return (val < 0) ? R : std::max(0, R - 1 - isqrt(val));
+    };
+
+    // inner_aa_hits — corners of pixel (x, r) that are OUTSIDE the inner circle
+    // (i.e. still in the border annulus).  Mirror of arc_aa_hits but testing >
+    // rather than ≤.  Effective inner alpha = (fc_a * hits + 2) >> 2.
+    const auto inner_aa_hits = [](int R, int Ri, int x, int r) -> int
+            __attribute__((always_inline)) {
+        const long long Ri2 = static_cast<long long>(Ri)*Ri;
+        const long long a   = R - x,  b   = R - r;
+        const long long ax  = a*a,    ax1 = (a-1LL)*(a-1LL);
+        const long long by  = b*b,    by1 = (b-1LL)*(b-1LL);
+        return (int)(ax1+by1 > Ri2) + (int)(ax1+by > Ri2)
+             + (int)(ax +by1 > Ri2) + (int)(ax +by > Ri2);
+    };
+
+    // Write one mirrored row at absolute FB row y.
+    //   Left  corner: columns [left_x  + x_lo, left_x  + x_hi)
+    //   Right corner: columns [right_x − x_hi, right_x − x_lo)  (symmetric)
+    //
+    // The outermost pixel (x_lo) is AA'd via arc_aa_hits.
+    // Pixels in [inner_x_first, x_hi) are AA'd via inner_aa_hits — they
+    // partially overlap the inner hole and should fade rather than hard-clip.
+    // Solid interior pixels [x_lo+1, inner_x_first) receive full fc_a.
+    const auto write_row = [&](int y, int x_lo, int x_hi, int R, int r)
+            __attribute__((always_inline)) {
+        if (x_lo >= x_hi || y < 0 || y >= static_cast<int>(kWP_H)) return;
+        const u32 yp     = s_wp_yParts[static_cast<u32>(y)];
+        const int Ri     = R - B;
+        const int ix_f   = inner_x_first(R, r);   // start of inner AA zone
+        const int solid_end = std::min(ix_f, x_hi);
+
+        // Outer AA pixel.
+        const int hits = arc_aa_hits(R, x_lo, r);
+        const u8  aa_a = static_cast<u8>(
+            hits >= 4 ? static_cast<unsigned>(fc_a)
+                      : (static_cast<unsigned>(fc_a) * static_cast<unsigned>(hits) + 2u) >> 2u);
+        blend_one(left_x  + x_lo,     yp, aa_a);
+        blend_one(right_x - 1 - x_lo, yp, aa_a);
+
+        // Solid interior — fully inside the border annulus.
+        for (int d = x_lo + 1; d < solid_end; ++d) {
+            blend_one(left_x  + d,     yp, fc_a);
+            blend_one(right_x - 1 - d, yp, fc_a);
+        }
+
+        // Inner AA — pixels that partially overlap the inner hole.
+        // Alpha = fc_a scaled by the number of pixel corners still in the border.
+        for (int d = solid_end; d < x_hi; ++d) {
+            const int ih  = inner_aa_hits(R, Ri, d, r);
+            const u8  ia  = static_cast<u8>(
+                ih >= 4 ? static_cast<unsigned>(fc_a)
+                        : (static_cast<unsigned>(fc_a) * static_cast<unsigned>(ih) + 2u) >> 2u);
+            blend_one(left_x  + d,     yp, ia);
+            blend_one(right_x - 1 - d, yp, ia);
+        }
+    };
+
+    // ── Top corners: R=10, arc rows grow downward from y_top ─────────────────
+    {
+        constexpr int R = 10;
+        for (int r = 0; r < R; ++r)
+            write_row(y_top + r, outer_x_lo(R, r), inner_x_hi(R, r), R, r);
+    }
+
+    // ── Bottom corners: R=20, arc rows grow upward from y_bot ────────────────
+    {
+        constexpr int R = 20;
+        for (int r = 0; r < R; ++r)
+            write_row(y_bot - r, outer_x_lo(R, r), inner_x_hi(R, r), R, r);
+    }
+}
 
 // =============================================================================
 // clear_ovl_corners_448
@@ -1406,7 +1641,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 top_end   = std::min(rowEnd, skip_row_start);
                     for (u32 y = rowStart; y < top_end; ++y) {
                         const u32       yPart = s_wp_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_RowBytes);
                         for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
                     }
 
@@ -1414,7 +1649,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 mid_end   = std::min(rowEnd,   skip_row_end);
                     for (u32 y = mid_start; y < mid_end; ++y) {
                         const u32       yPart = s_wp_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_RowBytes);
                         for (u32 g = 0u;           g < skip_grp_start; ++g) do_group(yPart, rs, g);
                         for (u32 g = skip_grp_end; g < kWP_GW;         ++g) do_group(yPart, rs, g);
                     }
@@ -1422,7 +1657,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                     const u32 bot_start = std::max(rowStart, skip_row_end);
                     for (u32 y = bot_start; y < rowEnd; ++y) {
                         const u32       yPart = s_wp_yParts[y];
-                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_W * 2u);
+                        const u8* const rs    = src_base + (y + src_row_offset) * (kWP_RowBytes);
                         for (u32 g = 0u; g < kWP_GW; ++g) do_group(yPart, rs, g);
                     }
 
@@ -1507,23 +1742,21 @@ static void draw_drag_dim_border(tsl::gfx::Renderer* renderer,
         clear_ovl_corners_448(fb16, y, y + h);
 
         // Rounded red border matching the free overlay player shape.
-        // Top corners R=10, bottom corners R=20 — same kOvlR10Arc / kOvlR20Arc
-        // tables used by render_ovl_free_border, drawn BORD px thick via inset passes.
+        // Top corners R=10, bottom corners R=20 — straight edges shortened by
+        // the respective corner radius on each end so they don't form square
+        // corners where the arc leaves transparent cutouts.
+        // Corner arcs are drawn via draw_thick_arc_corners_fb which scan-fills
+        // the union span per absolute row, eliminating the diagonal gaps that
+        // the old BORD-inset drawRect loop produced.
         static constexpr int R_T = 10, R_B = 20;
-        // Straight edges (shortened by the respective corner radius on each end)
+        // Straight edges
         renderer->drawRect(R_T,     y,          w - 2*R_T, BORD,          RED);  // top
         renderer->drawRect(R_B,     y+h-BORD,   w - 2*R_B, BORD,          RED);  // bottom
         renderer->drawRect(0,       y+R_T,      BORD,       h-R_T-R_B,    RED);  // left
         renderer->drawRect(w-BORD,  y+R_T,      BORD,       h-R_T-R_B,    RED);  // right
-        // Corner arcs — BORD inset passes so the arc band is BORD px thick.
-        for (int t = 0; t < BORD; ++t) {
-            draw_r10_2corners(renderer, t, w-t, y+t, false, RED);
-            for (const auto& a : kOvlR20Arc) {
-                const int row = (y+h-1-t) - a.dy;
-                renderer->drawRect( t       + a.dx,         row, a.cnt, a.h, RED);
-                renderer->drawRect((w-t)    - a.dx - a.cnt, row, a.cnt, a.h, RED);
-            }
-        }
+        // Corner arcs — scan-filled directly into the framebuffer; no drawRect loop.
+        static constexpr uint16_t kPackedRed = 0xF00Fu;  // {r=F,g=0,b=0,a=F} RGBA4444
+        draw_thick_arc_corners_fb(fb16, 0, w, y, y+h-1, BORD, kPackedRed);
     }
 
     // "Paused" centred within the caller-supplied text sub-region.

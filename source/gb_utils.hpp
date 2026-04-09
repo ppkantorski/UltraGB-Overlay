@@ -122,7 +122,7 @@ static void __attribute__((optimize("O3"))) process_zr_fast_forward(bool zr_down
     if (g_fast_forward && !zr_held) {
         g_fast_forward     = false;
         g_gb_frame_next_ns = 0;   // re-anchor so no catch-up burst
-        gb_audio_resume();
+        gb_audio_ff_resume();     // resync GBAPU state before next real audio frame
     }
 }
 
@@ -388,28 +388,40 @@ static bool __attribute__((optimize("O3"))) draw_focus_flash(tsl::gfx::Renderer*
         // Matches the overlay player shape exactly: top corners R=10, bottom corners R=20,
         // same geometry driven by kOvlR10Arc / kOvlR20Arc in gb_renderer.h.
         //
-        // Straight edges are B px thick (shortened by the respective arc radius on each
-        // side so they don't form square corners where the arc leaves transparent cutouts).
-        // Corner arcs are filled by drawing B inset passes of the 1-px arc tables — each
-        // pass shifts the arc origin 1 px inward, painting the arc band to full thickness.
-        // Using the same R=10/R=20 tables for all B passes (instead of computing inset
-        // radii R-t) produces an imperceptible ~1 px deviation at B=4.
+        // Straight edges are B px thick, shortened by the respective arc radius on each
+        // side so they don't butt squarely against the transparent corner cutouts.
+        // Corner arcs are scan-filled directly into the framebuffer via
+        // draw_thick_arc_corners_fb — see that function for a full explanation of
+        // why the old B-inset drawRect loop was replaced.
         static constexpr int R_T = 10, R_B = 20;
         // Straight edges
         renderer->drawRect(x0 + R_T, y0,      w - 2*R_T, B,          fc);  // top
         renderer->drawRect(x0 + R_B, y0+h-B,  w - 2*R_B, B,          fc);  // bottom
         renderer->drawRect(x0,       y0+R_T,  B,          h-R_T-R_B, fc);  // left
         renderer->drawRect(x0+w-B,   y0+R_T,  B,          h-R_T-R_B, fc);  // right
-        // Corner arcs — B inset passes (top corners via draw_r10_2corners,
-        // bottom corners via kOvlR20Arc loop, mirrored left ↔ right).
-        for (int t = 0; t < B; ++t) {
-            draw_r10_2corners(renderer, x0+t, x0+w-t, y0+t, false, fc);
-            for (const auto& a : kOvlR20Arc) {
-                const int row = (y0+h-1-t) - a.dy;
-                renderer->drawRect( x0+t       + a.dx,             row, a.cnt, a.h, fc);
-                renderer->drawRect((x0+w-t)    - a.dx - a.cnt,     row, a.cnt, a.h, fc);
-            }
-        }
+        // Corner arcs — scan-filled directly into the framebuffer.
+        // draw_thick_arc_corners_fb computes the union x-span of all B inset
+        // passes per absolute row and writes it in one shot, eliminating the
+        // diagonal pixel gaps the old BORD-inset drawRect loop produced.
+        //
+        // Every arc pixel is written via blend_one, which reads the existing
+        // framebuffer pixel and applies the same (src*(15-a) + color*a)>>4
+        // alpha-blend as Tesla's drawRect / blendPixelDirect.  This means the
+        // corners and the straight edges fade identically: both blend back
+        // toward whatever is already in the framebuffer (the wallpaper) as
+        // g_focus_flash counts down toward zero, rather than the corners
+        // fading toward black as the previous direct-write path did.
+        //
+        // Pack the colour with fc.a = al directly — the blending in
+        // draw_thick_arc_corners_fb produces the correct fade without any
+        // RGB pre-scaling.
+        const uint16_t packed_fc = static_cast<uint16_t>(
+            static_cast<unsigned>(fc.r)        |
+           (static_cast<unsigned>(fc.g) <<  4) |
+           (static_cast<unsigned>(fc.b) <<  8) |
+           (static_cast<unsigned>(al)   << 12));
+        auto* fb16 = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
+        draw_thick_arc_corners_fb(fb16, x0, x0+w, y0, y0+h-1, B, packed_fc);
     }
     --g_focus_flash;
     return true;
