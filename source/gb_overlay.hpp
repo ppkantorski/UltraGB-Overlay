@@ -766,10 +766,14 @@ public:
         // Runs every 120 frames (~2 s) so the pmdmnt + audproc IPC cost is
         // completely negligible.  Counter is a plain u8; wrapping at 256 is harmless
         // (fires one frame early every ~4 s — no correctness impact).
+        // Suppressed while pass-through is active: the title volume was intentionally
+        // lifted to 1.0f by gb_game_vol_suppress() and must not be re-lowered until
+        // foreground is reclaimed.
         static u8 s_vol_recheck_ctr = 0;
         if (++s_vol_recheck_ctr >= 120) {
             s_vol_recheck_ctr = 0;
-            gb_game_vol_recheck();
+            if (!m_zl_state.pass_through)
+                gb_game_vol_recheck();
         }
     }
 
@@ -828,8 +832,18 @@ public:
         {
             const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
             const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & ALL_KEYS_MASK));
+            const bool was_pass_through = m_zl_state.pass_through;
             process_zl_pass_through(zl_down, zl_held, m_zl_state);
             process_home_foreground_release(m_zl_state);
+            if (!was_pass_through && m_zl_state.pass_through) {
+                // Foreground just released — silence GB, restore title volume.
+                gb_audio_pause();
+                gb_game_vol_suppress();
+            } else if (was_pass_through && !m_zl_state.pass_through) {
+                // Foreground just reclaimed — un-silence GB, re-apply title volume.
+                gb_audio_resume();
+                gb_game_vol_recheck();
+            }
         }
 
         // ── Touch → virtual button state ──────────────────────────────────────

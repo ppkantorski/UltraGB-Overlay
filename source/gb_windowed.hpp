@@ -1092,10 +1092,14 @@ public:
         // Periodic background-title volume correction — same safety net as
         // GBOverlayGui::update().  See that comment for full rationale.
         // Runs every 120 frames (~2 s); u8 wrap at 256 is harmless.
+        // Suppressed while pass-through is active: the title volume was
+        // intentionally lifted to 1.0f by gb_game_vol_suppress() and must not
+        // be re-lowered until foreground is reclaimed.
         static u8 s_vol_recheck_ctr = 0;
         if (++s_vol_recheck_ctr >= 120) {
             s_vol_recheck_ctr = 0;
-            gb_game_vol_recheck();
+            if (!m_zl_state.pass_through)
+                gb_game_vol_recheck();
         }
     }
 
@@ -1190,11 +1194,26 @@ public:
         // written to g_focus_flash / g_focus_flash_red by the helper and drawn
         // in GBWindowedElement::draw().  The d-pad keys are excluded from the
         // ZL-alone guard because they are separate physical axes, not buttons.
+        //
+        // Audio coupling: on foreground loss the GB audio is silenced and the
+        // background Switch title's volume is lifted back to 1.0f so the user
+        // can hear it normally.  On foreground regain the GB audio is restored
+        // and gb_game_vol_recheck() re-applies g_game_volume to the title.
         {
             const bool zl_down = ((keysDown & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
             const bool zl_held = ((keysHeld  & KEY_ZL) && !(keysHeld & ~KEY_ZL & (ALL_KEYS_MASK | KEY_DOWN | KEY_UP | KEY_RIGHT | KEY_LEFT)));
+            const bool was_pass_through = m_zl_state.pass_through;
             process_zl_pass_through(zl_down, zl_held, m_zl_state);
             process_home_foreground_release(m_zl_state);
+            if (!was_pass_through && m_zl_state.pass_through) {
+                // Foreground just released — silence GB, restore title volume.
+                gb_audio_pause();
+                gb_game_vol_suppress();
+            } else if (was_pass_through && !m_zl_state.pass_through) {
+                // Foreground just reclaimed — un-silence GB, re-apply title volume.
+                gb_audio_resume();
+                gb_game_vol_recheck();
+            }
         }
 
         // ── Right/Left stick click: resize window ────────────────────────────

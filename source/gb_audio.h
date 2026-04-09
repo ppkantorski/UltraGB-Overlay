@@ -288,6 +288,19 @@ static void gb_game_vol_restore() {
     s_pre_game_pid = 0;
 }
 
+// Temporarily lift the title volume back to 1.0f without ending the session.
+// Called when the player loses foreground (pass-through mode or home press) so
+// the background Switch title plays at full volume while the user interacts with
+// it directly.  s_pre_game_pid is intentionally preserved — the session remains
+// live, and gb_game_vol_recheck() will re-apply g_game_volume the moment
+// foreground is reclaimed.
+static void gb_game_vol_suppress() {
+    if (s_pre_game_pid == 0) return;
+    if (R_FAILED(s_audproc_init())) return;
+    s_audproc_set_vol(s_pre_game_pid, 1.0f);
+    s_audproc_exit();
+}
+
 // Re-synchronise the background-title volume after the overlay is shown again
 // (Overlay::onShow) or as a periodic safety-net check from the player GUIs'
 // update() every ~120 frames.
