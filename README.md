@@ -292,4 +292,4 @@ Contributions are welcome! If you have any ideas, suggestions, or bug reports, p
 
 ## License
 
-UltraGB Overlay is released under the [GPLv2](LICENSE).
+This project is licensed and distributed under [GPLv2](LICENSE).
