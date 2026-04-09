@@ -419,19 +419,19 @@ public:
 
             const auto [aw, ah] = renderer->getTextDimensions("\uE0E0", false, ABTN_SIZE);
             g_abtn_hx  = ABTN_DRAW_X  + aw / 2;
-            g_abtn_hy  = ABTN_DRAW_Y  + g_render_y_offset - ah / 2;
+            g_abtn_hy  = ABTN_DRAW_Y  + g_render_y_offset - ah / 2 + 8;  // +8: circle backing centre
 
             const auto [bw, bh] = renderer->getTextDimensions("\uE0E1", false, BBTN_SIZE);
             g_bbtn_hx  = BBTN_DRAW_X  + bw / 2;
-            g_bbtn_hy  = BBTN_DRAW_Y  + g_render_y_offset - bh / 2;
+            g_bbtn_hy  = BBTN_DRAW_Y  + g_render_y_offset - bh / 2 + 6;  // +6: circle backing centre
 
             const auto [sw, sh] = renderer->getTextDimensions("\uE0EF", false, START_SIZE);
-            g_start_hx = START_DRAW_X + sw / 2;
-            g_start_hy = START_DRAW_Y + g_render_y_offset - sh / 2;
+            g_start_hx = START_DRAW_X + sw / 2 + 3;   // glyph drawn at +3; now stores circle centre X
+            g_start_hy = START_DRAW_Y + g_render_y_offset - sh / 2 + 4;  // circle backing centre
 
             const auto [selw, selh] = renderer->getTextDimensions("\uE0F0", false, SELECT_SIZE);
-            g_select_hx = SELECT_DRAW_X + selw / 2;
-            g_select_hy = SELECT_DRAW_Y + g_render_y_offset - selh / 2;
+            g_select_hx = SELECT_DRAW_X + selw / 2 - 3;  // glyph drawn at −3; now stores circle centre X
+            g_select_hy = SELECT_DRAW_Y + g_render_y_offset - selh / 2 + 4;  // circle backing centre
 
             //const auto [divw, divh] = renderer->getTextDimensions(ult::DIVIDER_SYMBOL, false, START_SIZE);
             //g_div_half_w = static_cast<int>(divw) / 2;
@@ -466,17 +466,17 @@ public:
         }
 
         // A button: filled black circle matching the hit-test radius.
-        renderer->drawCircle(g_abtn_hx, g_abtn_hy + 8, ABTN_R, true, BK);
+        renderer->drawCircle(g_abtn_hx, g_abtn_hy, ABTN_R, true, BK);
 
         // B button: filled black circle matching the hit-test radius.
-        renderer->drawCircle(g_bbtn_hx, g_bbtn_hy + 6, BBTN_R, true, BK);
+        renderer->drawCircle(g_bbtn_hx, g_bbtn_hy, BBTN_R, true, BK);
 
         // Plus (+) / Minus (−): individual filled circles behind each glyph,
         // matching the A/B button style.  g_start/select_hx/hy are the measured
         // visual centres from the g_btns_measured block above; START_R/SELECT_R
         // are the intended radii (both 24), defined in gb_globals.hpp.
-        renderer->drawCircle(g_select_hx-3, g_select_hy+4, SELECT_R-6, true, BK);
-        renderer->drawCircle(g_start_hx+3,  g_start_hy+4,  START_R-6,  true, BK);
+        renderer->drawCircle(g_select_hx, g_select_hy, SELECT_R-6, true, BK);
+        renderer->drawCircle(g_start_hx,  g_start_hy,  START_R-6,  true, BK);
 
         // ── D-pad composite — all four arrow directions ───────────────────────
         // Each glyph is treated as a 3×3 grid; we scissor to the center strip.
@@ -865,7 +865,7 @@ public:
         if (touching && !m_zl_state.pass_through && !s_ovl_free_dragging) {
             {
                 static constexpr int D_CX        = DPAD_DRAW_X + 67;
-                static constexpr int D_CY        = DPAD_DRAW_Y - 61;
+                const            int D_CY        = DPAD_DRAW_Y - 61 + g_render_y_offset;
                 static constexpr int D_HALF_ARM  = 27;
                 static constexpr int D_HALF_SPAN = 70;
 
