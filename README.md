@@ -22,15 +22,20 @@ Play GB and GBC games on top of any running application.
 - Accurate 59.73 Hz Game Boy clock rate, decoupled from the display vsync
 - LCD ghosting / frame blending — per-game 50/50 blend of consecutive frames to reproduce the phosphor persistence that 30 Hz flickering transparency effects were designed for
 - Fast-forward (4×) via ZR double-click-hold; audio pauses for the duration and resumes cleanly on release
+- No Sprite Limit — per-game toggle that lifts the 10-sprites-per-scanline hardware cap so flickering transparency effects show all sprites every frame
 
 ### Display Modes
 
 **Overlay mode** — emulator drawn inside the standard Ultrahand overlay panel (448×720 framebuffer) alongside the UltraGB menu chrome.
 - **2.5× scale** (default) — 400×360 viewport, fills the overlay width
-- **2× pixel-perfect** — 320×288 viewport, integer scale with letterbox; toggleable in-game by tapping the screen or a quick RS press
+- **2× pixel-perfect** — 320×288 viewport, integer scale with letterbox; toggleable in-game by tapping the game screen
+
+**Fixed overlay** (default) — overlay panel is anchored to the left edge of the screen, identical to all other Ultrahand overlays.
+
+**Free overlay** — the overlay panel floats freely anywhere on screen. Repositionable by touch hold (≈1 s) on the game screen or KEY_PLUS hold (1 s) + left stick. Position is saved between sessions.
 
 **Windowed mode** — framebuffer-accurate floating window placed anywhere on screen with no UI chrome.
-- Integer scales: 1× through 5× (memory-gated; see Requirements)
+- Integer scales: 1× through 6× (scale range is heap- and mode-gated; see Requirements)
 - Repositionable by touch hold (≈1 s) or KEY_PLUS hold (2 s) + left stick
 - RS / LS click to step scale up / down in-game (relaunches at new scale)
 - Position and scale saved to `config.ini`
@@ -41,7 +46,7 @@ Cycled per game from the per-game config screen. All modes work for both DMG and
 | Mode | Behaviour |
 |---|---|
 | `GBC` (default) | CGB games use hardware colour. DMG games receive the real GBC boot ROM title-based colorisation (per-game lookup from hardware-verified palette database); unrecognised or unlicensed games fall back to greyscale. |
-| `SGB` | Same title lookup as GBC, but applied to all games regardless of licensee, with a warm amber fallback for unrecognised titles. |
+| `SGB` | Same title lookup as GBC, applied to all games regardless of licensee (bypasses the Nintendo licensee gate). A warm amber palette is used as the fallback for unrecognised titles. |
 | `DMG` | Classic four-shade green Game Boy LCD tint. |
 | `Native` | True greyscale — raw luminance values, no tint. |
 
@@ -50,6 +55,14 @@ Simulates the dark inter-pixel gap of a real Game Boy Color LCD by dimming the l
 
 ### Virtual On-Screen Controls (Overlay Mode)
 D-pad, A, B, Start, and Select are drawn below the game screen and mapped to touch input each frame.
+
+### Audio
+- **Game Boy volume** — global GB audio output level (0–100).
+- **Active Title volume** — per-process master volume of the running background Switch title, controlled independently. Adjusted live while the overlay is open and automatically restored to its pre-game level when the overlay closes.
+- **Audio Balance** — per-game GB audio trim (−150% … 0% … +150%) stored in the per-game config. Applied as a power-of-2 gain multiplier on top of the master volume so individual games can be normalised without affecting global volume.
+
+### Themes and Wallpapers
+The overlay UI chrome (background, button colours, border) is fully themeable via `.ini` files placed in `sdmc:/config/ultragb/ovl_themes/`. A wallpaper (`.rgba` format) can be selected from `sdmc:/config/ultragb/ovl_wallpapers/` and is displayed behind the game screen when expanded memory permits.
 
 ---
 
@@ -66,9 +79,18 @@ D-pad, A, B, Start, and Select are drawn below the game screen and mapped to tou
 | D-Pad | GB D-Pad |
 | Touch (virtual buttons) | GB D-Pad / A / B / Start / Select |
 | ZR double-click-hold | Fast-forward (4×) |
+| ZL double-click, then hold (≈0.5 s) | Toggle controller pass-through to background app |
 | Quick tap on game screen | Toggle 2.5× ↔ 2× scale |
-| RS quick-release | Toggle 2.5× ↔ 2× scale |
-| Launch combo | Back to ROM selector (normal) / close overlay (quick-launch mode) |
+| Launch combo | Return to ROM selector (normal) / close overlay (quick-launch or direct mode) |
+
+**Free overlay only:**
+
+| Input | Action |
+|---|---|
+| Touch hold on game screen (≈1 s) | Enter drag mode — move overlay, release to save position |
+| KEY_PLUS hold (1 s) + left stick | Joystick reposition mode |
+| RS click (solo) | Switch to free overlay mode |
+| LS click (solo) | Switch to fixed overlay mode |
 
 ### Windowed Mode (In-Game)
 
@@ -83,7 +105,7 @@ D-pad, A, B, Start, and Select are drawn below the game screen and mapped to tou
 | ZL double-click, then hold (≈0.5 s) | Toggle controller pass-through to background app |
 | Touch hold inside window (≈1 s) | Enter drag mode — move window, release to save position |
 | KEY_PLUS hold (2 s) + left stick | Joystick reposition mode |
-| RS click (solo) | Step scale up (1× → 2× → … → 5×) |
+| RS click (solo) | Step scale up (1× → 2× → … → max) |
 | LS click (solo) | Step scale down |
 | Launch combo | Return to UltraGB menu / close overlay (quick-exit mode) |
 
@@ -101,7 +123,7 @@ D-pad, A, B, Start, and Select are drawn below the game screen and mapped to tou
 
 ## Save System
 
-- **Battery saves (SRAM)** — written on ROM unload; stored at `sdmc:/config/ultragb/saves/`
+- **Battery saves (SRAM)** — written on ROM unload; stored at `sdmc:/config/ultragb/saves/internal/`
 - **Quick-resume state** — full CPU/PPU/APU snapshot saved automatically when the overlay closes; restored on next launch; stored at `sdmc:/config/ultragb/states/internal/`
 - **User save states** — 10 manual slots per game; stored at `sdmc:/config/ultragb/states/`
 - **SRAM backup slots** — 10 manual SRAM backup slots per game, independent of save states
@@ -117,23 +139,53 @@ Press **Y** on any ROM in the selector to open its config screen.
 | Save States | 10 named slots — save, load, or delete any slot |
 | Save Data | 10 SRAM backup slots — manual snapshots of battery save data |
 | Reset | Cold boot the game (deletes the quick-resume state) |
-| Pallet Mode | Cycle GBC → DMG → Native; applied live without restarting |
+| Pallet Mode | Cycle GBC → SGB → DMG → Native; applied live without restarting |
+| No Sprite Limit | Lift the 10-sprites-per-scanline hardware cap; on by default |
 | LCD Ghosting | Enable 50/50 frame blending for accurate flicker reproduction (memory-gated — see below) |
+| Audio Balance | Per-game GB volume trim from −150% to +150%; press Y while focused to reset to 0% |
 
 ---
 
 ## Settings
 
+### Volume
+
 | Item | Description |
 |---|---|
-| Volume | Slider 0–100; tap the speaker icon or press Y (when slider is focused) to mute/unmute |
-| Windowed Mode | Toggle windowed mode on/off; takes effect on next ROM launch |
-| Windowed Scale | Cycle 1× → 2× → 3× → 4× → 5×; capped by available heap (see below) |
-| Overlay Scale | Toggle 2.5× (default) ↔ 2× pixel-perfect |
+| Game Boy | GB audio output level (0–100); tap the speaker icon or press Y (when focused) to mute/unmute |
+| Active Title | Background Switch title volume (0–100); tap the speaker icon or press Y (when focused) to mute/unmute; reverts to pre-game level on overlay close |
+
+### Display
+
+| Item | Description |
+|---|---|
+| Mode | Toggle between Overlay and Windowed; takes effect on next ROM launch |
 | LCD Grid | Enable/disable the LCD inter-pixel gap simulation |
+| Overlay | Submenu: Position (Fixed / Free) and Theme |
+| Windowed | Submenu: Scale (1×–6×, heap-gated) and Docked Resolution (720p / 1080p) |
+
+### Miscellaneous
+
+| Item | Description |
+|---|---|
 | Quick Combo | Assign a button combo to launch directly to the last played ROM from anywhere |
-| In-Game Haptics | Enable/disable rumble feedback during gameplay |
-| In-Game Wallpaper | Show the Ultrahand wallpaper behind the game screen (requires 8 MB+ heap) |
+| Button Haptics | Enable/disable rumble feedback on controller button presses |
+| Touch Haptics | Enable/disable rumble feedback on screen touch (virtual buttons, drag reposition) |
+
+### Overlay Submenu
+
+| Item | Description |
+|---|---|
+| Position | Fixed (anchored left edge) or Free (repositionable floating panel) |
+| Theme | Select a UI theme from `sdmc:/config/ultragb/ovl_themes/`; "default" always available |
+| Wallpaper | Select a background wallpaper from `sdmc:/config/ultragb/ovl_wallpapers/` (requires 8 MB+ heap) |
+
+### Windowed Submenu
+
+| Item | Description |
+|---|---|
+| Scale | Cycle 1× → 2× → … → max; capped by available heap and ROM size (see Requirements) |
+| Docked Resolution | 720p (default, 1.5× VI layer) or 1080p (pixel-perfect, 1:1 VI layer); takes effect on next windowed launch |
 
 ### Quick Combo / Quick Launch
 Assigning a combo in Settings registers it system-wide and deconflicts it from other overlays and packages automatically. When triggered, the overlay launches straight into the last played ROM, bypassing the selector. The launch combo then closes the overlay entirely rather than returning to the menu.
@@ -148,8 +200,8 @@ The Switch overlay heap is capped per system configuration. UltraGB adapts autom
 |---|---|---|---|
 | 4 MB | 3× | — | — |
 | 6 MB | 4× | — | ROMs < 2 MB only |
-| 8 MB | 5× | ✓ | ROMs < 4 MB only |
-| 10 MB+ | 5× | ✓ | All ROMs |
+| 8 MB | 5× (6× when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only |
+| 10 MB+ | 5× (6× when docked + 1080p) | ✓ | All ROMs |
 
 ROMs that exceed the current tier's playable size are shown in the selector with a warning colour and cannot be launched.
 
@@ -198,12 +250,17 @@ sdmc:/
 └── config/
     └── ultragb/
         ├── config.ini              ← global settings (rom_dir, volume, scale, etc.)
-        ├── saves/                  ← SRAM battery saves
+        ├── ovl_theme.ini           ← active overlay theme (copied from ovl_themes/ on select)
+        ├── ovl_wallpaper.rgba      ← active overlay wallpaper (copied from ovl_wallpapers/ on select)
+        ├── ovl_themes/             ← user-provided .ini theme files
+        ├── ovl_wallpapers/         ← user-provided .rgba wallpaper files
+        ├── saves/
+        │   └── internal/           ← SRAM battery saves
         ├── states/
         │   ├── internal/           ← quick-resume state (one per game, auto-managed)
         │   └── <game>/             ← user save-state slots
         └── configure/
-            └── <game>.ini          ← per-game settings (palette, ghosting)
+            └── <game>.ini          ← per-game settings (palette, ghosting, audio balance, etc.)
 ```
 
 ---
