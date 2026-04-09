@@ -1148,8 +1148,29 @@ static void draw_thick_arc_corners_fb(uint16_t* fb,
 
     // Integer sqrt floor — accurate for n up to ~R²≤400 (R=20).
     // Uses sqrtf; exact for all values that arise here.
+    // Integer sqrt floor — faster than sqrtf, exact for small n (R≤20)
     const auto isqrt = [](long long n) -> int {
-        return n <= 0 ? 0 : static_cast<int>(sqrtf(static_cast<float>(n)));
+        if (n <= 0) return 0;
+    
+        // Approximate sqrt using bit hack
+        uint32_t x = static_cast<uint32_t>(n);
+        uint32_t res = 0;
+        uint32_t bit = 1u << 30; // The second-to-top bit set
+    
+        // "Bitwise" integer sqrt
+        while (bit > x) bit >>= 2;
+    
+        while (bit != 0) {
+            if (x >= res + bit) {
+                x -= res + bit;
+                res = (res >> 1) + bit;
+            } else {
+                res >>= 1;
+            }
+            bit >>= 2;
+        }
+    
+        return static_cast<int>(res);
     };
 
     // outer_x_lo — first column x where pixel (x, r) has any corner inside

@@ -348,6 +348,15 @@ public:
             fill_vp_corners_448(fb16, pre_wp_bg);
         }
         render_gb_screen(renderer);
+        // 1-pixel inner border around the 2× game screen — sits inside the letterbox,
+        // never touches game pixels.  Matches the same border colour as the outer VP border.
+        {
+            const tsl::Color& BORDER = g_ovl_bdr_col;
+            renderer->drawRect(VP2_X - 1, VP2_Y - 1 + g_render_y_offset, VP2_W + 2, 1, BORDER);  // top
+            renderer->drawRect(VP2_X - 1, VP2_Y + VP2_H + g_render_y_offset, VP2_W + 2, 1, BORDER);  // bottom
+            renderer->drawRect(VP2_X - 1, VP2_Y + g_render_y_offset,         1, VP2_H, BORDER);  // left
+            renderer->drawRect(VP2_X + VP2_W, VP2_Y + g_render_y_offset,     1, VP2_H, BORDER);  // right
+        }
         // Theme-aware viewport border + arc border at the 4 outer letterbox corners.
         // Corner arcs use kOvlR10Arc growing down from vp_top / up from vp_bot,
         // mirrored left↔right.  14 arc drawRect calls × 2 (top+bottom) = 28 total.

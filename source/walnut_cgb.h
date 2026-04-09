@@ -36,7 +36,6 @@
  * Copyright (c) 2015-2019 Lior Halphon
  */
 
-
 #ifndef WALNUT_GB_H
 #define WALNUT_GB_H
 #if defined(__has_include)
