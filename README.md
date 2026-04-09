@@ -21,7 +21,7 @@ Play GB and GBC games on top of any running application.
 - Supports ROM-only, MBC1, MBC2, MBC3 (with RTC), and MBC5 (including rumble) cartridge types
 - Accurate 59.73 Hz Game Boy clock rate, decoupled from the display vsync
 - LCD ghosting / frame blending — per-game 50/50 blend of consecutive frames to reproduce the phosphor persistence that 30 Hz flickering transparency effects were designed for
-- Fast-forward (4×) via ZR double-click-hold; audio pauses for the duration and resumes cleanly on release
+- Fast-forward (4x) via ZR double-click-hold; audio pauses for the duration and resumes cleanly on release
 - No Sprite Limit — per-game toggle that lifts the 10-sprites-per-scanline hardware cap so flickering transparency effects show all sprites every frame
 
 ### Display Modes
@@ -34,7 +34,7 @@ Play GB and GBC games on top of any running application.
 **Free overlay** — the overlay panel floats freely anywhere on screen. Repositionable by touch hold (≈1 s) on the game screen or KEY_PLUS hold (1 s) + left stick. Position is saved between sessions.
 
 **Windowed mode** — framebuffer-accurate floating window placed anywhere on screen with no UI chrome.
-- Integer scales: 1× through 6× (scale range is heap- and mode-gated; see Requirements)
+- Integer scales: 1x through 6x (scale range is heap- and mode-gated; see Requirements)
 - Repositionable by touch hold (≈1 s) or KEY_PLUS hold (2 s) + left stick
 - RS / LS click to step scale up / down in-game (relaunches at new scale)
 - Position and scale saved to `config.ini`
