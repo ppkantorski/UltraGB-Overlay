@@ -27,7 +27,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 0.9.0
+APP_VERSION := 0.9.2
 TARGET      := ultragb
 BUILD       := build
 SOURCES     := source
@@ -76,7 +76,7 @@ CFLAGS += -DTESLA_TARGETED_SPEED
 CFLAGS += -DULTRA_TARGETED_SIZE
 
 # FPS Indicator (for debugging)
-CFLAGS += -DGB_FPS
+#CFLAGS += -DGB_FPS
 
 CXXFLAGS := $(CFLAGS) -std=c++26 \
             -Wno-dangling-else \

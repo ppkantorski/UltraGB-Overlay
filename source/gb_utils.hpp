@@ -648,7 +648,7 @@ static void register_quick_launch_mode() {
 
 // =============================================================================
 // Per-game config helpers
-// Each ROM gets its own ini at: CONFIGURE_DIR/<filename>.ini
+// Each ROM gets its own ini at: SETTINGS_DIR/<filename>.ini
 // =============================================================================
 
 // Peek at ROM header byte 0x143 to determine CGB support without loading the ROM.
@@ -670,7 +670,7 @@ static bool rom_has_cgb_flag(const char* romPath) {
 static void build_game_config_path(const char* romPath, char* out, size_t outSz) {
     const char* sl = strrchr(romPath, '/');
     const char* base = sl ? sl + 1 : romPath;
-    snprintf(out, outSz, "%s%s.ini", CONFIGURE_DIR, base);
+    snprintf(out, outSz, "%s%s.ini", SETTINGS_DIR, base);
 }
 
 static std::string load_game_cfg_str(const char* romPath, const char* key) {
@@ -682,7 +682,7 @@ static std::string load_game_cfg_str(const char* romPath, const char* key) {
 static void save_game_cfg_str(const char* romPath, const char* key, const char* value) {
     char cfgPath[PATH_BUFFER_SIZE];
     build_game_config_path(romPath, cfgPath, sizeof(cfgPath));
-    ult::createDirectory(CONFIGURE_DIR);
+    ult::createDirectory(SETTINGS_DIR);
     ult::setIniFileValue(cfgPath, kConfigSection, key, value, "");
 }
 

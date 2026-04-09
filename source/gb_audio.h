@@ -253,16 +253,27 @@ static u8    g_game_volume       = 30;
 static float s_pre_game_proc_vol = 1.0f;
 static u64   s_pre_game_pid      = 0;
 
-// Apply g_game_volume to the running background title and save its previous level.
+// Apply g_game_volume to the running background title and record 1.0f as the
+// restore baseline.
 // Called once from gb_audio_init() after the audio thread is live.
+//
+// We intentionally do NOT read the title's current audproc volume via
+// s_audproc_get_vol.  The Switch initialises every application's audio process
+// at 1.0f, so in the common case reading it is redundant.  More critically,
+// audproc volume changes persist across home-menu transitions: if a prior
+// UltraGB session had g_game_volume set to 0 (muted), the title's audproc will
+// still report 0 even after the user returns from home, causing us to save 0
+// as s_pre_game_proc_vol and then "restore" the title to muted on every
+// subsequent exit.  Hardcoding 1.0f is always the correct restore target —
+// any deviation from 1.0f in the title's current audproc was put there by us,
+// not by the user or the system.
 static void gb_game_vol_apply() {
     if (R_FAILED(pmdmntGetApplicationProcessId(&s_pre_game_pid))) {
         s_pre_game_pid = 0;
         return;
     }
     if (R_FAILED(s_audproc_init())) return;
-    if (R_FAILED(s_audproc_get_vol(s_pre_game_pid, &s_pre_game_proc_vol)))
-        s_pre_game_proc_vol = 1.0f;
+    s_pre_game_proc_vol = 1.0f;
     s_audproc_set_vol(s_pre_game_pid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
     s_audproc_exit();
 }
@@ -304,16 +315,13 @@ static void gb_game_vol_recheck() {
     if (R_FAILED(s_audproc_init())) return;
 
     if (currentPid != s_pre_game_pid) {
-        // Title changed under us.  Capture the new title's natural volume as
-        // the restore baseline (it hasn't been touched by us yet), then apply
-        // g_game_volume.  The old PID is discarded — it is either gone or no
-        // longer our responsibility.
-        float newPreVol = 1.0f;
-        if (R_FAILED(s_audproc_get_vol(currentPid, &newPreVol)))
-            newPreVol = 1.0f;
+        // Title changed under us.  Apply g_game_volume immediately and record
+        // 1.0f as the restore baseline — same reasoning as gb_game_vol_apply():
+        // we must never trust the current audproc value of a title we're
+        // adopting mid-session.
         s_audproc_set_vol(currentPid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
         s_pre_game_pid      = currentPid;
-        s_pre_game_proc_vol = newPreVol;
+        s_pre_game_proc_vol = 1.0f;
     } else {
         // Same title — re-assert in case the system reset the level while the
         // overlay was hidden (e.g. another overlay or a system event touched it).

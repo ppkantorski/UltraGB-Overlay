@@ -2559,7 +2559,7 @@ public:
         ult::createDirectory(SAVE_BASE_DIR);
         ult::createDirectory(STATE_BASE_DIR);
         ult::createDirectory(STATE_DIR);
-        ult::createDirectory(CONFIGURE_DIR);
+        ult::createDirectory(SETTINGS_DIR);
         ult::createDirectory(g_rom_dir);
         ult::createDirectory(g_save_dir);
 
