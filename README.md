@@ -217,7 +217,7 @@ ROMs that exceed the current tier's playable size are shown in the selector with
 
 ## Installation
 
-1. Download the latest `gbemu.ovl` from [Releases](../../releases)
+1. Download the latest `ultragb.ovl` from [Releases](../../releases)
 2. Copy it to `sdmc:/switch/.overlays/`
 3. Launch via Ultrahand
 
@@ -246,7 +246,7 @@ The build targets C++26, ARMv8-A with SIMD/CRC/crypto extensions tuned for Corte
 sdmc:/
 ├── switch/
 │   └── .overlays/
-│       └── gbemu.ovl
+│       └── ultragb.ovl
 └── config/
     └── ultragb/
         ├── config.ini              ← global settings (rom_dir, volume, scale, etc.)
