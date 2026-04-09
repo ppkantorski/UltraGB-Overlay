@@ -45,7 +45,7 @@ static constexpr const char* OVL_THEME_FILE     = "sdmc:/config/ultragb/ovl_them
 static constexpr const char* OVL_WALLPAPERS_DIR = "sdmc:/config/ultragb/ovl_wallpapers/";
 static constexpr const char* OVL_WALLPAPER_FILE = "sdmc:/config/ultragb/ovl_wallpaper.rgba";
 
-static constexpr size_t PATH_BUFFER_SIZE = 128;
+static constexpr size_t PATH_BUFFER_SIZE = 256;
 static char g_rom_dir[PATH_BUFFER_SIZE]             = "sdmc:/roms/gb/";
 static char g_save_dir[PATH_BUFFER_SIZE]            = "sdmc:/config/ultragb/saves/internal/";
 static char g_last_rom_path[PATH_BUFFER_SIZE]       = {};   // basename of last-played ROM, persisted to config.ini
