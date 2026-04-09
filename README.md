@@ -184,7 +184,7 @@ Press **Y** on any ROM in the selector to open its config screen.
 
 | Item | Description |
 |---|---|
-| Scale | Cycle 1× → 2× → … → max; capped by available heap and ROM size (see Requirements) |
+| Scale | Cycle 1x → 2x → … → max; capped by available heap and ROM size (see Requirements) |
 | Docked Resolution | 720p (default, 1.5× VI layer) or 1080p (pixel-perfect, 1:1 VI layer); takes effect on next windowed launch |
 
 ### Quick Combo / Quick Launch
@@ -198,10 +198,10 @@ The Switch overlay heap is capped per system configuration. UltraGB adapts autom
 
 | Heap | Windowed max scale | In-game wallpaper | LCD Ghosting |
 |---|---|---|---|
-| 4 MB | 3× | — | — |
-| 6 MB | 4× | — | ROMs < 2 MB only |
-| 8 MB | 5× (6× when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only |
-| 10 MB+ | 5× (6× when docked + 1080p) | ✓ | All ROMs |
+| 4 MB | 3x | — | — |
+| 6 MB | 4x | — | ROMs < 2 MB only |
+| 8 MB | 5x (6x when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only |
+| 10 MB+ | 5x (6x when docked + 1080p) | ✓ | All ROMs |
 
 ROMs that exceed the current tier's playable size are shown in the selector with a warning colour and cannot be launched.
 
