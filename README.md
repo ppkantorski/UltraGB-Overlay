@@ -9,7 +9,7 @@
 
 A Game Boy / Game Boy Color emulator overlay for the Nintendo Switch, built on [libultrahand](https://github.com/ppkantorski/libultrahand).
 
-[![screenshot](.pics/screenshot.png)](https://github.com/ppkantorski/UltraGB-Overlay)
+[![screenshot](.pics/screenshot.png)](https://gbatemp.net/threads/ultragb-overlay-the-game-boy-gbc-emulation-overlay.680989/)
 
 Play GB and GBC games on top of any running application.
 
