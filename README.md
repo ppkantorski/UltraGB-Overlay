@@ -61,7 +61,7 @@ D-pad, A, B, Start, and Select are drawn below the game screen and mapped to tou
 - **Audio Balance** — per-game GB audio trim (−150% … 0% … +150%) stored in the per-game config. Applied as a power-of-2 gain multiplier on top of the master volume so individual games can be normalised without affecting global volume.
 
 ### Themes and Wallpapers
-The overlay UI chrome (background, button colours, border) is fully themeable via `.ini` files placed in `sdmc:/config/ultragb/ovl_themes/`. A wallpaper (`.rgba` format) can be selected from `sdmc:/config/ultragb/ovl_wallpapers/` and is displayed behind the game screen when expanded memory permits.
+The overlay UI chrome (background, button colours, border) is fully themeable via `.ini` files placed in `sdmc:/config/ultragb/ovl_themes/`. A wallpaper (448×720 `.rgba` format) can be selected from `sdmc:/config/ultragb/ovl_wallpapers/` and is displayed behind the game screen when expanded memory permits.
 
 ---
 
