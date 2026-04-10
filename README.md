@@ -137,7 +137,7 @@ Press **Y** on any ROM in the selector to open its config screen.
 | Save States | 10 named slots: save, load, or delete any slot |
 | Save Data | 10 SRAM backup slots: manual snapshots of battery save data |
 | Reset | Cold boot the game (deletes the quick-resume state) |
-| Palette Mode | Cycle GBC → SGB → DMG → Native; applied live without restarting |
+| Palette Mode | Cycle GBC → DMG → Native; applied live without restarting |
 | No Sprite Limit | Lift the 10-sprites-per-scanline hardware cap; on by default |
 | LCD Ghosting | Enable 50/50 frame blending for accurate flicker reproduction (memory-gated: see below) |
 | Audio Balance | Per-game GB volume trim from −150% to +150%; press Y while focused to reset to 0% |
