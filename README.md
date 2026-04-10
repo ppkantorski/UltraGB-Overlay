@@ -46,7 +46,6 @@ Cycled per game from the per-game config screen. All modes work for both DMG and
 | Mode | Behaviour |
 |---|---|
 | `GBC` (default) | CGB games use hardware colour. DMG games receive the real GBC boot ROM title-based colorisation (per-game lookup from hardware-verified palette database); unrecognised or unlicensed games fall back to greyscale. |
-| `SGB` | Same title lookup as GBC, applied to all games regardless of licensee (bypasses the Nintendo licensee gate). A warm amber palette is used as the fallback for unrecognised titles. |
 | `DMG` | Classic four-shade green Game Boy LCD tint. |
 | `Native` | True greyscale: raw luminance values, no tint. |
 
