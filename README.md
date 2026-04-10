@@ -41,7 +41,7 @@ Play GB and GBC games on top of any running application.
 - Position and scale saved to `config.ini`
 
 ### Palette Modes
-Cycled per game from the per-game config screen. All modes work for both DMG and CGB games.
+Cycled per game from the per-game settings screen. All modes work for both DMG and CGB games.
 
 | Mode | Behaviour |
 |---|---|
@@ -112,8 +112,8 @@ The overlay UI chrome (background, button colours, border) is fully themeable vi
 | Input | Action |
 |---|---|
 | A | Launch ROM |
-| Y | Open per-game config |
-| Right / Settings footer | Go to Settings page |
+| Y | Open per-game settings |
+| Right / Configure footer | Go to Configure page |
 | Left / Games footer | Return to ROM list (from Settings) |
 | B | Close overlay |
 
@@ -128,9 +128,9 @@ The overlay UI chrome (background, button colours, border) is fully themeable vi
 
 ---
 
-## Per-Game Configuration
+## Per-Game Settings
 
-Press **Y** on any ROM in the selector to open its config screen.
+Press **Y** on any ROM in the selector to open its settings screen.
 
 | Item | Description |
 |---|---|
