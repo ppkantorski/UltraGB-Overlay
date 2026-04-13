@@ -27,7 +27,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 APP_TITLE   := UltraGB
 APP_AUTHOR  := ppkantorski
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 TARGET      := ultragb
 BUILD       := build
 SOURCES     := source
