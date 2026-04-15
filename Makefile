@@ -46,7 +46,7 @@ WALNUT_DEFINES := -DENABLE_LCD=1 \
 #---------------------------------------------------------------------------------
 ARCH := -march=armv8-a+simd+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS := -Wall -Os \
+CFLAGS := -g -Wall -Os \
           -ffunction-sections -fdata-sections -flto=6 \
           -fuse-linker-plugin -fomit-frame-pointer \
           -fno-strict-aliasing -frename-registers \
@@ -77,6 +77,15 @@ CFLAGS += -DULTRA_TARGETED_SIZE
 
 # FPS Indicator (for debugging)
 #CFLAGS += -DGB_FPS
+
+# Exception wrap utilization (for smaller compilation size)
+CFLAGS += -DUSE_EXCEPTION_WRAP=1
+
+# Requires USE_EXCEPTION_WRAP and inclusion of exception_wrap.hpp in main
+LDFLAGS += -Wl,-wrap,__cxa_throw \
+           -Wl,-wrap,_Unwind_Resume \
+           -Wl,-wrap,__gxx_personality_v0
+
 
 CXXFLAGS := $(CFLAGS) -std=c++26 \
             -Wno-dangling-else \

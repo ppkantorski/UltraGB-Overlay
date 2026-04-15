@@ -1438,7 +1438,7 @@ static void draw_wallpaper_direct(tsl::gfx::Renderer* renderer,
                                    u32 fb_height      = kWP_H,
                                    u32 fb_y_start     = 0u) {
     // ── Same entry guards as Renderer::drawWallpaper() ──────────────────────
-    if (!ult::expandedMemory || ult::refreshWallpaper.load(std::memory_order_acquire)) return;
+    if (ult::limitedMemory || ult::refreshWallpaper.load(std::memory_order_acquire)) return;
 
     ult::inPlot.store(true, std::memory_order_release);
 

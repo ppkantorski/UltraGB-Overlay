@@ -34,12 +34,12 @@
 // =============================================================================
 // Paths / config
 // =============================================================================
-static constexpr const char* CONFIG_DIR        = "sdmc:/config/ultragb/";
-static constexpr const char* CONFIG_FILE       = "sdmc:/config/ultragb/config.ini";
-static constexpr const char* SAVE_BASE_DIR     = "sdmc:/config/ultragb/saves/";
-static constexpr const char* STATE_BASE_DIR    = "sdmc:/config/ultragb/states/";
-static constexpr const char* STATE_DIR         = "sdmc:/config/ultragb/states/internal/";
-static constexpr const char* SETTINGS_DIR     = "sdmc:/config/ultragb/settings/";
+static constexpr const char* CONFIG_DIR         = "sdmc:/config/ultragb/";
+static constexpr const char* CONFIG_FILE        = "sdmc:/config/ultragb/config.ini";
+static constexpr const char* SAVE_BASE_DIR      = "sdmc:/config/ultragb/saves/";
+static constexpr const char* STATE_BASE_DIR     = "sdmc:/config/ultragb/states/";
+static constexpr const char* STATE_DIR          = "sdmc:/config/ultragb/states/internal/";
+static constexpr const char* SETTINGS_DIR       = "sdmc:/config/ultragb/settings/";
 static constexpr const char* OVL_THEMES_DIR     = "sdmc:/config/ultragb/ovl_themes/";
 static constexpr const char* OVL_THEME_FILE     = "sdmc:/config/ultragb/ovl_theme.ini";
 static constexpr const char* OVL_WALLPAPERS_DIR = "sdmc:/config/ultragb/ovl_wallpapers/";
@@ -71,8 +71,8 @@ static bool g_waitForInputRelease = false;
 // 31 chars, above the ARM64 SSO threshold of 15; all ult:: INI helpers take
 // const std::string&).
 // =============================================================================
-static const std::string kConfigFile   {CONFIG_FILE};
-static const std::string kConfigSection{"config"};
+static const std::string kConfigFile       {CONFIG_FILE};
+static const std::string kConfigSection    {"config"};
 static const std::string kKeyRomDir        {"rom_dir"};
 static const std::string kKeySaveDir       {"save_dir"};
 static const std::string kKeyLastRom       {"last_rom"};
@@ -85,19 +85,19 @@ static const std::string kKeyWindowed      {"windowed"};
 static const std::string kKeyButtonHaptics    {"button_haptics"};
 static const std::string kKeyTouchHaptics     {"touch_haptics"};
 static const std::string kKeyOvlWallpaperName {"ovl_wallpaper"};
-static const std::string kKeyWinPosX       {"win_pos_x"};
-static const std::string kKeyWinPosY       {"win_pos_y"};
-static const std::string kKeyWinScale      {"win_scale"};
-static const std::string kKeyWinOutput     {"win_output"};   // "720" or "1080"
-static const std::string kKeyWindowedRom   {"windowed_rom"};
-static const std::string kKeyWinQuickExit  {"win_quick_exit"};
-static const std::string kKeySettingsScroll{"settings_scroll"};
-static const std::string kKeyPlayerRom     {"overlay_rom"};  // ROM path for -overlay relaunch
-static const std::string kKeyOvlTheme     {"ovl_theme"};     // selected overlay theme filename stem
-static const std::string kKeyOvlFreeMode  {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
-static const std::string kKeyOvlFreePosX  {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
-static const std::string kKeyOvlFreePosY  {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
-static const std::string kKeyOvlOpaque    {"ovl_opaque"};       // 0=theme alpha (default), 1=force all alpha to 15
+static const std::string kKeyWinPosX        {"win_pos_x"};
+static const std::string kKeyWinPosY        {"win_pos_y"};
+static const std::string kKeyWinScale       {"win_scale"};
+static const std::string kKeyWinOutput      {"win_output"};   // "720" or "1080"
+static const std::string kKeyWindowedRom    {"windowed_rom"};
+static const std::string kKeyWinQuickExit   {"win_quick_exit"};
+static const std::string kKeySettingsScroll {"settings_scroll"};
+static const std::string kKeyPlayerRom      {"overlay_rom"};  // ROM path for -overlay relaunch
+static const std::string kKeyOvlTheme       {"ovl_theme"};     // selected overlay theme filename stem
+static const std::string kKeyOvlFreeMode    {"ovl_free_mode"};   // 0=fixed 1=free floating overlay
+static const std::string kKeyOvlFreePosX    {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
+static const std::string kKeyOvlFreePosY    {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
+static const std::string kKeyOvlOpaque      {"ovl_opaque"};       // 0=theme alpha (default), 1=force all alpha to 15
 
 // =============================================================================
 // ROM size thresholds
@@ -218,10 +218,10 @@ static int g_win_pos_y = (1080 - 216) / 2;   // 432  (1× default centre)
 static int  g_win_scale        = 1;
 static bool g_win_scale_locked = false;
 
-// True when running on a 4 MB heap at scale 3 in windowed mode.
-// In this mode the framebuffer is exactly game-sized (no anchor padding),
-// the layer is positioned directly at g_win_pos_y, and screenshots are
-// disabled.  Set once in main() before setup_windowed_framebuffer().
+// True when using the simplified game-sized framebuffer in windowed mode.
+// Previously set for 4 MB heap at scale 3; now always false — the anchor-based
+// half-screen FB is safe at all supported scales and memory tiers, and it
+// enables screenshots and the smooth top/bottom anchor positioning logic.
 static bool g_win_limited_fb = false;
 
 // Windowed output resolution mode.

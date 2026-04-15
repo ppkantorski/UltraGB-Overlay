@@ -1028,14 +1028,8 @@ public:
         g_emu_active     = !m_load_failed;
         m_waitForRelease = !m_load_failed;
 
-        // In limited-memory mode (4 MB heap) the FB is exactly game-sized and the
-        // anchor-padding trick that makes screenshots work is not used.  The
-        // screenshot layer would display garbage, so remove it entirely.
-        if (g_win_limited_fb) {
-            screenshotsAreDisabled.store(true, std::memory_order_release);
-            screenshotsAreForceDisabled.store(true, std::memory_order_release);
-            tsl::gfx::Renderer::get().removeScreenshotStacks();
-        }
+        // The anchor-based FB is used at all scales and tiers (g_win_limited_fb is
+        // always false), so screenshots are always enabled in windowed mode.
 
         // Suppress Tesla's footer touch handling entirely.
         ult::noClickableItems.store(true,  std::memory_order_release);
@@ -1096,8 +1090,9 @@ public:
             if (g_win_quick_exit)
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
             launchComboHasTriggered.store(true, std::memory_order_release);
-            if (g_self_path[0])
-                tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+            if (g_self_path[0]) {
+                tsl::setNextOverlay(std::string(g_self_path), g_directMode ? "-windowed --direct" : "-windowed");
+            }
             tsl::Overlay::get()->close();
         }
         run_once_setup(runOnce, m_restoreHapticState);
@@ -1153,23 +1148,21 @@ public:
 
             launchComboHasTriggered.store(true, std::memory_order_release);
 
-            // Reset the settings scroll only for genuine exits — quick-exit mode
-            // (g_win_quick_exit, triggered by the Quick Combo fast path) and
-            // direct mode — where pressing the combo means "leave entirely".
-            //
-            // In normal windowed mode (g_win_quick_exit=false, g_directMode=false)
-            // this combo returns to the ROM selector via -returning, exactly as
-            // X/back does in overlay mode.  The scroll position must survive so
-            // SettingsGui lands at the right item on the next RIGHT-press.
-            // exitServices() will write the intact g_settings_scroll to INI, and
-            // the -returning process's initServices() will restore it.
-            if (g_win_quick_exit || g_directMode) {
+            // Clear settings scroll on genuine exits: quick launch (g_comboReturn=true,
+            // just closes) and direct mode (where "leave entirely" is the intent).
+            // Normal windowed (g_comboReturn=false, g_directMode=false) returns to the
+            // ROM selector via -returning so the scroll position survives.
+            if (g_comboReturn || (g_directMode && !g_quick_launch)) {
                 g_settings_scroll[0] = '\0';
                 ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
             }
 
-            if (!g_win_quick_exit && g_self_path[0]) {
-                const std::string returnArg = g_directMode ? "-returning --direct" : "-returning";
+            if (!g_comboReturn && g_self_path[0] && !g_quick_launch) {
+                // g_comboReturn=true (quick launch): no setNextOverlay — just close.
+                // g_comboReturn=false: return to ROM selector.
+                //   Direct mode  → "--direct"   (ROM selector reopens in direct mode)
+                //   Normal       → "-returning" (scroll position is restored)
+                const std::string returnArg = g_directMode ? "--direct" : "-returning";
                 tsl::setNextOverlay(std::string(g_self_path), returnArg);
             }
 
@@ -1197,7 +1190,7 @@ public:
             if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
-                triggerRumbleClick.store(true, std::memory_order_release);
+                triggerRumbleClickFeedback();
         }
 
         // ── ZL double-click-hold: toggle background pass-through ──────────────
@@ -1232,9 +1225,11 @@ public:
         // ── Right/Left stick click: resize window ────────────────────────────
         // Right stick click steps up one scale; left stick click steps down.
         // Cycles 1× → 2× → 3× → 4× → 5× → (6×) capped by heap tier and mode.
-        //   4 MB heap  : max 3×
-        //   6 MB heap  : max 4×
-        //   8 MB+ heap : max 5×  (or 6× when expandedMemory + docked + 1080p)
+        //   4 MB heap               : max 3×
+        //   6 MB heap               : max 5×
+        //   8 MB heap, ROM <  4 MB  : max 5×  (or 6× when docked + 1080p pixel-perfect)
+        //   8 MB heap, ROM >= 4 MB  : max 5×  (6× blocked — insufficient headroom)
+        //   10 MB+ heap             : max 5×  (or 6× when docked + 1080p pixel-perfect)
         //
         // Both are disabled while pass-through is active so the background
         // app receives the stick click undisturbed.
@@ -1254,14 +1249,15 @@ public:
                 const bool earlyExpanded        = ult::expandedMemory && !ult::furtherExpandedMemory;
                 const bool earlyFurtherExpanded = ult::furtherExpandedMemory;
 
-                // 6× is only available when expandedMemory + docked + 1080p pixel-perfect.
-                // On plain 8 MB heap (not furtherExpandedMemory), also requires ROM < 4 MB.
+                // 6× requires docked + 1080p pixel-perfect on any heap that supports it.
+                // On plain 8 MB heap (not furtherExpandedMemory), also requires ROM < 4 MB
+                // (large ROMs lack headroom for the 6× framebuffer overhead, cap stays 5×).
                 const bool romSmall = earlyExpanded
                     ? (get_rom_size(g_gb.romPath) < kROM_4MB)
                     : true;  // furtherExpandedMemory or smaller tiers — no extra ROM-size gate
                 const int max_scale = earlyLimited              ? 3
-                                    : earlyRegularMemory        ? 4
-                                    : (earlyExpanded && !romSmall) ? 4  // 8 MB + 4 MB+ ROM — not enough heap for scale 5
+                                    : earlyRegularMemory        ? 5
+                                    : (earlyExpanded && !romSmall) ? 5  // 8 MB + 4 MB+ ROM: max 5×; 6× blocked (insufficient headroom)
                                     : ((earlyFurtherExpanded || (earlyExpanded && romSmall)) && poll_console_docked() && ult::windowedLayerPixelPerfect) ? 6
                                     :                              5;
                 const int new_scale = rstick
@@ -1290,7 +1286,7 @@ public:
                     // triggerNavigationFeedback (navigation sound + rumble) feels
                     // exit-like right before the overlay closes; a bare click is
                     // unambiguous and consistent with other button confirmations.
-                    triggerRumbleClick.store(true, std::memory_order_release);
+                    triggerRumbleClickFeedback();
                     // Suppress Tesla's directMode close-time double-click rumble.
                     // tesla.hpp fires rumbleDoubleClickStandalone() at process exit
                     // when directMode=true and launchComboHasTriggered=false.
@@ -1299,8 +1295,9 @@ public:
                     // sessions have directMode=false so they're unaffected.  Setting
                     // this flag here suppresses that extra rumble in all sessions.
                     launchComboHasTriggered.store(true, std::memory_order_release);
-                    if (g_self_path[0])
-                        tsl::setNextOverlay(std::string(g_self_path), "-windowed");
+                    if (g_self_path[0]) {
+                        tsl::setNextOverlay(std::string(g_self_path), g_directMode ? "-windowed --direct" : "-windowed");
+                    }
                     tsl::Overlay::get()->close();
                     return true;
                 }

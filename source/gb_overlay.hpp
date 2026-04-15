@@ -97,7 +97,7 @@ public:
         //                   ORDERING: fb16[0] is read as pre_wp_bg AFTER fillScreen
         //                   writes to the buffer — the pointer itself is stable.
         const bool     free_mode    = g_overlay_free_mode;
-        const bool     has_wallpaper = ult::expandedMemory && g_overlay_wallpaper;
+        const bool     has_wallpaper = !ult::limitedMemory && g_overlay_wallpaper;
         uint16_t* const fb16        = static_cast<uint16_t*>(renderer->getCurrentFramebuffer());
 
         // Compute content bounds once — reused for transparent-row clearing,
@@ -802,21 +802,50 @@ public:
         }
 
         // ── Overlay close combo ───────────────────────────────────────────────
-        if (g_quick_launch || g_directMode || g_overlay_mode) {
-            if ((keysDown & tsl::cfg::launchCombo) && (((keysDown | keysHeld) & tsl::cfg::launchCombo) == tsl::cfg::launchCombo)) {
-                g_touch_keys = 0;
-                ult::noClickableItems.store(false, std::memory_order_release);
-                gb_audio_pause();
-                launchComboHasTriggered.store(true, std::memory_order_release);
-                if (g_quick_launch || g_directMode) {
-                    g_settings_scroll[0] = '\0';
-                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
-                }
-                if (!g_directMode && g_self_path[0])
-                    tsl::setNextOverlay(std::string(g_self_path), "-returning");
-                tsl::Overlay::get()->close();
-                return true;
+        // ── Launch combo: exit windowed mode, return to normal UltraGB ────────
+        if (combo_pressed(keysDown, keysHeld)) {
+            restore_haptic_if_needed(m_restoreHapticState);
+
+            // Quick-exit mode (triggered via Quick Combo): close the overlay
+            // entirely without relaunching the normal UltraGB UI.
+            // Normal mode: return to UltraGB via setNextOverlay so it can
+            // restore the Settings scroll position.
+            // Use the synchronous standalone call — triggerExitFeedback() sets
+            // an atomic for the background feedback thread, but close() stops
+            // that thread before it gets a chance to process it, so the rumble
+            // would never fire.  rumbleDoubleClickStandalone() fires immediately,
+            // matching exactly what Tesla does at its own directMode exit path.
+
+            // Suppress Tesla's own directMode close-time double-click
+            // (tesla.hpp fires rumbleDoubleClickStandalone() on close when
+            // directMode=true and launchComboHasTriggered=false — session 1
+            // gets directMode from Ultrahand's --direct flag).  We fire our
+            // own exit feedback above, so we don't want a second one.
+            gb_audio_pause();
+
+            launchComboHasTriggered.store(true, std::memory_order_release);
+
+            // Clear settings scroll on genuine exits: quick launch (g_comboReturn=true,
+            // just closes) and direct mode (where "leave entirely" is the intent).
+            // Normal windowed (g_comboReturn=false, g_directMode=false) returns to the
+            // ROM selector via -returning so the scroll position survives.
+            if (g_comboReturn || (g_directMode && !g_quick_launch)) {
+                g_settings_scroll[0] = '\0';
+                ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll, "", "");
             }
+
+            if (!g_comboReturn && g_self_path[0] && !g_quick_launch) {
+                // g_comboReturn=true (quick launch): no setNextOverlay — just close.
+                // g_comboReturn=false: return to ROM selector.
+                //   Direct mode  → "--direct"   (ROM selector reopens in direct mode)
+                //   Normal       → "-returning" (scroll position is restored)
+                const std::string returnArg = g_directMode ? "--direct" : "-returning";
+                tsl::setNextOverlay(std::string(g_self_path), returnArg);
+            }
+
+            tsl::Overlay::get()->close();
+            
+            return true;
         }
 
         // ── Touch state — layer-relative coordinates ──────────────────────────
@@ -896,7 +925,7 @@ public:
 
         u64 newTouchPresses = g_touch_keys & ~m_prevTouchKeys;
         if (newTouchPresses && g_touch_haptics && !m_zl_state.pass_through)
-            triggerRumbleClick.store(true, std::memory_order_release);
+            triggerRumbleClickFeedback();
         m_prevTouchKeys = g_touch_keys;
 
         // Physical buttons → GB joypad.  Suppressed during drag and pass-through.
@@ -905,7 +934,7 @@ public:
             if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
-                triggerRumbleClick.store(true, std::memory_order_release);
+                triggerRumbleClickFeedback();
         }
 
         // ── Free overlay reposition (touch + joystick) ────────────────────────
@@ -1119,7 +1148,7 @@ public:
                 const bool wantFree = rstick;   // lstick → fixed (false), rstick → free (true)
                 g_overlay_free_mode = wantFree;
                 save_ovl_free_mode();
-                triggerRumbleClick.store(true, std::memory_order_release);
+                triggerRumbleClickFeedback();
                 // Suppress directMode exit double-click, matching windowed resize behaviour.
                 launchComboHasTriggered.store(true, std::memory_order_release);
                 if (g_gb.romPath[0]) {

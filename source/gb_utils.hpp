@@ -95,7 +95,7 @@ static void show_notify(const char* msg) {
 // plus the createUI() of both GBOverlayGui and GBWindowedGui).
 // =============================================================================
 static inline void audio_exit_if_enabled() {
-    if (ult::useSoundEffects && !ult::limitedMemory) ult::Audio::exit();
+    if (ult::useSoundEffects) ult::Audio::exit();
 }
 
 // =============================================================================
@@ -512,8 +512,8 @@ static bool rom_is_playable(const char* path) {
     const size_t sz = get_rom_size(path);
     if (!sz) return false;
     if (ult::limitedMemory          && sz >= kROM_2MB) return false;
-    //if (!ult::expandedMemory        && sz >= kROM_4MB) return false;
-    //if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return false;
+    if (!ult::expandedMemory        && sz >= kROM_4MB) return false;
+    if (!ult::furtherExpandedMemory && sz >= kROM_6MB) return false;
     return true;
 }
 
@@ -526,8 +526,8 @@ static const char* rom_playability_message(const char* path) {
     const size_t sz = get_rom_size(path);
     if (!sz) return nullptr;
     if ( ult::limitedMemory          && sz >= kROM_2MB && sz < kROM_4MB) return REQUIRES_AT_LEAST_6MB;
-    //if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
-    //if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
+    if (!ult::expandedMemory         && sz >= kROM_4MB && sz < kROM_6MB) return REQUIRES_AT_LEAST_8MB;
+    if (!ult::furtherExpandedMemory  && sz >= kROM_6MB)                  return REQUIRES_AT_LEAST_10MB;
     return nullptr;
 }
 
@@ -1145,16 +1145,23 @@ static bool load_user_slot(const char* romPath, int slot) {
 static bool launch_windowed_mode(const char* romPath) {
     if (!g_windowed_mode || !g_self_path[0]) return false;
 
-    skipRumbleDoubleClick = true;
+    skipClosingExitFeedback = true;
 
     ult::launchingOverlay.store(true, std::memory_order_release);
     ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWindowedRom, romPath, "");
     if (g_settings_scroll[0])
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
                              g_settings_scroll, "");
-    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch" : "-windowed");
-    if (g_directMode)
-        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+    if (g_directMode && g_comboReturn) {
+        // Quick combo: windowed should exit entirely on close.
+        tsl::setNextOverlay(g_self_path, "-quicklaunch --direct --comboReturn");
+    } else {
+        // Normal or ROM-selector direct: windowed returns to menu / ROM selector.
+        // Passing --direct keeps g_directMode=true in the windowed session so its
+        // existing exit path fires setNextOverlay("-returning --direct"), which
+        // routes back to the ROM selector.
+        tsl::setNextOverlay(g_self_path, g_directMode ? "-windowed --direct" : "-windowed");
+    }
     tsl::Overlay::get()->close();
     return true;
 }
@@ -1168,11 +1175,15 @@ static void launch_overlay_mode(const char* romPath) {
     if (g_settings_scroll[0])
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
                              g_settings_scroll, "");
-    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-overlay");
-    if (g_directMode)
-        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+    if (g_directMode && g_comboReturn)
+        // Quick combo: pass --comboReturn through so the player knows to exit entirely.
+        tsl::setNextOverlay(g_self_path, "-quicklaunch --direct --comboReturn");
+    else
+        // Normal or ROM-selector direct: player will use g_comboReturn=false to
+        // redirect back to the ROM selector via --direct on close.
+        tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-overlay");
 
-    skipRumbleDoubleClick = true;
+    skipClosingExitFeedback = true;
     tsl::Overlay::get()->close();
 }
 
@@ -1187,11 +1198,12 @@ static void launch_free_overlay_mode(const char* romPath) {
     if (g_settings_scroll[0])
         ult::setIniFileValue(kConfigFile, kConfigSection, kKeySettingsScroll,
                              g_settings_scroll, "");
-    tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-freeoverlay");
-    if (g_directMode)
-        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+    if (g_directMode && g_comboReturn)
+        tsl::setNextOverlay(g_self_path, "-quicklaunch --direct --comboReturn");
+    else
+        tsl::setNextOverlay(g_self_path, g_directMode ? "-quicklaunch --direct" : "-freeoverlay");
 
-    skipRumbleDoubleClick = true;
+    skipClosingExitFeedback = true;
     tsl::Overlay::get()->close();
 }
 
@@ -1244,7 +1256,7 @@ static bool launch_game(const char* romPath) {
 // =============================================================================
 [[gnu::noinline]]
 static void fill_vp_corners_448(uint16_t* const fb16, const uint16_t bg_packed) {
-    const bool has_wp = ult::expandedMemory && g_overlay_wallpaper
+    const bool has_wp = !ult::limitedMemory && g_overlay_wallpaper
                         && !ult::wallpaperData.empty()
                         && !ult::refreshWallpaper.load(std::memory_order_acquire);
 
@@ -1517,7 +1529,7 @@ static void close_overlay_direct_mode() {
             ult::TRUE_STR
         );
         disableSound.store(true, std::memory_order_release);
-        skipRumbleDoubleClick = true;
+        skipClosingExitFeedback = true;
 
         const std::string selfFilename = ult::getNameFromPath(std::string(g_self_path));
         const bool needsFgFix = ult::resetForegroundCheck.load(std::memory_order_acquire) ||

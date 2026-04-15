@@ -23,6 +23,7 @@
 #define STBTT_STATIC
 #define TESLA_INIT_IMPL
 
+#include <exception_wrap.hpp>
 #include <ultra.hpp>
 #include <tesla.hpp>
 
@@ -31,12 +32,12 @@
 #include "gb_utils.hpp"      // ← globals + all shared helpers
                              //   (pulls in gb_globals.hpp → gb_audio.h, gb_core.h, gb_renderer.h)
 
-
 #include <dirent.h>
 #include <ctime>
 #include <vector>
 #include <string>
 #include <algorithm>
+
 
 using namespace ult;
 
@@ -319,22 +320,25 @@ bool gb_load_rom(const char* path) {
     // ── Heap-tier capability check ────────────────────────────────────────────
     // Memory tiers (set by tesla.hpp at startup):
     //   limitedMemory        = 4 MB heap  → max ROM 1 MB
-    //   (neither)            = 6 MB heap  → max ROM 2 MB (can't fit 4 MB ROMs)
+    //   (neither)            = 6 MB heap  → max ROM 2 MB; wallpaper supported
     //   expandedMemory       = 8 MB heap  → max ROM 4 MB (wallpaper evicted below)
     //   furtherExpandedMemory= >8 MB heap → max ROM 6 MB
     //
     // Notify the user with an actionable message before touching any state.
     if (ult::limitedMemory && sz >= kROM_2MB && sz < kROM_4MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_6MB);
+        triggerWallFeedback();
         fclose(f); return false;
     }
     // Default (6 MB heap): reject ROMs > 2 MB.
     if (!ult::expandedMemory && sz >= kROM_4MB && sz < kROM_6MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_8MB);
+        triggerWallFeedback();
         fclose(f); return false;
     }
     if (!ult::furtherExpandedMemory && sz >= kROM_6MB) [[unlikely]] {
         show_notify(REQUIRES_AT_LEAST_10MB);
+        triggerWallFeedback();
         fclose(f); return false;
     }
 
@@ -348,8 +352,8 @@ bool gb_load_rom(const char* path) {
     // malloc(4 MB) even with enough total free bytes.
     //
     // Memory tiers and wallpaper eviction:
-    //   4 MB heap  (limitedMemory)         — max 2 MB ROM, no wallpaper anyway
-    //   6 MB heap  (neither flag)          — max 2 MB ROM, wallpaper safe with 2 MB ROM
+    //   4 MB heap  (limitedMemory)         — max 2 MB ROM, no wallpaper
+    //   6 MB heap  (neither flag)          — max 2 MB ROM, wallpaper always safe
     //   8 MB heap  (expandedMemory)        — max 4 MB ROM, wallpaper evicted for large ROMs; ghosting disabled for 4 MB+ ROMs
     //   10 MB+ heap (furtherExpandedMemory)— max 6 MB ROM, wallpaper safe at all sizes
 
@@ -529,7 +533,8 @@ bool gb_load_rom(const char* path) {
     //   • expandedMemory only (8 MB heap) with a ROM < 4 MB.
     // Every other tier — limitedMemory (4 MB), base 6 MB heap, or 8 MB with a
     // 4 MB+ ROM — forces ghosting off regardless of the per-game config.
-    // Ghosting requires enough heap headroom for the extra frame buffer.
+    // (Note: windowed 5× is supported for 4 MB+ ROMs on 8 MB heap, but ghosting
+    // still requires the extra frame buffer which exceeds the available headroom.)
     // The minimum tier depends on ROM size:
     //   ROM < 2 MB  → needs 6 MB heap (locked only on 4 MB)
     //   ROM 2–4 MB  → needs 8 MB heap (locked on 4 MB and 6 MB)
@@ -840,7 +845,7 @@ class SlotActionGui : public tsl::Gui {
         buildTs(m_rom_path.c_str(), m_slot, tsPath, sizeof(tsPath));
         delete_file(tsPath);
         swap_to_slots(isData);
-        triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+        triggerMoveFeedback();
         show_notify("Slot deleted.");
     }
 
@@ -1142,7 +1147,7 @@ public:
         statesItem->setValue(ult::DROPDOWN_SYMBOL);
         statesItem->setClickListener([romPath, displayName](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
-            triggerEnterFeedback();
+            //triggerEnterFeedback();
             tsl::swapTo<SaveSlotsGui>(romPath, displayName, "", false);
             return true;
         });
@@ -1153,7 +1158,7 @@ public:
         saveDataItem->setValue(ult::DROPDOWN_SYMBOL);
         saveDataItem->setClickListener([romPath, displayName](u64 keys) -> bool {
             if (!(keys & KEY_A)) return false;
-            triggerEnterFeedback();
+            //triggerEnterFeedback();
             tsl::swapTo<SaveSlotsGui>(romPath, displayName, "", true);
             return true;
         });
@@ -1247,8 +1252,9 @@ public:
         // Available only on furtherExpandedMemory (10 MB+ heap, any ROM), or on
         // expandedMemory (8 MB heap) with a ROM < 4 MB.  All other tiers —
         // limitedMemory (4 MB), base 6 MB heap, or 8 MB with a 4 MB+ ROM —
-        // show a locked warning item pointing the user toward 10 MB+.
-        // Ghosting lock and message — both derived from ROM size and current heap tier.
+        // show a locked warning item pointing the user toward the required tier.
+        // (Windowed 5× works for 4 MB+ ROMs on 8 MB, but ghosting needs a full
+        // extra frame buffer which exceeds the available headroom at that size.)
         // The message always names the MINIMUM tier that would allow ghosting for
         // this specific ROM:
         //   ROM < 2 MB  → needs 6 MB heap  (locked only on 4 MB)
@@ -1476,8 +1482,8 @@ class DropdownSelectorGui : public tsl::Gui {
             g_overlay_wallpaper = ult::isFile(OVL_WALLPAPER_FILE);
         }
 
-        // Reload wallpaper into the renderer if expanded memory allows it.
-        if (ult::expandedMemory) {
+        // Reload wallpaper into the renderer if memory allows it (6 MB+ heap).
+        if (!ult::limitedMemory) {
             if (g_overlay_wallpaper)
                 ult::reloadWallpaper();
             else
@@ -1600,7 +1606,7 @@ public:
                 list->addItem(th_item);
             }
 
-            if (ult::expandedMemory) {
+            if (!ult::limitedMemory) {
                 // Current wallpaper name: OPTION_SYMBOL when none is selected.
                 const std::string wpDisplay = g_ovl_wallpaper_name[0]
                     ? std::string(g_ovl_wallpaper_name)
@@ -1608,7 +1614,7 @@ public:
                 auto* wallpaper_item = new tsl::elm::ListItem("Wallpaper", wpDisplay);
                 wallpaper_item->setClickListener([this](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
-                    triggerEnterFeedback();
+                    //triggerEnterFeedback();
                     tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, "Wallpaper",
                                                       SelectorMode::OvlWallpaper, true);
                     return true;
@@ -1649,7 +1655,7 @@ public:
                 }();
                 auto make_label = [romSmall]() -> std::string {
                     const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
-                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 5 : (c6_ ? 6 : 5));
                     static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
                     return lbs[std::min(g_win_scale, ms_) - 1];
                 };
@@ -1657,7 +1663,7 @@ public:
                 scale_item->setClickListener([scale_item, romSmall, make_label](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
                     const bool c6_ = ult::expandedMemory && poll_console_docked() && g_win_1080 && romSmall;
-                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6_ ? 6 : 5));
+                    const int  ms_ = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 5 : (c6_ ? 6 : 5));
                     g_win_scale    = (std::min(g_win_scale, ms_) % ms_) + 1;
                     save_win_scale();
                     scale_item->setValue(make_label());
@@ -1681,7 +1687,7 @@ public:
                             : (g_last_rom_path[0] && get_rom_size(
                                    (std::string(g_rom_dir) + g_last_rom_path).c_str()) < kROM_4MB);
                         const bool c6 = ult::expandedMemory && poll_console_docked() && g_win_1080 && rs;
-                        const int  ms = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 4 : (c6 ? 6 : 5));
+                        const int  ms = ult::limitedMemory ? 3 : (!ult::expandedMemory ? 5 : (c6 ? 6 : 5));
                         static const char* lbs[] = { "1x", "2x", "3x", "4x", "5x", "6x" };
                         m_scale_item->setValue(lbs[std::min(g_win_scale, ms) - 1]);
                     }
@@ -2090,7 +2096,7 @@ public:
             auto* ovl_item = new tsl::elm::ListItem("Overlay", ult::DROPDOWN_SYMBOL);
             ovl_item->setClickListener([this](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                triggerEnterFeedback();
+                //triggerEnterFeedback();
                 tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
                                                   SelectorMode::OverlaySub);
                 return true;
@@ -2105,7 +2111,7 @@ public:
             auto* win_item = new tsl::elm::ListItem("Windowed", ult::DROPDOWN_SYMBOL);
             win_item->setClickListener([this](u64 keys) -> bool {
                 if (!(keys & KEY_A)) return false;
-                triggerEnterFeedback();
+                //triggerEnterFeedback();
                 tsl::swapTo<DropdownSelectorGui>(m_rom_scroll, std::string(""),
                                                   SelectorMode::WindowedSub);
                 return true;
@@ -2192,7 +2198,6 @@ public:
         const bool wantLeft = !sliderActive && (simulatedNext || ((keysDown & KEY_LEFT) && !(keysHeld & ~KEY_LEFT & ALL_KEYS_MASK)));
 
         if (wantLeft) {
-            triggerNavigationFeedback();
             // Reset slider lock state so it comes up locked on the next page visit.
             ult::allowSlide.store(false, std::memory_order_release);
             // Capture the focused item's label right now — no per-frame polling needed.
@@ -2202,6 +2207,7 @@ public:
             // ListItem subclass and exposes getText() directly.
             set_settings_scroll(focused_label().c_str());
             tsl::swapTo<RomSelectorGui>(m_rom_scroll);
+            triggerNavigationFeedback();
             return true;
         }
 
@@ -2290,7 +2296,7 @@ public:
     virtual tsl::elm::Element* createUI() override {
         g_emu_active = false;
 
-        //if (ult::useSoundEffects && !ult::limitedMemory)
+        //if (ult::useSoundEffects)
         //    ult::Audio::initialize();
 
         // ── ROM list ─────────────────────────────────────────────────────
@@ -2362,8 +2368,7 @@ public:
                             sizeof(g_rom_selector_scroll) - 1);
                     g_rom_selector_scroll[sizeof(g_rom_selector_scroll) - 1] = '\0';
                     if (keys & KEY_Y) {
-                        triggerRumbleClick.store(true, std::memory_order_release);
-                        triggerSettingsSound.store(true, std::memory_order_release);
+                        triggerSettingsFeedback();
                         tsl::swapTo<GameSettingsGui>(p, displayStr_);
                         return true;
                     }
@@ -2425,10 +2430,10 @@ public:
         const bool wantRight = !sliderActive && (simulatedNext || ((keysDown & KEY_RIGHT) && !(keysHeld & ~KEY_RIGHT & ALL_KEYS_MASK)));
 
         if (wantRight) {
-            triggerNavigationFeedback();
             ult::allowSlide.store(false, std::memory_order_release);
             tsl::swapTo<SettingsGui>(g_rom_selector_scroll,
                                      g_settings_scroll);
+            triggerNavigationFeedback();
             return true;
         }
 
@@ -2542,7 +2547,7 @@ class Overlay : public tsl::Overlay {
     std::unique_ptr<tsl::Gui> launch_overlay_gui(const char* rom_path,
                                                   char*       clear_src = nullptr) {
         load_ovl_theme();
-        if (ult::expandedMemory) {
+        if (!ult::limitedMemory) {
             // Always use the overlay-specific wallpaper slot so the overlay
             // player never picks up a UI wallpaper from a different path.
             ult::WALLPAPER_PATH = OVL_WALLPAPER_FILE;
@@ -2807,35 +2812,40 @@ public:
 
 
 // Clamp g_win_scale to the maximum the current heap tier can support.
-// romPath is used only for the earlyExpanded (8 MB) 6× check; pass nullptr
-// when the ROM path is not yet known (forces 5× on that tier).
+// romPath is used for the earlyExpandedMemory (8 MB) ROM-size checks: both the
+// 5× cap for 4 MB+ ROMs (blocks 6×) and the 6× docked+1080p eligibility check.
+// Pass nullptr when the ROM path is not yet known (rsz treated as 0, allowing 6×).
 // Called from main() before the framebuffer is sized — must run before tsl::loop.
-static void clamp_win_scale(bool earlyLimited, bool earlyRegularMemory,
-                             bool earlyExpanded, const char* romPath) {
-    if (earlyLimited       && g_win_scale >= 4) g_win_scale = 3;
-    if (earlyRegularMemory && g_win_scale >= 5) g_win_scale = 4;
-    // 8 MB heap with a 4 MB+ ROM: the ROM itself consumes most of the heap,
-    // leaving insufficient room for the scale-5 framebuffer (~1.1 MB extra).
-    // Cap at 4× regardless of output mode.  ROM < 4 MB falls through to the
-    // 6× logic below where docked + 1080p is still allowed.
-    if (earlyExpanded && g_win_scale >= 5) {
+static void clamp_win_scale(bool earlyLimitedMemory, bool earlyRegularMemory,
+                             bool earlyExpandedMemory, const char* romPath) {
+    if (earlyLimitedMemory && g_win_scale >= 4) g_win_scale = 3;
+    // 6 MB heap: 5× is now safe; scale 6 falls through to the else branch below
+    // which clamps it to 5.  No explicit cap needed here.
+    // 8 MB heap with a 4 MB+ ROM: cap at 5×.  6× is blocked because the large
+    // ROM leaves insufficient headroom (~1.1 MB short) for the 6× framebuffer
+    // overhead.  ROM < 4 MB falls through to the 6× logic below where
+    // docked + 1080p is still allowed.
+    if (earlyExpandedMemory && g_win_scale >= 5) {
         const size_t rsz = (romPath && romPath[0]) ? get_rom_size(romPath) : 0;
-        if (rsz >= kROM_4MB) { g_win_scale = 4; return; }
+        if (rsz >= kROM_4MB) { g_win_scale = 5; return; }
     }
     if (g_win_scale < 6) return;
-    // earlyExpanded == true means EXACTLY 8 MB.
-    // For 10 MB+ none of earlyLimited/Regular/Expanded are true.
-    const bool isFurtherExpanded = !earlyLimited && !earlyRegularMemory && !earlyExpanded;
+    // earlyExpandedMemory == true means EXACTLY 8 MB.
+    // For 10 MB+ none of earlyLimitedMemory/Regular/Expanded are true.
+    const bool isFurtherExpanded = !earlyLimitedMemory && !earlyRegularMemory && !earlyExpandedMemory;
     const bool consoleIsDocked = poll_console_docked();
     if (isFurtherExpanded) {
         // 10 MB+: 6× allowed for any ROM size; need docked + 1080p.
         if (!(consoleIsDocked && g_win_1080)) g_win_scale = 5;
-    } else if (earlyExpanded) {
+    } else if (earlyExpandedMemory) {
         // 8 MB: 6× only with docked + 1080p + ROM < 4 MB.
         const size_t rsz = (romPath && romPath[0]) ? get_rom_size(romPath) : 0;
         if (!(consoleIsDocked && g_win_1080 && rsz < kROM_4MB)) g_win_scale = 5;
+    } else if (earlyRegularMemory) {
+        // 6 MB — 6× is not supported; clamp to 5×.
+        g_win_scale = 5;
     } else {
-        // 4 MB / 6 MB — unreachable (already clamped to 3 or 4 above).
+        // 4 MB — unreachable (already clamped to 3 above).
         g_win_scale = 5;
     }
 }
@@ -2878,12 +2888,12 @@ int main(int argc, char* argv[]) {
 
     //ult::logFilePath    = "sdmc:/config/ultragb/log.txt";
     //ult::disableLogging = false;
-    skipRumbleDoubleClick = false;
+    skipClosingExitFeedback = false;
 
-    const auto currentHeapSize    = ult::getCurrentHeapSize();
-    const bool earlyLimited       = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
-    const bool earlyRegularMemory = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
-    const bool earlyExpanded      = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
+    const auto currentHeapSize     = ult::getCurrentHeapSize();
+    const bool earlyLimitedMemory  = (currentHeapSize == ult::OverlayHeapSize::Size_4MB);
+    const bool earlyRegularMemory  = (currentHeapSize == ult::OverlayHeapSize::Size_6MB);
+    const bool earlyExpandedMemory = (currentHeapSize == ult::OverlayHeapSize::Size_8MB);
 
     // ── Phase 1: parse argv into raw intent flags ─────────────────────────────
     // Flags only — no branching.  Session resolution happens in Phase 2.
@@ -2892,11 +2902,11 @@ int main(int argc, char* argv[]) {
     bool wantQuickLaunch   = false;
 
     for (int i = 1; i < argc; ++i) {
-        if      (strcmp(argv[i], "-returning")   == 0) { g_returning_from_windowed = true; skipRumbleDoubleClick = false; }
-        else if (strcmp(argv[i], "--direct")     == 0) { g_directMode = true;              skipRumbleDoubleClick = false; }
+        if      (strcmp(argv[i], "-returning")   == 0) { g_returning_from_windowed = true; skipClosingExitFeedback = false; }
+        else if (strcmp(argv[i], "--direct")     == 0) { g_directMode = true;              skipClosingExitFeedback = false; }
         else if (strcmp(argv[i], "--comboReturn") == 0) { g_comboReturn = true;}
-        else if (strcmp(argv[i], "-overlay")     == 0) { g_overlay_mode = true; wantOverlayPlayer = true; skipRumbleDoubleClick = false; }
-        else if (strcmp(argv[i], "-freeoverlay") == 0) { g_overlay_mode = true; g_overlay_free_mode = true; wantOverlayPlayer = true; skipRumbleDoubleClick = false; }
+        else if (strcmp(argv[i], "-overlay")     == 0) { g_overlay_mode = true; wantOverlayPlayer = true; skipClosingExitFeedback = false; }
+        else if (strcmp(argv[i], "-freeoverlay") == 0) { g_overlay_mode = true; g_overlay_free_mode = true; wantOverlayPlayer = true; skipClosingExitFeedback = false; }
         else if (strcmp(argv[i], "-quicklaunch") == 0) { g_quick_launch = true; wantQuickLaunch   = true; }
         else if (strcmp(argv[i], "-windowed")    == 0) { wantWindowed   = true; }
 
@@ -2930,11 +2940,11 @@ int main(int argc, char* argv[]) {
                 if (romDir.back() != '/') romDir += '/';
                 const std::string fullPath = romDir + lastRom;
 
-                const size_t rsz      = get_rom_size(fullPath.c_str());
-                const bool   tooLarge = rsz > 0 &&
-                    ((earlyLimited       && rsz >= kROM_2MB) ||
-                     (earlyRegularMemory && rsz >= kROM_4MB) ||
-                     (earlyExpanded      && rsz >= kROM_6MB));
+                const size_t rsz = get_rom_size(fullPath.c_str());
+                const bool tooLarge = rsz > 0 &&
+                    ((earlyLimitedMemory && rsz >= kROM_2MB) ||
+                    (earlyRegularMemory && rsz >= kROM_4MB) ||
+                    (earlyExpandedMemory && rsz >= kROM_6MB));
 
                 if (!tooLarge) {
                     // Write transient keys consumed by initServices().
@@ -2958,14 +2968,21 @@ int main(int argc, char* argv[]) {
         // lastRom empty → stays SessionType::Menu.
 
     } else if (wantWindowed) {
+        //forceReturnToOverlayPath = true;
+        //stripReturnToOverlayPathArgs = true;
         // Explicit relaunch — ROM path already in config under "windowed_rom".
         session = SessionType::Windowed;
 
     } else if (wantOverlayPlayer) {
+        //forceReturnToOverlayPath = true;
+        //stripReturnToOverlayPathArgs = true;
         // ROM path already in config under "overlay_rom" (set by launch_overlay_mode /
         // launch_free_overlay_mode).  Route to the correct session sub-type.
         session = g_overlay_free_mode ? SessionType::FreeOverlayPlayer
                                       : SessionType::OverlayPlayer;
+    //} else {
+    //    forceReturnToOverlayPath = false;
+    //    stripReturnToOverlayPathArgs = false;
     }
 
     // ── Phase 3: session-specific pre-loop setup, then single dispatch ────────
@@ -2974,11 +2991,11 @@ int main(int argc, char* argv[]) {
     // load_config() only runs later inside initServices().
     // All other sessions need no pre-loop work beyond what Phase 2 already did.
     if (session == SessionType::Windowed) {
-        ult::COPY_BUFFER_SIZE   = 1024*2;
+        ult::COPY_BUFFER_SIZE   = 1024*4;
         g_win_1080  = (ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput) == "1080");
         g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
         const std::string wrom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowedRom);
-        clamp_win_scale(earlyLimited, earlyRegularMemory, earlyExpanded,
+        clamp_win_scale(earlyLimitedMemory, earlyRegularMemory, earlyExpandedMemory,
                         wrom.empty() ? nullptr : wrom.c_str());
         // Read the saved window Y position now so setup_windowed_framebuffer()
         // so g_win_pos_y is populated before setup_windowed_framebuffer() and createUI().
@@ -2993,11 +3010,11 @@ int main(int argc, char* argv[]) {
             if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosY), v))
                 g_win_pos_y = v;
         }
-        g_win_limited_fb = (earlyLimited && g_win_scale == 3);  // simple FB: only scale 3 on 4MB heap needs this
+        g_win_limited_fb = false;  // anchor-based FB is now safe at all supported scales/tiers
         setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 
     } else if (session == SessionType::FreeOverlayPlayer) {
-        ult::COPY_BUFFER_SIZE   = 1024*2;
+        ult::COPY_BUFFER_SIZE   = 1024*4;
         // Free overlay: 448×OVL_FREE_FB_H framebuffer, windowed-style floating
         // layer sized at 1.5× (= 672×954 VI pixels at 720p).  Setting
         // g_win_scale_locked=true makes Tesla use windowed layer sizing instead
