@@ -264,17 +264,6 @@ public:
 
         //render_gb_background(renderer);
 
-        if (!g_gb.running || !g_emu_active) {
-            // Cold-boot transient: emulator not yet active, so render_gb_screen
-            // is never reached and the game viewport region shows through as
-            // wallpaper/background (i.e. "nothing").  Fill it with opaque black
-            // so the screen area is well-defined until the first real frame lands.
-            // This path is never hit during normal gameplay — zero perf impact.
-            static constexpr tsl::Color kOpaqueBlack{0, 0, 0, 0xF};
-            renderer->drawRect(VP_X, VP_Y + g_render_y_offset, VP_W, VP_H, kOpaqueBlack);
-            return;
-        }
-
         // Detect operation-mode change (handheld ↔ docked).
         // When the mode changes the audio output device changes and the kernel
         // silently invalidates all queued DMA buffers.  Request an async resync

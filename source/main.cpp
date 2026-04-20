@@ -597,7 +597,19 @@ bool gb_load_rom(const char* path) {
     // Clear the framebuffer BEFORE gb_reset() — peanut_gb fires gb_lcd_draw_line
     // for line 0 during reset itself.  If memset runs after, that first draw is
     // erased and row 0 stays black until the second frame completes.
-    memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
+    //
+    // Pre-packed path (DMG / CGB-compat with DMG palette): g_gb_fb holds RGBA4444
+    // values directly, so 0x0000 = alpha-0 = transparent.  Fill with 0xFFFF
+    // (opaque white) so the screen region shows solid white before the first frame
+    // arrives — visible when boot-paused and no state is restored.  Scanline /
+    // ghosting effects render on top of this initialised surface correctly.
+    // Non-prepacked paths (RGB565/RGB555): the converter produces 0xF000 from a
+    // zero pixel at render time, so a plain memset to 0 is already correct there.
+    if (g_fb_is_prepacked) {
+        std::fill(g_gb_fb, g_gb_fb + GB_W * GB_H, static_cast<uint16_t>(0xFFFFu));
+    } else {
+        memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
+    }
 
     // ── Attempt to restore a previously saved state ───────────────────────────
     // save_state() is called from gb_unload_rom() so every clean unload leaves a
@@ -3104,7 +3116,7 @@ int main(int argc, char* argv[]) {
     // load_config() only runs later inside initServices().
     // All other sessions need no pre-loop work beyond what Phase 2 already did.
     if (session == SessionType::Windowed) {
-        ult::COPY_BUFFER_SIZE   = 1024*4;
+        //ult::COPY_BUFFER_SIZE   = 1024*4;
         g_win_1080  = (ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinOutput) == "1080");
         g_win_scale = parse_win_scale_str(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinScale));
         const std::string wrom = ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWindowedRom);
@@ -3125,7 +3137,7 @@ int main(int argc, char* argv[]) {
         }
 
         //g_win_limited_fb = false;  // anchor-based FB is now safe at all supported scales/tiers
-        
+
         // Limited-FB exception: 5× 1080p + 4 MB ROM on an 8 MB heap.
         //
         // Anchor-based FB height at 5× 1080p:
@@ -3140,15 +3152,14 @@ int main(int argc, char* argv[]) {
         // for this configuration only.  Screenshots are not available in this mode.
         {
             const size_t wrom_size = wrom.empty() ? 0u : get_rom_size(wrom.c_str());
-            g_win_limited_fb = (g_win_scale == 5 && g_win_1080 &&
-                                earlyExpandedMemory &&
-                                wrom_size >= kROM_4MB);
+            g_win_limited_fb = (g_win_scale == 5 && g_win_1080 && earlyExpandedMemory && wrom_size >= kROM_4MB) || \
+                               (g_win_scale == 5 && g_win_1080 && earlyRegularMemory && wrom_size >= kROM_2MB);
         }
 
         setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 
     } else if (session == SessionType::FreeOverlayPlayer) {
-        ult::COPY_BUFFER_SIZE   = 1024*4;
+        //ult::COPY_BUFFER_SIZE   = 1024*4;
         // Free overlay: 448×OVL_FREE_FB_H framebuffer, windowed-style floating
         // layer sized at 1.5× (= 672×954 VI pixels at 720p).  Setting
         // g_win_scale_locked=true makes Tesla use windowed layer sizing instead
