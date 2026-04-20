@@ -198,7 +198,7 @@ The Switch overlay heap is capped per system configuration. UltraGB adapts autom
 
 | Heap | Windowed max scale | In-game wallpaper | LCD Ghosting | Screenshots |
 |---|---|---|---|---|
-| 4 MB | 3x | ✗ | ✗ | 3x only |
+| 4 MB | 3x | ✗ | ✗ | ✓ |
 | 6 MB | 4x (5x when docked + 1080p) | ✓ | ROMs < 2 MB only | Disabled at 5x for ROMs ≥ 2 MB |
 | 8 MB | 5x (6x when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only | Disabled at 5x for ROMs ≥ 4 MB |
 | 10 MB+ | 5x (6x when docked + 1080p) | ✓ | All ROMs | ✓ |
