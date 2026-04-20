@@ -134,6 +134,14 @@ static void load_config() {
     if (!ovl_opaque_val.empty())
         g_ovl_opaque = (ovl_opaque_val != "0");
 
+    const std::string boot_cold_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyBootCold);
+    if (!boot_cold_val.empty())
+        g_boot_cold = (boot_cold_val != "0");
+
+    const std::string boot_paused_val = ult::parseValueFromIniSection(path, kConfigSection, kKeyBootPaused);
+    if (!boot_paused_val.empty())
+        g_boot_paused = (boot_paused_val != "0");
+
     // ovl_theme — filename stem of the selected overlay theme (empty = "default").
     // Only the name is read here; colors are loaded by load_ovl_theme() when
     // launching the overlay player.
@@ -154,7 +162,9 @@ static void load_config() {
             strncpy(g_ovl_wallpaper_name, wp_val.c_str(), sizeof(g_ovl_wallpaper_name) - 1);
             g_ovl_wallpaper_name[sizeof(g_ovl_wallpaper_name) - 1] = '\0';
         }
-        g_overlay_wallpaper = (g_ovl_wallpaper_name[0] != '\0' && ult::isFile(OVL_WALLPAPER_FILE));
+        g_overlay_wallpaper = (g_ovl_wallpaper_name[0] != '\0' &&
+                                (strcmp(g_ovl_wallpaper_name, "default") == 0 ||
+                                 ult::isFile(OVL_WALLPAPER_FILE)));
     }
 
     // win_pos_x / win_pos_y — persisted VI-space window position
@@ -614,7 +624,10 @@ bool gb_load_rom(const char* path) {
     }
 
     // ── Init audio BEFORE gb_reset() so the APU callback is live from frame 1 ──
-    gb_audio_init(g_gb.gb);
+    // Pass g_boot_paused so gb_audio_init sets s_ctrl.paused=true between
+    // threadCreate and threadStart — the only race-free point where the thread
+    // exists but hasn't yet executed its first iteration on a separate core.
+    gb_audio_init(g_gb.gb, g_boot_paused);
     gb_audio_set_gb_ptr(g_gb.gb);  // give audio_write() cycle-accurate LY+lcd_count offsets
 
     // If load_state succeeded, gb_reset() must NOT be called — it would wipe
@@ -1381,11 +1394,13 @@ static int ovl_theme_filter(const struct dirent* e) {
     return (strcmp(n + len - 4, ".ini") == 0) ? 1 : 0;
 }
 
-// Accepts any file ending in ".rgba" inside OVL_WALLPAPERS_DIR.
+// Accepts any file ending in ".rgba" inside OVL_WALLPAPERS_DIR,
+// except "default.rgba" which is reserved for the built-in Default option.
 static int ovl_wallpaper_filter(const struct dirent* e) {
     const char* n = e->d_name;
     const size_t len = strlen(n);
     if (len < 6) return 0;
+    if (strcmp(n, "default.rgba") == 0) return 0;
     return (strcmp(n + len - 5, ".rgba") == 0) ? 1 : 0;
 }
 
@@ -1459,6 +1474,22 @@ class DropdownSelectorGui : public tsl::Gui {
     // refreshes g_ovl_wallpaper_name / g_overlay_wallpaper, and triggers a
     // wallpaper reload so the new image appears immediately in the overlay.
     void apply_wallpaper(const char* name, const char* srcPath) {
+        // "default" sentinel — pass through to the Ultrahand wallpaper.
+        // No file is copied; OVL_WALLPAPER_FILE is removed so the player
+        // mode falls back cleanly to ult::WALLPAPER_PATH (the UH path).
+        const bool isDefault = (name && strcmp(name, "default") == 0);
+        if (isDefault) {
+            delete_file(OVL_WALLPAPER_FILE);
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyOvlWallpaperName, "default");
+            strncpy(g_ovl_wallpaper_name, "default", sizeof(g_ovl_wallpaper_name) - 1);
+            g_ovl_wallpaper_name[sizeof(g_ovl_wallpaper_name) - 1] = '\0';
+            g_overlay_wallpaper = true;  // wallpaper is "active" — sourced from UH path
+            // The menu UI keeps whatever wallpaper is already loaded (UH path).
+            // No reload needed here; launch_overlay_gui will leave WALLPAPER_PATH
+            // pointing at the UH path so the player picks it up at launch.
+            return;
+        }
+
         if (srcPath) {
             // Copy chosen .rgba → active wallpaper slot.
             copy_file(srcPath, OVL_WALLPAPER_FILE);
@@ -1607,10 +1638,11 @@ public:
             }
 
             if (!ult::limitedMemory) {
-                // Current wallpaper name: OPTION_SYMBOL when none is selected.
-                const std::string wpDisplay = g_ovl_wallpaper_name[0]
-                    ? std::string(g_ovl_wallpaper_name)
-                    : ult::OPTION_SYMBOL;
+                // Current wallpaper name: OPTION_SYMBOL when none, "default" for passthrough.
+                const std::string wpDisplay =
+                    (strcmp(g_ovl_wallpaper_name, "default") == 0) ? "default" :
+                    g_ovl_wallpaper_name[0] ? std::string(g_ovl_wallpaper_name)
+                                            : ult::OPTION_SYMBOL;
                 auto* wallpaper_item = new tsl::elm::ListItem("Wallpaper", wpDisplay);
                 wallpaper_item->setClickListener([this](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
@@ -1723,6 +1755,25 @@ public:
                 item->setClickListener([this, item](u64 keys) -> bool {
                     if (!(keys & KEY_A)) return false;
                     apply_wallpaper(nullptr, nullptr);
+                    select_item(item);
+                    triggerEnterFeedback();
+                    do_wallpaper_back();
+                    return true;
+                });
+                list->addItem(item);
+            }
+
+            // "default" entry — pass through to the Ultrahand wallpaper in player mode.
+            {
+                const bool isCurrent = (current == "default");
+                if (isCurrent && jumpTarget.empty()) jumpTarget = "default";
+
+                auto* item = new tsl::elm::SilentListItem("default");
+                if (isCurrent)
+                    select_item(item);
+                item->setClickListener([this, item](u64 keys) -> bool {
+                    if (!(keys & KEY_A)) return false;
+                    apply_wallpaper("default", nullptr);
                     select_item(item);
                     triggerEnterFeedback();
                     do_wallpaper_back();
@@ -2149,6 +2200,38 @@ public:
             list->addItem(qc_item);
         }
 
+        // ── Boot Paused ───────────────────────────────────────────────────────
+        // When ON, every game session begins in the dim/"Paused" state (same
+        // visual used during reposition) with the emulator and audio halted.
+        // The pause clears on KEY_PLUS press+release; thereafter the game
+        // plays normally.  No way to re-enter the pause state via this toggle.
+        auto* boot_paused_item = new tsl::elm::ToggleListItem(
+            "Boot Paused", g_boot_paused, ult::ON, ult::OFF);
+        boot_paused_item->setStateChangedListener([](bool state) {
+            g_boot_paused = state;
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyBootPaused,
+                                 state ? "1" : "0", "");
+        });
+        list->addItem(boot_paused_item);
+
+
+        // ── Boot Cold ─────────────────────────────────────────────────────────
+        // When ON, clicking any ROM other than the last-played one deletes the
+        // saved .state file before launching, forcing a cold boot.  Same-game
+        // clicks still resume normally.  Implemented in the ROM selector's
+        // click listener (mirrors the existing Reset button's mechanism).
+        auto* boot_cold_item = new tsl::elm::ToggleListItem(
+            "Boot Cold", g_boot_cold, ult::ON, ult::OFF);
+        boot_cold_item->setStateChangedListener([](bool state) {
+            g_boot_cold = state;
+            ult::setIniFileValue(kConfigFile, kConfigSection, kKeyBootCold,
+                                 state ? "1" : "0", "");
+            if (state) {
+                show_notify("Active states will be reset.");
+            }
+        });
+        list->addItem(boot_cold_item);
+
         auto* btn_haptics_item = new tsl::elm::ToggleListItem(
             "Button Haptics", g_button_haptics, ult::ON, ult::OFF);
         btn_haptics_item->setStateChangedListener([](bool state) {
@@ -2374,6 +2457,19 @@ public:
                     }
                     if (!(keys & KEY_A)) return false;
                     if (!playable) { gb_load_rom(p); return false; }
+
+                    // Boot Cold: launching a game other than the last-played one
+                    // deletes its quick-resume state so gb_load_rom cold-boots —
+                    // same mechanism as the Reset button in GameSettingsGui.
+                    // Same-game clicks fall through and resume normally.
+                    if (g_boot_cold &&
+                        (!g_last_rom_path[0] || strcmp(romNameStr.c_str(), g_last_rom_path) != 0)) {
+                        char internalPath[PATH_BUFFER_SIZE] = {};
+                        build_rom_data_path(p, internalPath, sizeof(internalPath),
+                                            STATE_DIR, ".state");
+                        delete_file(internalPath);
+                    }
+
                     return launch_game(p);
                 });
                 list->addItem(item);
@@ -2548,9 +2644,11 @@ class Overlay : public tsl::Overlay {
                                                   char*       clear_src = nullptr) {
         load_ovl_theme();
         if (!ult::limitedMemory) {
-            // Always use the overlay-specific wallpaper slot so the overlay
-            // player never picks up a UI wallpaper from a different path.
-            ult::WALLPAPER_PATH = OVL_WALLPAPER_FILE;
+            // "default" sentinel — pass through to the Ultrahand wallpaper path.
+            // Any other selection routes the player to OVL_WALLPAPER_FILE as before.
+            // This only affects the overlay player; the rest of the UI is untouched.
+            if (strcmp(g_ovl_wallpaper_name, "default") != 0)
+                ult::WALLPAPER_PATH = OVL_WALLPAPER_FILE;
             ult::loadWallpaperFileWhenSafe();
         }
         safe_copy(g_pending_rom_path, rom_path);
@@ -2589,6 +2687,21 @@ public:
 
         if (m_game_session)
             tsl::disableHiding = true;   // launch combo must close, not hide
+
+        // ── Transient boot-pause override ─────────────────────────────────────
+        // Written by the stick-click mode/scale switch handler when the user had
+        // already unpaused the current session (g_boot_paused_active was false).
+        // "0" means: suppress boot pause for this one new session, even though
+        // the persistent g_boot_paused setting is still true in config.ini.
+        // Erased immediately so it never bleeds into unrelated subsequent sessions.
+        if (m_game_session) {
+            const std::string bpo = ult::parseValueFromIniSection(
+                kConfigFile, kConfigSection, kKeyBootPausedOnce);
+            if (!bpo.empty()) {
+                if (bpo == "0") { g_boot_paused = false; g_boot_paused_suppressed = true; }
+                erase_ini(kKeyBootPausedOnce);
+            }
+        }
 
         // ── Default-writes: skip for game sessions ────────────────────────────
         // Config/theme defaults are only needed for UI rendering.  A game session

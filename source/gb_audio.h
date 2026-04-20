@@ -76,6 +76,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <atomic>
 #include <mutex>
 #include <switch.h>
@@ -253,27 +254,38 @@ static u8    g_game_volume       = 30;
 static float s_pre_game_proc_vol = 1.0f;
 static u64   s_pre_game_pid      = 0;
 
-// Apply g_game_volume to the running background title and record 1.0f as the
-// restore baseline.
+// Apply g_game_volume to the running background title and record the
+// PRE-ULTRAGB audproc level as the restore baseline.
 // Called once from gb_audio_init() after the audio thread is live.
 //
-// We intentionally do NOT read the title's current audproc volume via
-// s_audproc_get_vol.  The Switch initialises every application's audio process
-// at 1.0f, so in the common case reading it is redundant.  More critically,
-// audproc volume changes persist across home-menu transitions: if a prior
-// UltraGB session had g_game_volume set to 0 (muted), the title's audproc will
-// still report 0 even after the user returns from home, causing us to save 0
-// as s_pre_game_proc_vol and then "restore" the title to muted on every
-// subsequent exit.  Hardcoding 1.0f is always the correct restore target —
-// any deviation from 1.0f in the title's current audproc was put there by us,
-// not by the user or the system.
+// Earlier versions hardcoded s_pre_game_proc_vol = 1.0f, which is wrong when
+// sys-tune (or any similar tool) has applied a per-title master volume on
+// title entry: exiting UltraGB would "restore" the title to 1.0f and stomp
+// the user's sys-tune-configured level.  We now READ the current audproc
+// value so whatever sys-tune / the user / the system set is preserved.
+//
+// Edge case: if a previous UltraGB session died without running
+// gb_game_vol_restore() (crash, force-close while a game was suspended in
+// the background), the audproc value we read here is our own residue from
+// that prior session rather than the true pre-UltraGB baseline.  The
+// self-healing path is gb_game_vol_recheck() below: on the next HOME flip
+// (gb_game_vol_suppress raises the level to 1.0f, then recheck reads it
+// back) it adopts the corrected value as the new baseline.  No persistent
+// flag file is required.
 static void gb_game_vol_apply() {
     if (R_FAILED(pmdmntGetApplicationProcessId(&s_pre_game_pid))) {
         s_pre_game_pid = 0;
         return;
     }
     if (R_FAILED(s_audproc_init())) return;
-    s_pre_game_proc_vol = 1.0f;
+
+    float measured = 1.0f;
+    if (R_SUCCEEDED(s_audproc_get_vol(s_pre_game_pid, &measured))) {
+        s_pre_game_proc_vol = std::clamp(measured, 0.f, 1.f);
+    } else {
+        s_pre_game_proc_vol = 1.0f;   // fallback on IPC failure
+    }
+
     s_audproc_set_vol(s_pre_game_pid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
     s_audproc_exit();
 }
@@ -308,13 +320,24 @@ static void gb_game_vol_suppress() {
 // Two cases handled in a single IPC round-trip:
 //
 //   PID changed — user pressed Home, launched a different Switch title, and
-//   returned.  s_pre_game_pid is now stale.  We adopt the new PID, capture its
-//   natural (unmodified) volume as the new restore baseline, and apply
-//   g_game_volume immediately.
+//   returned.  s_pre_game_pid is now stale.  We adopt the new PID and
+//   capture the NEW title's current audproc level as the restore baseline
+//   (this is whatever sys-tune's policy just applied for that title, or
+//   1.0f on a cold title), then apply g_game_volume on top.
 //
-//   PID unchanged — same title still running but its volume may have been reset
-//   by the system or another tool while the overlay was hidden.  We just
-//   re-assert g_game_volume to correct any drift.
+//   PID unchanged — same title still running.  We READ the current audproc
+//   level first:
+//     * Matches our target (g_game_volume / 100) within tolerance → nobody
+//       touched it, no-op.  No IPC write, no fight with sys-tune which may
+//       have just written the same value it already had cached.
+//     * Differs → someone else legitimately wrote a new value (sys-tune
+//       applying an updated per-title level, the user moving sys-tune's
+//       slider mid-session, a system event, or our own residue from an
+//       earlier crashed session).  Adopt that value as the NEW restore
+//       baseline, then re-assert g_game_volume.  This is what lets the
+//       user adjust sys-tune's slider while UltraGB is open and have
+//       UltraGB restore to that NEW level on exit rather than a stale
+//       pre-session one.
 //
 // Exits in one cheap pmdmnt IPC call when no player session is active
 // (s_pre_game_pid == 0), so it is safe to call on every onShow() and every
@@ -327,18 +350,35 @@ static void gb_game_vol_recheck() {
 
     if (R_FAILED(s_audproc_init())) return;
 
+    const float target = std::clamp(g_game_volume / 100.f, 0.f, 1.f);
+
     if (currentPid != s_pre_game_pid) {
-        // Title changed under us.  Apply g_game_volume immediately and record
-        // 1.0f as the restore baseline — same reasoning as gb_game_vol_apply():
-        // we must never trust the current audproc value of a title we're
-        // adopting mid-session.
-        s_audproc_set_vol(currentPid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
-        s_pre_game_pid      = currentPid;
-        s_pre_game_proc_vol = 1.0f;
+        // Title changed under us — capture new baseline from current audproc.
+        float measured = 1.0f;
+        if (R_SUCCEEDED(s_audproc_get_vol(currentPid, &measured))) {
+            s_pre_game_proc_vol = std::clamp(measured, 0.f, 1.f);
+        } else {
+            s_pre_game_proc_vol = 1.0f;
+        }
+        s_audproc_set_vol(currentPid, target);
+        s_pre_game_pid = currentPid;
     } else {
-        // Same title — re-assert in case the system reset the level while the
-        // overlay was hidden (e.g. another overlay or a system event touched it).
-        s_audproc_set_vol(s_pre_game_pid, std::clamp(g_game_volume / 100.f, 0.f, 1.f));
+        // Same title — read before write.  Only re-assert if drift detected.
+        float measured = target;
+        if (R_SUCCEEDED(s_audproc_get_vol(s_pre_game_pid, &measured))) {
+            // Tolerance guards against float round-trip noise across the IPC
+            // boundary.  0.002f ≈ 0.2% is well below audible resolution.
+            if (std::fabs(measured - target) > 0.002f) {
+                // Someone else legitimately changed the level — adopt as the
+                // new restore baseline, then overwrite with our target.
+                s_pre_game_proc_vol = std::clamp(measured, 0.f, 1.f);
+                s_audproc_set_vol(s_pre_game_pid, target);
+            }
+            // else: no drift — no IPC write, no fight with sys-tune.
+        } else {
+            // Couldn't read — fall back to unconditional write for safety.
+            s_audproc_set_vol(s_pre_game_pid, target);
+        }
     }
 
     s_audproc_exit();
@@ -1270,7 +1310,11 @@ static void gb_audio_set_balance(int16_t balance) {
 
 // gb_audio_init — call after gb_init_lcd(), before gb_reset().
 // ─────────────────────────────────────────────────────────────────────────────
-static bool gb_audio_init(gb_s*) {
+// start_paused — when true, the paused flag is set between threadCreate and
+// threadStart so the audio thread sees it paused from its very first iteration,
+// preventing any real audio frame from being submitted before the caller can act.
+// Pass g_boot_paused here from gb_load_rom when the boot-pause feature is on.
+static bool gb_audio_init(gb_s*, bool start_paused = false) {
     if(s_ctrl.ready) return true;
 
     s_ctrl.evt_w.store(0,std::memory_order_relaxed);
@@ -1344,6 +1388,14 @@ static bool gb_audio_init(gb_s*) {
         for(int i=0;i<4;++i){free(s_ctrl.dma[i]);s_ctrl.dma[i]=nullptr;}
         return false;
     }
+    // If the caller wants to start paused (boot-pause feature), set the flag
+    // HERE — after threadCreate but before threadStart.  The thread exists at
+    // this point but has not executed a single instruction, so setting paused
+    // now is the only truly race-free path.  The thread's very first iteration
+    // will see paused=true and submit silence instead of real audio.
+    if (start_paused)
+        s_ctrl.paused.store(true, std::memory_order_release);
+
     threadStart(&s_ctrl.thread_handle);
     s_ctrl.ready=true;
     gb_game_vol_apply();   // set background-title DSP volume for this player session

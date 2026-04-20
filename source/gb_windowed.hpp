@@ -721,8 +721,21 @@ public:
                 }
                 s_was_screenshot = capturing;
             }
-            if (!s_win_dragging && !capturing) gb_tick_frame();
-            else                               ++g_frame_count;
+            // Boot Pause rising/falling edge — symmetric with screenshot pause.
+            // Audio must be paused on entry so the SPSC ring doesn't drain to
+            // a buzz; on exit the GB clock is re-anchored to avoid catch-up.
+            static bool s_was_boot_paused = false;
+            if (g_boot_paused_active != s_was_boot_paused) {
+                if (g_boot_paused_active) {
+                    gb_audio_pause();
+                } else {
+                    gb_audio_resume();
+                    g_gb_frame_next_ns = 0;
+                }
+                s_was_boot_paused = g_boot_paused_active;
+            }
+            if (!s_win_dragging && !capturing && !g_boot_paused_active) gb_tick_frame();
+            else                                                        ++g_frame_count;
         }
 
         // ── Row LUT: rebuild if the game's y_offset changed since last frame ──
@@ -795,11 +808,11 @@ public:
 
         draw_focus_flash(renderer, 0, y_ofs, fw, fh);
 
-        // ── Reposition overlay ────────────────────────────────────────────────
-        // While dragging: dim the frozen frame and show "Paused" centred.
-        // draw_drag_dim_border (gb_renderer.h) handles dim + red border + text.
+        // ── Reposition / Boot Pause overlay ───────────────────────────────────
+        // While dragging OR boot-paused: dim the frozen frame and show "Paused"
+        // centred.  draw_drag_dim_border (gb_renderer.h) handles dim + border + text.
         // Text is centred within the full game-content rect (x=0, y=y_ofs, fw×fh).
-        if (s_win_dragging)
+        if (s_win_dragging || g_boot_paused_active)
             draw_drag_dim_border(renderer,
                 y_ofs, fw, fh,
                 0, y_ofs, fw, fh,
@@ -981,6 +994,11 @@ class GBWindowedGui : public tsl::Gui {
     // Joystick deadzone (HidAnalogStickState range: –32767..32767).
     static constexpr int      JOY_DEADZONE = kJoyDeadzone;
     // Mask of all physical buttons — used to confirm KEY_PLUS is held *alone*.
+
+    // ── Boot Pause: KEY_PLUS press-then-release latch ────────────────────────
+    // Set true when KEY_PLUS is pressed while g_boot_paused_active.  The flag
+    // clears g_boot_paused_active on the next frame KEY_PLUS is no longer held.
+    bool     m_boot_pause_plus_seen = false;
     
     bool     m_zr_first_seen  = false;
     uint32_t m_zr_first_frame = 0;
@@ -1185,12 +1203,28 @@ public:
         // joystick drag) so the game never sees buttons held during repositioning.
         // Also suppress when pass-through is active: foreground has been released
         // so the background app owns HID natively; we must not double-route input.
-        if (!m_dragging && !m_plus_dragging && !m_zl_state.pass_through) {
+        // Suppressed during boot pause too: user must press KEY_PLUS to start
+        // the game, so the GB must not see input until that release.
+        if (!m_dragging && !m_plus_dragging && !m_zl_state.pass_through && !g_boot_paused_active) {
             gb_set_input(keysHeld | keysDown);
             if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClickFeedback();
+        }
+
+        // ── Boot Pause exit: KEY_PLUS press → release clears g_boot_paused_active.
+        // Press is latched here, release detected on the frame KEY_PLUS leaves
+        // keysHeld.  Reposition logic continues to function during boot pause;
+        // if the user holds KEY_PLUS long enough to enter joystick reposition,
+        // the eventual release clears both states in the same frame.
+        if (g_boot_paused_active) {
+            if (keysDown & KEY_PLUS)
+                m_boot_pause_plus_seen = true;
+            if (m_boot_pause_plus_seen && !(keysHeld & KEY_PLUS)) {
+                g_boot_paused_active   = false;
+                m_boot_pause_plus_seen = false;
+            }
         }
 
         // ── ZL double-click-hold: toggle background pass-through ──────────────
@@ -1282,6 +1316,13 @@ public:
                     // again before each resize relaunch.
                     if (g_win_quick_exit)
                         ult::setIniFileValue(kConfigFile, kConfigSection, kKeyWinQuickExit, "1", "");
+                    // Boot Pause: if the setting is enabled but the user already unpaused
+                    // this session (g_boot_paused_active cleared), write a transient override
+                    // so the relaunched windowed session also starts unpaused.  If the user
+                    // has NOT yet unpaused (still in locked-pause state), omit the override —
+                    // the next session naturally re-arms boot pause from the persistent setting.
+                    if ((g_boot_paused || g_boot_paused_suppressed) && !g_boot_paused_active)
+                        ult::setIniFileValue(kConfigFile, kConfigSection, kKeyBootPausedOnce, "0", "");
                     // Simple click — confirms the scale step without implying exit.
                     // triggerNavigationFeedback (navigation sound + rumble) feels
                     // exit-like right before the overlay closes; a bare click is

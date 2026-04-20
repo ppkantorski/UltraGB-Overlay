@@ -252,6 +252,15 @@ static void consume_pending_rom(bool& load_failed) {
     g_pending_rom_path[0] = '\0';
     if (!gb_load_rom(path))
         load_failed = true;
+    else if (g_boot_paused) {
+        // Arm boot pause for this session.  Pause audio immediately here —
+        // before the first draw() call — so there is no audible blip between
+        // gb_load_rom() returning and the draw() rising-edge handler running.
+        // The draw() rising-edge handler will see the flag already set and
+        // skip its own gb_audio_pause() call harmlessly.
+        g_boot_paused_active = true;
+        gb_audio_pause();
+    }
 }
 
 // =============================================================================

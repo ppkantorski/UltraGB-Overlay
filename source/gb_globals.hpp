@@ -98,6 +98,9 @@ static const std::string kKeyOvlFreeMode    {"ovl_free_mode"};   // 0=fixed 1=fr
 static const std::string kKeyOvlFreePosX    {"ovl_free_pos_x"};  // VI-space X of the free overlay layer
 static const std::string kKeyOvlFreePosY    {"ovl_free_pos_y"};  // transparent rows at top of FB (0..OVL_FREE_TOP_TRIM)
 static const std::string kKeyOvlOpaque      {"ovl_opaque"};       // 0=theme alpha (default), 1=force all alpha to 15
+static const std::string kKeyBootCold       {"boot_cold"};        // 0=resume across games (default), 1=cold-boot any game that isn't g_last_rom_path
+static const std::string kKeyBootPaused     {"boot_paused"};      // 0=play immediately (default), 1=start games paused until KEY_PLUS press+release
+static const std::string kKeyBootPausedOnce {"boot_paused_once"}; // transient: "0" suppresses boot pause for next game session only; erased immediately on read
 
 // =============================================================================
 // ROM size thresholds
@@ -141,6 +144,10 @@ static bool g_windowed_mode     = false;
 static bool g_button_haptics    = false;  // controller button presses; off by default
 static bool g_touch_haptics     = false;  // screen touch (virtual d-pad/buttons, repositioning); off by default
 static bool g_ovl_opaque        = false;  // when true, all overlay alpha channels are forced to 15 (fully opaque)
+static bool g_boot_cold         = false;  // user setting: when true, clicking a game that isn't g_last_rom_path deletes its .state before launching
+static bool g_boot_paused       = false;  // user setting: when true, every overlay/windowed game session starts paused until KEY_PLUS press+release
+static bool g_boot_paused_active= false;  // runtime: true while the current game session is in the boot-pause state (cleared by KEY_PLUS release in handleInput)
+static bool g_boot_paused_suppressed = false; // runtime: true when boot pause was suppressed this session via kKeyBootPausedOnce transient key; ensures stick-click switches continue to propagate the suppression even though g_boot_paused was cleared in memory
 static bool g_overlay_wallpaper = false;  // derived: true when a wallpaper file is selected + file exists
 static char g_ovl_wallpaper_name[64] = {};  // selected wallpaper filename stem (empty = none)
 

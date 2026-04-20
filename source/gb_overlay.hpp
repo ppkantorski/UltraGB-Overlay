@@ -327,7 +327,21 @@ public:
                 }
                 s_was_screenshot = capturing;
             }
-            if (!s_ovl_free_dragging && !capturing)
+            // Boot Pause rising/falling edge — symmetric with screenshot pause.
+            // gb_audio_pause keeps the SPSC ring quiet while the user reads the
+            // "Paused" overlay and decides when to start.  On falling edge the
+            // GB clock is re-anchored so the emulator doesn't try to catch up.
+            static bool s_was_boot_paused = false;
+            if (g_boot_paused_active != s_was_boot_paused) {
+                if (g_boot_paused_active) {
+                    gb_audio_pause();
+                } else {
+                    gb_audio_resume();
+                    g_gb_frame_next_ns = 0;
+                }
+                s_was_boot_paused = g_boot_paused_active;
+            }
+            if (!s_ovl_free_dragging && !capturing && !g_boot_paused_active)
                 gb_tick_frame();
         }
 
@@ -569,19 +583,24 @@ public:
                 render_ovl_free_border(renderer, fb_top, fb_bot, a(tsl::edgeSeparatorColor));
         }
 
-        // ── Free overlay reposition overlay ──────────────────────────────────
+        // ── Free overlay reposition / Boot Pause overlay ──────────────────────
         // draw_drag_dim_border (gb_renderer.h) handles dim + red border + text.
         // "Paused" is centred within the 2× pixel-perfect screen region (VP2).
         // scr_y accounts for g_render_y_offset so the text tracks pos_y correctly.
-        if (free_mode && s_ovl_free_dragging) {
+        // Also fires for g_boot_paused_active in BOTH fixed and free overlay
+        // modes so the Boot Paused setting works regardless of overlay layout.
+        if (g_boot_paused_active || (free_mode && s_ovl_free_dragging)) {
             const s32 fw  = static_cast<s32>(tsl::cfg::FramebufferWidth);
             const s32 fbt = static_cast<s32>(fb_top);
             const s32 fbc = static_cast<s32>(fb_bot) - fbt;  // content height
             const s32 scr_y = static_cast<s32>(VP2_Y) + g_render_y_offset;
+            // Pass fb16 only in free mode — free mode uses rounded corners matching
+            // the floating overlay player frame.  Fixed mode (boot paused, no dragging)
+            // uses square corners matching the ZL-hold reposition visual.
             draw_drag_dim_border(renderer,
                 fbt, fw, fbc,
                 (s32)VP2_X, scr_y, (s32)VP2_W, (s32)VP2_H,
-                20u, fb16);  // fb16 → rounded corners matching the overlay player frame
+                20u, free_mode ? fb16 : nullptr);
         }
         } // end fb_top/fb_bot scope
 
@@ -694,6 +713,11 @@ class GBOverlayGui : public tsl::Gui {
     float    m_joy_acc_x          = 0.f;
     float    m_joy_acc_y          = 0.f;
     uint64_t m_joy_last_ns        = 0;
+
+    // ── Boot Pause: KEY_PLUS press-then-release latch ────────────────────────
+    // Set true when KEY_PLUS is pressed while g_boot_paused_active.  The flag
+    // clears g_boot_paused_active on the next frame KEY_PLUS is no longer held.
+    bool     m_boot_pause_plus_seen = false;
 
     // 60 frames ≈ 1 s at ~60 fps.
     static constexpr int      HOLD_FRAMES  = kHoldFrames;
@@ -889,9 +913,11 @@ public:
 
         // ── Touch → virtual button state ──────────────────────────────────────
         // Suppressed while dragging so the game never receives button presses
-        // during reposition, and suppressed during pass-through.
+        // during reposition, suppressed during pass-through, and suppressed
+        // during boot pause (the user must press KEY_PLUS to start the game,
+        // not poke at virtual buttons).
         g_touch_keys = 0;
-        if (touching && !m_zl_state.pass_through && !s_ovl_free_dragging) {
+        if (touching && !m_zl_state.pass_through && !s_ovl_free_dragging && !g_boot_paused_active) {
             {
                 static constexpr int D_CX        = DPAD_DRAW_X + 67;
                 const            int D_CY        = DPAD_DRAW_Y - 61 + g_render_y_offset;
@@ -928,13 +954,29 @@ public:
             triggerRumbleClickFeedback();
         m_prevTouchKeys = g_touch_keys;
 
-        // Physical buttons → GB joypad.  Suppressed during drag and pass-through.
-        if (!m_zl_state.pass_through && !s_ovl_free_dragging) {
+        // Physical buttons → GB joypad.  Suppressed during drag, pass-through,
+        // and boot pause (user must use KEY_PLUS to leave boot pause; the GB
+        // must not see button input until they do).
+        if (!m_zl_state.pass_through && !s_ovl_free_dragging && !g_boot_paused_active) {
             gb_set_input(keysHeld | g_touch_keys);
             if (g_button_haptics &&
                 (keysDown & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_PLUS | KEY_MINUS |
                              KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT)))
                 triggerRumbleClickFeedback();
+        }
+
+        // ── Boot Pause exit: KEY_PLUS press → release clears g_boot_paused_active.
+        // Press is latched here, release detected on the frame KEY_PLUS leaves
+        // keysHeld.  Reposition logic below continues to run normally during
+        // boot pause; if the user holds KEY_PLUS long enough to enter joystick
+        // reposition, the eventual release clears both states in the same frame.
+        if (g_boot_paused_active) {
+            if (keysDown & KEY_PLUS)
+                m_boot_pause_plus_seen = true;
+            if (m_boot_pause_plus_seen && !(keysHeld & KEY_PLUS)) {
+                g_boot_paused_active   = false;
+                m_boot_pause_plus_seen = false;
+            }
         }
 
         // ── Free overlay reposition (touch + joystick) ────────────────────────
@@ -1146,6 +1188,17 @@ public:
             const bool rstick = (keysDown & KEY_RSTICK) && !(keysHeld & ~KEY_RSTICK & ALL_KEYS_MASK);
             if (lstick || rstick) {
                 const bool wantFree = rstick;   // lstick → fixed (false), rstick → free (true)
+                // No-op if already in the requested mode — swallow the press silently.
+                // lstick while already fixed, or rstick while already free, does nothing.
+                if (wantFree == g_overlay_free_mode) return true;
+                // Boot Pause: if the setting is enabled but the user already unpaused
+                // this session (g_boot_paused_active cleared), write a transient override
+                // so the incoming session also starts unpaused.  If the user has NOT
+                // yet unpaused (still in the initial locked-pause state), omit the
+                // override — load_config() will re-arm boot pause naturally from the
+                // persistent g_boot_paused setting.
+                if ((g_boot_paused || g_boot_paused_suppressed) && !g_boot_paused_active)
+                    ult::setIniFileValue(kConfigFile, kConfigSection, kKeyBootPausedOnce, "0", "");
                 g_overlay_free_mode = wantFree;
                 save_ovl_free_mode();
                 triggerRumbleClickFeedback();
