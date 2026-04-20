@@ -167,6 +167,8 @@ Press **Y** on any ROM in the selector to open its settings screen.
 | Item | Description |
 |---|---|
 | Quick Combo | Assign a button combo to launch directly to the last played ROM from anywhere |
+| Boot Paused | Start the emulator with the game paused on launch |
+| Boot Cold | Always cold-boot the game on launch (skips quick-resume state restore) |
 | Button Haptics | Enable/disable rumble feedback on controller button presses |
 | Touch Haptics | Enable/disable rumble feedback on screen touch (virtual buttons, drag reposition) |
 
@@ -176,7 +178,7 @@ Press **Y** on any ROM in the selector to open its settings screen.
 |---|---|
 | Position | Fixed (anchored left edge) or Free (repositionable floating panel) |
 | Theme | Select a UI theme from `sdmc:/config/ultragb/ovl_themes/`; "default" always available |
-| Wallpaper | Select a background wallpaper from `sdmc:/config/ultragb/ovl_wallpapers/` (requires 8 MB+ heap) |
+| Wallpaper | Select a background wallpaper from `sdmc:/config/ultragb/ovl_wallpapers/` (requires 6 MB+ heap); "default" pass-through mode shows the preset Ultrahand UI wallpaper behind the overlay instead (if set) |
 
 ### Windowed Submenu
 
@@ -194,12 +196,12 @@ Assigning a combo in Settings registers it system-wide and deconflicts it from o
 
 The Switch overlay heap is capped per system configuration. UltraGB adapts automatically.
 
-| Heap | Windowed max scale | In-game wallpaper | LCD Ghosting |
-|---|---|---|---|
-| 4 MB | 3x | ✗ | ✗ |
-| 6 MB | 4x | ✗ | ROMs < 2 MB only |
-| 8 MB | 5x (6x when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only |
-| 10 MB+ | 5x (6x when docked + 1080p) | ✓ | All ROMs |
+| Heap | Windowed max scale | In-game wallpaper | LCD Ghosting | Screenshots |
+|---|---|---|---|---|
+| 4 MB | 3x | ✗ | ✗ | 3x only |
+| 6 MB | 4x (5x when docked + 1080p) | ✓ | ROMs < 2 MB only | Disabled at 5x for ROMs ≥ 2 MB |
+| 8 MB | 5x (6x when docked + 1080p + ROM < 4 MB) | ✓ | ROMs < 4 MB only | Disabled at 5x for ROMs ≥ 4 MB |
+| 10 MB+ | 5x (6x when docked + 1080p) | ✓ | All ROMs | ✓ |
 
 ROMs that exceed the current tier's playable size are shown in the selector with a warning colour and cannot be launched.
 
