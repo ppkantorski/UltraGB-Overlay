@@ -1080,9 +1080,7 @@ static void gb_audio_thread_fn(void*) {
     // it overflows GB_CPU_HZ, giving exactly 48000 samples/sec on average.
     uint32_t spf_acc = 0;
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC,&ts);
-    int64_t next_ns=(int64_t)ts.tv_sec*1'000'000'000LL+ts.tv_nsec+GB_FRAME_NS;
+    int64_t next_ns = ult::nowNs() + GB_FRAME_NS;
 
     while(s_ctrl.thread_run.load(std::memory_order_relaxed)){
 
@@ -1252,8 +1250,7 @@ static void gb_audio_thread_fn(void*) {
                 s_ctrl.cur = (s_ctrl.cur + 2u) & 3u;
             }
             // Re-anchor the drift clock so we don't spin catch-up frames.
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            next_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec + GB_FRAME_NS;
+            next_ns = ult::nowNs() + GB_FRAME_NS;
             s_ctrl.resync.store(false, std::memory_order_release);
         }
 
@@ -1261,8 +1258,7 @@ static void gb_audio_thread_fn(void*) {
         // Skip sleep when thread_run is false so the thread exits immediately
         // rather than waiting up to 16 ms.  threadWaitForExit then returns in
         // < 1 ms, keeping gb_audio_shutdown() safe to call from handleInput.
-        clock_gettime(CLOCK_MONOTONIC,&ts);
-        const int64_t now_ns=(int64_t)ts.tv_sec*1'000'000'000LL+ts.tv_nsec;
+        const int64_t now_ns = ult::nowNs();
         const int64_t sleep_ns=next_ns-now_ns;
         if(sleep_ns>0 && s_ctrl.thread_run.load(std::memory_order_relaxed))
             svcSleepThread(sleep_ns);
@@ -1379,7 +1375,7 @@ static bool gb_audio_init(gb_s*, bool start_paused = false) {
     s_ctrl.thread_run.store(true,std::memory_order_relaxed);
     if(R_FAILED(threadCreate(&s_ctrl.thread_handle,
                               gb_audio_thread_fn,nullptr,
-                              nullptr,0x1000,0x2B,-2)))
+                              nullptr,0x1000,0x2C,-2)))
     {
         s_ctrl.thread_run.store(false);
         audoutStopAudioOut();

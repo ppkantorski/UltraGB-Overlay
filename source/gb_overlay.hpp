@@ -46,13 +46,17 @@
 // Increments the display-frame counter and rate-limits the GB CPU to its
 // true 59.73 fps clock regardless of the 60 fps display vsync.
 // See GBOverlayElement::draw() for the full timing rationale.
+//
+// Timing source: ult::nowNs() → armTicksToNs(armGetSystemTick()) reads the
+// ARM Generic Timer (CNTVCT_EL0), a fixed 19.2 MHz hardware oscillator that
+// is independent of CPU clock speed.  Accurate on stock, overclocked, and
+// underclocked consoles alike, and faster than clock_gettime(CLOCK_MONOTONIC)
+// (single mrs instruction vs. kernel call).
 //#ifndef GB_TICK_FRAME_DEFINED
 //#define GB_TICK_FRAME_DEFINED
 inline void __attribute__((optimize("O3"))) gb_tick_frame() {
     ++g_frame_count;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const int64_t now_ns = (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+    const int64_t now_ns = static_cast<int64_t>(ult::nowNs());
     if (g_gb_frame_next_ns == 0)
         g_gb_frame_next_ns = now_ns;  // anchor on first draw after load/resume
     if (g_fast_forward) {

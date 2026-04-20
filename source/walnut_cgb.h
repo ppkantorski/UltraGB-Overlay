@@ -908,7 +908,6 @@ struct gb_s
 		 * Initialized to true in gb_init_lcd for visual correctness.
 		 * Set to false after gb_init_lcd to restore hardware-accurate behaviour. */
 		bool no_sprite_limit : 1; /* Lift 10-sprite-per-scanline hardware cap */
-		bool no_obj_priority : 1; /* Sprites always draw above BG (ignore OBJ_PRIORITY / pixelsPrio) */
 
 		union
 		{
@@ -3526,8 +3525,8 @@ void __gb_draw_line(struct gb_s *gb)
 					uint8_t bgColorIdx = bgColors[disp_x] & 0x3;
 					uint8_t isBackgroundDisabled = c && !(gb->hram_io[IO_LCDC] & LCDC_BG_ENABLE);
 					uint8_t isPixelPriorityNonConflicting = c &&
-															!(!gb->direct.no_obj_priority && pixelsPrio[disp_x] && bgColorIdx) &&
-															!(!gb->direct.no_obj_priority && (OF & OBJ_PRIORITY) && bgColorIdx);
+															!(pixelsPrio[disp_x] && bgColorIdx) &&
+															!((OF & OBJ_PRIORITY) && bgColorIdx);
 
 					if(isBackgroundDisabled || isPixelPriorityNonConflicting)
 					{
@@ -3539,21 +3538,11 @@ void __gb_draw_line(struct gb_s *gb)
 						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
 						}
 					}
-					else if(c && !gb->direct.no_obj_priority)
+					else if(c)
 					{
 						/* This sprite defers to BG. Restore the original BG pixel so
 						 * any lower-priority sprite that already drew here is evicted. */
 						pixels[disp_x] = bgColors[disp_x];
-					}
-					else if(c)
-					{
-						/* no_obj_priority=true: sprite wins unconditionally. */
-						pixels[disp_x] = ((OF & OBJ_CGB_PALETTE) << 2) + c + 0x20;
-						/* Ghosting: track sprite visibility and mark flicker pixels. */
-						if (s_flicker_pixel_curr) {
-						    s_sprite_rendered_curr[s] = true;
-						    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
-						}
 					}
 				}
 				else
@@ -3580,7 +3569,7 @@ void __gb_draw_line(struct gb_s *gb)
 				 *      (set during BG/window tile rendering).  Extract it with
 				 *      (bgColors[disp_x] >> 2) & 0x3.  Zero = BG colour 0
 				 *      (transparent on real HW), non-zero = opaque BG. */
-				if(c && (gb->direct.no_obj_priority || !((OF & OBJ_PRIORITY) && ((bgColors[disp_x] >> 2) & 0x3))))
+				if(c && !((OF & OBJ_PRIORITY) && ((bgColors[disp_x] >> 2) & 0x3)))
 				{
 					/* Set pixel colour. */
 					pixels[disp_x] = (OF & OBJ_PALETTE)
@@ -3600,7 +3589,7 @@ void __gb_draw_line(struct gb_s *gb)
 					    s_flicker_pixel_curr[hram_io_ly * LCD_WIDTH + disp_x] = 1;  // mark pixel for ghosting
 					}
 				}
-				else if(c && !gb->direct.no_obj_priority)
+				else if(c)
 				{
 					/* FIX (DMG missing BG-restore):
 					 *
@@ -8489,7 +8478,6 @@ void gb_init_lcd(struct gb_s *gb,
 
 	gb->direct.interlace = false;
 	gb->direct.no_sprite_limit = true;
-	gb->direct.no_obj_priority = false;
 	gb->display.interlace_count = false;
 	gb->direct.frame_skip = false;
 	gb->display.frame_skip_count = false;
