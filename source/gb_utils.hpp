@@ -1464,7 +1464,7 @@ static void load_ovl_theme() {
     {
         const auto tryColor = [&](const char* key, tsl::Color& target) {
             const std::string v = ult::parseValueFromIniSection(path, "theme", key);
-            if (v.size() == 6) target = tsl::RGB888(v, 15u);
+            if (v.size() == 6 || v.size() == 7) target = tsl::RGB888(v, 15u);
         };
         tryColor("dynamic_logo_color_1",  tsl::dynamicLogoRGB1);
         tryColor("dynamic_logo_color_2",  tsl::dynamicLogoRGB2);
@@ -1476,10 +1476,11 @@ static void load_ovl_theme() {
         tryColor("battery_color",         tsl::batteryColor);
         tryColor("battery_charging_color",tsl::batteryChargingColor);
         tryColor("battery_low_color",     tsl::batteryLowColor);
+        tryColor("widget_border_color",   tsl::widgetBorderColor);
 
         // widget_backdrop: alpha and color are linked — only apply if color is present.
         const std::string wbkd_raw = ult::parseValueFromIniSection(path, "theme", "widget_backdrop_color");
-        if (wbkd_raw.size() == 6) {
+        if (wbkd_raw.size() == 6 || wbkd_raw.size() == 7) {
             const std::string wbkd_a = ult::parseValueFromIniSection(path, "theme", "widget_backdrop_alpha");
             int va = static_cast<int>(tsl::widgetBackdropAlpha);  // keep existing alpha as default
             int vp = 0;
