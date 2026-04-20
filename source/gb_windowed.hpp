@@ -1033,10 +1033,12 @@ public:
     tsl::elm::Element* createUI() override {
         audio_exit_if_enabled();
 
-        // Ensure screenshot do nots work.
-        //screenshotsAreDisabled.store(true, std::memory_order_release);
-        //screenshotsAreForceDisabled.store(true, std::memory_order_release);
-        //tsl::gfx::Renderer::get().removeScreenshotStacks();
+        // Ensure screenshots do not work for g_win_limited_fb
+        if (g_win_limited_fb) {
+            screenshotsAreDisabled.store(true, std::memory_order_release);
+            screenshotsAreForceDisabled.store(true, std::memory_order_release);
+            tsl::gfx::Renderer::get().removeScreenshotStacks();
+        }
 
 
         // Load the ROM.  g_pending_rom_path was set from windowed_rom in

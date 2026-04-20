@@ -3123,7 +3123,28 @@ int main(int argc, char* argv[]) {
             if (parse_uint(ult::parseValueFromIniSection(kConfigFile, kConfigSection, kKeyWinPosY), v))
                 g_win_pos_y = v;
         }
-        g_win_limited_fb = false;  // anchor-based FB is now safe at all supported scales/tiers
+
+        //g_win_limited_fb = false;  // anchor-based FB is now safe at all supported scales/tiers
+        
+        // Limited-FB exception: 5× 1080p + 4 MB ROM on an 8 MB heap.
+        //
+        // Anchor-based FB height at 5× 1080p:
+        //   screen_fb_h()/2 + (GB_H×5 + 1)/2  =  540 + 360  =  900 rows
+        //   → 800×900×2 = ~1.4 MB framebuffer
+        // Limited-FB height (exact game size):
+        //   GB_H×5 = 720 rows  →  800×720×2 = ~1.1 MB framebuffer  (saves ~280 KB)
+        //
+        // With a 4 MB ROM already consuming most of the 8 MB heap, the extra
+        // ~280 KB from the anchor padding is enough to trigger OOM.  Use the
+        // exact-size framebuffer (no anchoring, layer tracks g_win_pos_y directly)
+        // for this configuration only.  Screenshots are not available in this mode.
+        {
+            const size_t wrom_size = wrom.empty() ? 0u : get_rom_size(wrom.c_str());
+            g_win_limited_fb = (g_win_scale == 5 && g_win_1080 &&
+                                earlyExpandedMemory &&
+                                wrom_size >= kROM_4MB);
+        }
+
         setup_windowed_framebuffer();   // sets g_win_scale_locked; reads g_win_limited_fb via win_fb_height()
 
     } else if (session == SessionType::FreeOverlayPlayer) {
