@@ -598,18 +598,13 @@ bool gb_load_rom(const char* path) {
     // for line 0 during reset itself.  If memset runs after, that first draw is
     // erased and row 0 stays black until the second frame completes.
     //
-    // Pre-packed path (DMG / CGB-compat with DMG palette): g_gb_fb holds RGBA4444
-    // values directly, so 0x0000 = alpha-0 = transparent.  Fill with 0xFFFF
-    // (opaque white) so the screen region shows solid white before the first frame
-    // arrives — visible when boot-paused and no state is restored.  Scanline /
-    // ghosting effects render on top of this initialised surface correctly.
-    // Non-prepacked paths (RGB565/RGB555): the converter produces 0xF000 from a
-    // zero pixel at render time, so a plain memset to 0 is already correct there.
-    if (g_fb_is_prepacked) {
-        std::fill(g_gb_fb, g_gb_fb + GB_W * GB_H, static_cast<uint16_t>(0xFFFFu));
-    } else {
-        memset(g_gb_fb, 0, GB_W * GB_H * sizeof(uint16_t));
-    }
+    // 0xFFFF is opaque white in all three framebuffer formats:
+    //   RGBA4444 (prepacked DMG/CGB-compat): R=F G=F B=F A=F → opaque white
+    //   RGB565   (CGB): rgb565_to_packed(0xFFFF) → opaque white
+    //   RGB555:         rgb555_to_packed(0xFFFF) → opaque white
+    // Initialising all paths to 0xFF makes every cold boot with no saved state
+    // show solid white instead of black (RGB565/555) or transparent (prepacked).
+    memset(g_gb_fb, 0xFF, GB_W * GB_H * sizeof(uint16_t));
 
     // ── Attempt to restore a previously saved state ───────────────────────────
     // save_state() is called from gb_unload_rom() so every clean unload leaves a
